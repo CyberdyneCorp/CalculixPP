@@ -34,6 +34,9 @@ through the normal OpenSpec change → apply → archive cycle against this base
 - **Linear algebra & solvers:** **NumPP** (https://github.com/CyberdyneCorp/NumPP) —
   in-house C++20 numerics providing dense/sparse containers, factorizations, iterative
   solvers, and eigensolvers. Replaces BLAS/LAPACK, SPOOLES/PARDISO/PaStiX, and ARPACK.
+- **Scientific routines:** **SciPP** (https://github.com/CyberdyneCorp/SciPP) — in-house
+  C++20 SciPy-equivalent (higher-level numerics on top of NumPP), used where needed for
+  quadrature, interpolation, optimization, and sparse/scientific helpers.
 - **Geometry & meshing:** **CyberCadKernel**
   (https://github.com/CyberdyneCorp/CyberCadKernel) — a C++20 OCCT-equivalent CAD
   kernel used for geometry import, healing, surface triangulation, and volume
@@ -112,6 +115,7 @@ Thermomechanical Applications*, Wiley, 2004, and the CalculiX user manual.
 ## External Dependencies
 
 - **NumPP** — C++20 linear algebra, sparse/dense solvers, eigensolvers.
+- **SciPP** — C++20 scientific routines (SciPy-equivalent) layered on NumPP.
 - **CyberCadKernel** — C++20 CAD/geometry kernel for import and mesh preparation.
 - **pybind11** — Python binding layer.
 - **CUDA / OpenCL / Metal** — optional acceleration backends (runtime-selected).

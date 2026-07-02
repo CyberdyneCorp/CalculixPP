@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Spec gate: always runs, no heavy dependencies.
+  openspec:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm install -g @fission-ai/openspec@latest
+      - run: openspec validate --all --strict
+
+  # Build the solver core + SciPP layer + Python module, then run the tests.
+  # NumPP and SciPP are separate repositories; if they are private, add a
+  # repo-scoped PAT as the DEPS_TOKEN secret. The core (calculixpp_core) also
+  # builds standalone without them (CALCULIXPP_WITH_SOLVER=OFF).
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: CalculixPP
+      - uses: actions/checkout@v4
+        with:
+          repository: CyberdyneCorp/NumPP
+          path: NumPP
+          token: ${{ secrets.DEPS_TOKEN || github.token }}
+      - uses: actions/checkout@v4
+        with:
+          repository: CyberdyneCorp/SciPP
+          ref: v1.2.0  # sparse direct (Cholesky/LU) + preconditioned CG (SciPP#10)
+          path: SciPP
+          token: ${{ secrets.DEPS_TOKEN || github.token }}
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install --upgrade pip pybind11 pytest numpy
+
+      - name: Bootstrap NumPP (build + install)
+        working-directory: CalculixPP
+        run: ./scripts/bootstrap_deps.sh --numpp ../NumPP --scipp ../SciPP
+
+      - name: Configure
+        working-directory: CalculixPP
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCALCULIXPP_WITH_SOLVER=ON
+          -DCALCULIXPP_BUILD_PYTHON=ON
+          -DCALCULIXPP_SCIPP_DIR=${{ github.workspace }}/SciPP
+          -DPython3_EXECUTABLE=$(which python)
+
+      - name: Build
+        working-directory: CalculixPP
+        run: cmake --build build -j
+
+      - name: Test (CPU backend, no GPU toolkit)
+        working-directory: CalculixPP
+        run: ctest --test-dir build --output-on-failure
+
+  # Mobile cross-compile CONFIGURE smoke check (task 12.3). This is NOT a full
+  # build: it only verifies that CMake can configure the dependency-free
+  # calculixpp_core target with the iOS / Android toolchain files
+  # (CALCULIXPP_WITH_SOLVER=OFF, no NumPP/SciPP). It is allowed to skip
+  # gracefully when the NDK/SDK is not present on the runner.
+  mobile-configure:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: android
+            runner: ubuntu-latest
+          - platform: ios
+            runner: macos-latest
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CMake/Ninja
+        uses: lukka/get-cmake@latest
+
+      # The GitHub-hosted ubuntu runners ship an Android NDK and export
+      # ANDROID_NDK_HOME/ANDROID_NDK_ROOT; the macOS runners ship Xcode. If a
+      # toolkit is missing we still want the job to pass as a documented no-op.
+      - name: Configure calculixpp_core (${{ matrix.platform }})
+        continue-on-error: true
+        run: |
+          set -x
+          cmake -S . -B build-${{ matrix.platform }} \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/${{ matrix.platform }}.cmake \
+            -DCALCULIXPP_WITH_SOLVER=OFF \
+            -DCALCULIXPP_BUILD_PYTHON=OFF \
+            -DCALCULIXPP_BUILD_TESTS=OFF
