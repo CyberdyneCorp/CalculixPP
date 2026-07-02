@@ -9,6 +9,7 @@
 #include "calculixpp/io/inp_parser.hpp"
 #include "calculixpp/io/results_writer.hpp"
 #include "calculixpp/numerics/linear_static.hpp"
+#include "calculixpp/numerics/nonlinear_static.hpp"
 
 namespace {
 
@@ -30,8 +31,12 @@ std::string stem(const std::string& path) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  static const char* kUsage =
+      "usage: ccxpp <model.inp> [-o <basename>] [--solver direct|cg] "
+      "[--nonlinear] [--line-search]\n";
   std::string input, out;
   std::optional<numerics::SolverKind> forced;  // empty -> deck SOLVER= / Auto
+  bool nonlinear = false, line_search = false;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "-o" && i + 1 < argc) {
@@ -39,15 +44,19 @@ int main(int argc, char** argv) {
     } else if (a == "--solver" && i + 1 < argc) {
       const std::string s = argv[++i];
       forced = (s == "cg") ? numerics::SolverKind::CG : numerics::SolverKind::Direct;
+    } else if (a == "--nonlinear") {
+      nonlinear = true;
+    } else if (a == "--line-search") {
+      line_search = true;
     } else if (!a.empty() && a[0] != '-') {
       input = a;
     } else {
-      std::fprintf(stderr, "usage: ccxpp <model.inp> [-o <basename>] [--solver direct|cg]\n");
+      std::fprintf(stderr, "%s", kUsage);
       return 2;
     }
   }
   if (input.empty()) {
-    std::fprintf(stderr, "usage: ccxpp <model.inp> [-o <basename>] [--solver direct|cg]\n");
+    std::fprintf(stderr, "%s", kUsage);
     return 2;
   }
   if (out.empty()) out = stem(input);
@@ -55,7 +64,17 @@ int main(int argc, char** argv) {
   try {
     const Model model = cxpp::io::parse_inp_file(input);
     // --solver overrides; otherwise honor the deck's SOLVER= (Auto by default).
-    const StaticFields f = numerics::solve_linear_static(model, forced);
+    // --nonlinear routes through the Newton-Raphson driver (identical results on a
+    // linear model); the default path stays the linear solve.
+    StaticFields f;
+    if (nonlinear) {
+      numerics::NonlinearOptions opts;
+      opts.line_search = line_search;
+      opts.forced = forced;
+      f = numerics::solve_nonlinear_static(model, opts);
+    } else {
+      f = numerics::solve_linear_static(model, forced);
+    }
 
     Real umax = 0.0, svm_max = 0.0;
     for (std::size_t i = 0; i < model.mesh.num_nodes(); ++i) {

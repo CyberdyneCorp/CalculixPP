@@ -98,6 +98,63 @@ def test_displacements_match_calculix(deck):
     assert max_abs < 1e-3, f"{deck}: max abs displacement error {max_abs:.3e}"
 
 
+def _rel_l2_disp(a, b):
+    num = den = 0.0
+    for k in range(len(a)):
+        for c in range(3):
+            d = float(a[k][c]) - float(b[k][c])
+            num += d * d
+            den += float(b[k][c]) ** 2
+    return math.sqrt(num / den) if den else math.sqrt(num)
+
+
+def test_nonlinear_reproduces_linear_single_tet():
+    """GATE (spec: nonlinear-solution-control 1.5): the Newton-Raphson driver
+    reproduces the linear solve on the single-tet model to rel-L2 < 1e-10 in one
+    increment / two iterations."""
+    import calculixpp
+
+    lin = calculixpp.solve_text(C3D4_PRESSURE_DECK)
+    nl = calculixpp.solve_nonlinear_text(C3D4_PRESSURE_DECK)
+    assert nl["converged"] is True
+    assert int(nl["newton_increments"]) == 1
+    assert int(nl["newton_iterations"]) == 2
+    assert _rel_l2_disp(nl["displacement"], lin["displacement"]) < 1e-10
+
+    # Line search on: identical solution.
+    ls = calculixpp.solve_nonlinear_text(C3D4_PRESSURE_DECK, line_search=True)
+    assert _rel_l2_disp(ls["displacement"], lin["displacement"]) < 1e-10
+
+
+def test_nonlinear_reproduces_linear_beam10p():
+    """GATE: the nonlinear driver reproduces the linear beam10p solve exactly."""
+    import calculixpp
+
+    inp = os.path.join(CCX_TEST, "beam10p.inp")
+    if not os.path.exists(inp):
+        pytest.skip("beam10p deck not available")
+    lin = calculixpp.solve(inp)
+    nl = calculixpp.solve_nonlinear(inp)
+    assert nl["converged"] is True
+    assert _rel_l2_disp(nl["displacement"], lin["displacement"]) < 1e-10
+
+
+def test_nonlinear_controls_and_increments_parse():
+    """*CONTROLS, *STATIC increment data, and DIRECT parse and still reproduce the
+    linear solve. DIRECT with increment 0.5 takes exactly two increments."""
+    import calculixpp
+
+    deck = C3D4_PRESSURE_DECK.replace(
+        "*STATIC",
+        "*CONTROLS, PARAMETERS=FIELD\n1e-4,,1e-4\n*STATIC, DIRECT\n0.5, 1.0",
+    )
+    lin = calculixpp.solve_text(C3D4_PRESSURE_DECK)
+    nl = calculixpp.solve_nonlinear_text(deck)
+    assert int(nl["newton_increments"]) == 2
+    assert int(nl["newton_cutbacks"]) == 0
+    assert _rel_l2_disp(nl["displacement"], lin["displacement"]) < 1e-10
+
+
 def test_c3d4_pressure_equilibrium():
     """C3D4 case: DLOAD pressure, validated analytically via global equilibrium."""
     import calculixpp

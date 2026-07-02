@@ -15,6 +15,7 @@
 #include "calculixpp/io/inp_parser.hpp"
 #include "calculixpp/io/results_writer.hpp"
 #include "calculixpp/numerics/linear_static.hpp"
+#include "calculixpp/numerics/nonlinear_static.hpp"
 
 namespace py = pybind11;
 using namespace cxpp;
@@ -129,6 +130,36 @@ py::dict solve_text(const std::string& text, const std::string& solver,
   return solve_model(io::parse_inp(text), solver, backend);
 }
 
+// Nonlinear Newton-Raphson solve. Reproduces the linear solve on a linear model.
+// The returned dict adds newton_increments / newton_iterations / converged so
+// callers can inspect the solution path.
+py::dict solve_nonlinear_model(const Model& m, const std::string& solver,
+                               const std::string& backend, bool line_search) {
+  const std::string used = resolve_backend(backend);
+  numerics::NonlinearOptions opts;
+  opts.line_search = line_search;
+  opts.forced = kind_of(solver);
+  numerics::NonlinearReport rep;
+  py::dict d = result_dict(m, numerics::solve_nonlinear_static(m, opts, &rep));
+  d["backend"] = used;
+  d["newton_increments"] = rep.increments;
+  d["newton_iterations"] = rep.iterations;
+  d["newton_cutbacks"] = rep.cutbacks;
+  d["converged"] = rep.converged;
+  return d;
+}
+
+py::dict solve_nonlinear_file(const std::string& path, const std::string& solver,
+                              const std::string& backend, bool line_search) {
+  return solve_nonlinear_model(io::parse_inp_file(path), solver, backend,
+                               line_search);
+}
+
+py::dict solve_nonlinear_text(const std::string& text, const std::string& solver,
+                              const std::string& backend, bool line_search) {
+  return solve_nonlinear_model(io::parse_inp(text), solver, backend, line_search);
+}
+
 py::dict summary_file(const std::string& path) {
   return summary_dict(io::parse_inp_file(path));
 }
@@ -154,6 +185,20 @@ PYBIND11_MODULE(calculixpp, mod) {
   mod.def("solve_text", &solve_text, py::arg("text"), py::arg("solver") = "",
           py::arg("backend") = "",
           "Like solve() but takes the deck contents as a string.");
+
+  mod.def("solve_nonlinear", &solve_nonlinear_file, py::arg("path"),
+          py::arg("solver") = "", py::arg("backend") = "",
+          py::arg("line_search") = false,
+          "Parse an .inp deck and solve the static step with the Newton-Raphson "
+          "driver (spec: nonlinear-solution-control). On a linear model this "
+          "reproduces solve() exactly. Returns the same fields as solve() plus "
+          "newton_increments, newton_iterations, newton_cutbacks, and converged. "
+          "line_search=True enables the optional Newton step scaling (off by "
+          "default).");
+  mod.def("solve_nonlinear_text", &solve_nonlinear_text, py::arg("text"),
+          py::arg("solver") = "", py::arg("backend") = "",
+          py::arg("line_search") = false,
+          "Like solve_nonlinear() but takes the deck contents as a string.");
 
   mod.def("summary", &summary_file, py::arg("path"),
           "Parse an .inp deck without solving and return a dict describing it: "

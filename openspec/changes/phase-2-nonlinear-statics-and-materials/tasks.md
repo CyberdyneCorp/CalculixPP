@@ -6,19 +6,19 @@ satisfies. Depends on `phase-1-foundation`.
 
 ## 1. Nonlinear solution driver (spec: nonlinear-solution-control [NEW]; static-analysis — "Nonlinear static analysis", "Incrementation control")
 
-- [ ] 1.1 `NonlinearSolver` Newton-Raphson loop: tangent assembly → residual → NumPP solve → update
-- [ ] 1.2 Residual/convergence controls (force + displacement) configurable via `*CONTROLS`
-- [ ] 1.3 Automatic incrementation engine with cutback on divergence; `DIRECT` fixed increment; `*TIME POINTS`
-- [ ] 1.4 Line search (optional, behind a flag) for difficult increments
-- [ ] 1.5 Validation: a linear deck solved in one increment reproduces the Phase-1 direct solve exactly
-- [ ] 1.6 `*STATIC, PERTURBATION` about a preloaded base state (stress stiffening)
+- [x] 1.1 `NonlinearSolver` Newton-Raphson loop: tangent assembly → residual → solve → update (`numerics::solve_nonlinear_static`; tangent = `assemble_linear_static` reduced system, residual via extracted `fem::internal_force`, solve via `solve_reduced`/`resolve_solver_kind`)
+- [x] 1.2 Residual/convergence controls (force + displacement) configurable via `*CONTROLS` (`NonlinearControls`, documented defaults; parser reads `PARAMETERS=FIELD` and `TIME INCREMENTATION`)
+- [x] 1.3 Automatic incrementation engine with cutback on divergence; `DIRECT` fixed increment; `*TIME POINTS` (`Incrementation`, `run_increments`/`clamp_increment`; grows after easy convergence, halves on failure, aborts below min)
+- [x] 1.4 Line search (optional, behind a flag) for difficult increments (`NonlinearOptions::line_search`, OFF by default; scales the Newton update to reduce the residual)
+- [x] 1.5 Validation: a linear deck solved in one increment reproduces the Phase-1 direct solve exactly (single-tet + beam10p reproduce `solve_linear_static` to rel-L2 < 1e-10; `tests/test_nonlinear.cpp`, `python/tests/test_regression.py`)
+- [~] 1.6 `*STATIC, PERTURBATION` about a preloaded base state (stress stiffening) — DEFERRED: the geometric stress-stiffening K_geo needs geometric nonlinearity (NLGEOM) that does not exist yet; only linear elasticity is implemented, so a faithful perturbation-about-preload solve cannot be built without faking K_geo. Revisit with workstream 3/4 (finite-strain elements + plasticity).
 
 ## 2. Amplitude & load breadth (spec: loads-and-boundary-conditions)
 
-- [ ] 2.1 Amplitude engine: step, tabular, and periodic `*AMPLITUDE`, sampled per increment
-- [ ] 2.2 Body loads: gravity and centrifugal `*DLOAD`; `*DSLOAD`
-- [ ] 2.3 Step/restart property changes: `*CHANGE MATERIAL`, `*CHANGE PLASTIC`, `*CHANGE SOLID SECTION`
-- [ ] 2.4 Load accumulation semantics (`OP=MOD` / `OP=NEW`) across steps
+- [x] 2.1 Amplitude engine: step, tabular, and periodic `*AMPLITUDE`, sampled per increment (`core/amplitude.hpp` `Amplitude::value_at`; `Model::amplitude_factor`; `*CLOAD`/`*DLOAD`/`*BOUNDARY` carry `AMPLITUDE=`; driver samples per-increment via `fem::external_load_vector(model, lambda)` and amplitude-scaled prescribed BCs; `tests/test_loads.cpp`)
+- [x] 2.2 Body loads: gravity and centrifugal `*DLOAD`; `*DSLOAD` (`BodyLoad` GRAV/CENTRIF integrated as `rho*N` over element volume via the shape/Gauss rule; `*DSLOAD` reuses the pressure-face machinery; `fem::external_load_vector` extended; gravity global-equilibrium + centrifugal outward-radial tests in `tests/test_loads.cpp`)
+- [~] 2.3 Step/restart property changes: `*CHANGE MATERIAL`, `*CHANGE PLASTIC`, `*CHANGE SOLID SECTION`. `*CHANGE SOLID SECTION` (MATERIAL=/ELSET=) is DONE — parsed and applied by appending a `SolidSection` that wins per element (`element_elastic` is last-writer); re-binds material within the single step. `*CHANGE MATERIAL, NAME=` is parsed (re-opens the named material, rejects unknown names) and `*CHANGE PLASTIC` data is accepted, but PARTIAL/DEFERRED: it only ever changes plastic hardening data, and plasticity does not exist yet (workstream 4), so the change is a no-op. The *cross-step / restart* aspect (redefining properties at a step boundary) also needs multi-step step handling, which the single-step model lacks. Parser + within-step apply for solid-section rebind implemented and tested (`tests/test_step_changes.cpp`).
+- [~] 2.4 Load accumulation semantics (`OP=MOD` / `OP=NEW`). Parsed and applied *within the single step*: `OP=` on `*CLOAD`/`*DLOAD`/`*BOUNDARY` is validated (MOD default / NEW), and `OP=NEW` resets the accumulated loads of that type (concentrated / distributed+body / SPC), honoring the "first card of the type only" rule via per-type once-per-step flags. DEFERRED: true *across-steps* semantics — OP=MOD keeping prior-step loads while adding same-step same-DOF forces, and OP=NEW removing prior-step loads — require multi-step step handling that does not exist yet (the model is single-step; there is no step boundary to accumulate across). Within-step reset implemented and tested (`tests/test_step_changes.cpp`).
 
 ## 3. Element library expansion (spec: element-sections, mesh-and-model)
 

@@ -1,4 +1,5 @@
 #pragma once
+#include <string>
 #include <vector>
 
 #include "calculixpp/core/model.hpp"
@@ -21,6 +22,9 @@ struct LinearSystem {
   std::vector<Index> dof_eq;
   // prescribed[node_index*3 + comp] = prescribed value for constrained DOFs (else 0).
   std::vector<Real> prescribed;
+  // prescribed_amp[node_index*3 + comp] = *AMPLITUDE name for that constrained DOF
+  // (empty -> default linear ramp). Lets the driver scale prescribed BCs over time.
+  std::vector<std::string> prescribed_amp;
 };
 
 // Assemble K_ff u_f = f_ext,f - K_fc u_c and the reduced load, using

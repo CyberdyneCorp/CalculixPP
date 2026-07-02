@@ -126,6 +126,15 @@ class Parser {
   std::string card_;                                        // normalized keyword
   std::unordered_map<std::string, std::string> params_;     // normalized key -> value
   std::string cur_material_;
+  std::string cur_amplitude_;
+  // OP=NEW on a load/BC card resets prior loads of that type; per CalculiX it
+  // takes effect on the FIRST card of that type in the step only. These flags
+  // record that the first-card reset has already been consumed for the step.
+  // (Single-step model: the reset clears loads accumulated earlier in the same
+  // deck. Cross-step OP semantics need multi-step step handling — deferred.)
+  bool op_seen_cload_ = false;
+  bool op_seen_dload_ = false;
+  bool op_seen_boundary_ = false;
   std::unordered_map<std::string, std::vector<Index>> nsets_, elsets_;
   std::vector<Surface> surfaces_;  // built incrementally; flushed at end
   int cur_surface_ = -1;           // index into surfaces_, or -1 outside a surface
@@ -133,6 +142,19 @@ class Parser {
   std::string param(const std::string& key) const {
     const auto it = params_.find(key);
     return it == params_.end() ? std::string{} : it->second;
+  }
+
+  // Apply OP= on a load/BC card (spec: loads-and-boundary-conditions — load
+  // accumulation). OP=MOD (default) keeps accumulating; OP=NEW resets the prior
+  // loads of that type, but only for the first such card in the step (`seen`
+  // guards the once-per-step rule). Returns whether the reset fired.
+  bool apply_op_reset(bool& seen, int line) {
+    const std::string op = param("OP");
+    if (op.empty() || op == "MOD") return false;
+    if (op != "NEW") throw ParseError(line, "OP must be MOD or NEW, got '" + op + "'");
+    if (seen) return false;  // NEW takes effect on the first card of the type only
+    seen = true;
+    return true;
   }
 
   void begin_card(const std::vector<std::string>& fields, int line) {
@@ -150,16 +172,46 @@ class Parser {
     // Cards that carry no data or need setup at declaration time.
     static const std::vector<std::string> ignored = {
         "*NODEPRINT", "*ELPRINT",  "*NODEFILE", "*ELFILE", "*CONTACTFILE",
-        "*OUTPUT",    "*RESTART",  "*STEP",     "*STATIC", "*ENDSTEP",
-        "*HEADING",   "*AMPLITUDE"};
+        "*OUTPUT",    "*RESTART",  "*STEP",     "*ENDSTEP",
+        "*HEADING"};
     if (card_ == "*STATIC") {
       select_solver(line);
+      begin_static();
+    } else if (card_ == "*CONTROLS") {
+      // Parameters carried on the card; data lines fill the tolerances/limits.
+    } else if (card_ == "*TIMEPOINTS") {
+      // Data lines list the time points.
     } else if (card_ == "*MATERIAL") {
       cur_material_ = param("NAME");
       model_.materials[cur_material_].name = cur_material_;
+    } else if (card_ == "*AMPLITUDE") {
+      begin_amplitude(line);
     } else if (card_ == "*SURFACE") {
       begin_surface(line);
     } else if (card_ == "*SOLIDSECTION") {
+      model_.sections.push_back(SolidSection{param("ELSET"), param("MATERIAL")});
+    } else if (card_ == "*CLOAD") {
+      if (apply_op_reset(op_seen_cload_, line)) model_.cloads.clear();
+    } else if (card_ == "*DLOAD") {
+      // OP on *DLOAD resets the whole distributed-load set (pressures + body loads).
+      if (apply_op_reset(op_seen_dload_, line)) {
+        model_.dloads.clear();
+        model_.body_loads.clear();
+      }
+    } else if (card_ == "*BOUNDARY") {
+      if (apply_op_reset(op_seen_boundary_, line)) model_.spcs.clear();
+    } else if (card_ == "*CHANGEMATERIAL") {
+      begin_change_material(line);
+    } else if (card_ == "*CHANGEPLASTIC") {
+      // Redefines plastic hardening data of the current material. Plasticity is
+      // not implemented yet (workstream 4), so the data lines are accepted and
+      // ignored — nothing to change. See tasks.md 2.3 ([~], plasticity-dependent).
+    } else if (card_ == "*CHANGESOLIDSECTION") {
+      // Re-bind a material to an element set within the step. Appending a section
+      // makes it win over earlier ones per element (element_elastic() is
+      // last-writer). MATERIAL and ELSET are required.
+      if (param("MATERIAL").empty() || param("ELSET").empty())
+        throw ParseError(line, "*CHANGE SOLID SECTION needs MATERIAL= and ELSET=");
       model_.sections.push_back(SolidSection{param("ELSET"), param("MATERIAL")});
     } else if (std::find(ignored.begin(), ignored.end(), card_) == ignored.end() &&
                !is_data_card()) {
@@ -188,11 +240,91 @@ class Parser {
     }
   }
 
+  // *STATIC card: DIRECT parameter fixes the increment (no auto resizing).
+  void begin_static() {
+    if (params_.count("DIRECT") != 0) model_.increment.direct = true;
+  }
+
+  // *STATIC data line: initial_inc, total_time, min_inc, max_inc (all optional,
+  // CalculiX order). Empty/missing fields keep the current defaults.
+  void static_data(const std::vector<std::string>& f, int line) {
+    Incrementation& inc = model_.increment;
+    if (f.size() > 0 && !f[0].empty()) inc.initial = to_double(f[0], line);
+    if (f.size() > 1 && !f[1].empty()) inc.total = to_double(f[1], line);
+    if (f.size() > 2 && !f[2].empty()) inc.min = to_double(f[2], line);
+    if (f.size() > 3 && !f[3].empty()) inc.max = to_double(f[3], line);
+    if (f.size() <= 3) inc.max = inc.total;  // default max = whole step
+  }
+
+  // *CONTROLS: PARAMETERS=FIELD gives convergence tolerances (first field is the
+  // force-residual tolerance R_n^alpha); PARAMETERS=TIME INCREMENTATION gives the
+  // iteration limit (first field I_0). Other rows are accepted and ignored. Absent
+  // fields keep the documented defaults on NonlinearControls. (ref: controlss.f)
+  void controls_data(const std::vector<std::string>& f, int line) {
+    const std::string p = param("PARAMETERS");
+    if (p == "FIELD") {
+      if (!f.empty() && !f[0].empty())
+        model_.controls.force_tol = to_double(f[0], line);
+      if (f.size() > 2 && !f[2].empty())
+        model_.controls.disp_tol = to_double(f[2], line);
+    } else if (p.rfind("TIMEINCREMENTATION", 0) == 0 || p == "TIME INCREMENTATION") {
+      if (!f.empty() && !f[0].empty())
+        model_.controls.max_iterations = static_cast<int>(to_index(f[0], line));
+    }
+  }
+
+  // *TIME POINTS: a list of increasing times within the step, used to force
+  // increments to land on the given times.
+  void time_points_data(const std::vector<std::string>& f, int line) {
+    for (const std::string& tok : f)
+      if (!tok.empty()) model_.time_points.times.push_back(to_double(tok, line));
+  }
+
+  // *AMPLITUDE, NAME=..., DEFINITION=TABULAR|STEP, TIME=..., VALUE=... — the data
+  // lines carry (time, value) pairs. Periodic amplitudes are not a NAME-scoped card
+  // here; PERIOD (if given as a parameter) sets the wrap length.
+  void begin_amplitude(int line) {
+    cur_amplitude_ = param("NAME");
+    if (cur_amplitude_.empty()) throw ParseError(line, "*AMPLITUDE without NAME");
+    Amplitude a;
+    a.name = cur_amplitude_;
+    const std::string def = param("DEFINITION");
+    a.definition = (def == "STEP") ? Amplitude::Definition::Step
+                                   : Amplitude::Definition::Tabular;
+    if (!param("PERIOD").empty()) a.period = to_double(param("PERIOD"), line);
+    model_.amplitudes[cur_amplitude_] = std::move(a);
+  }
+
+  // *AMPLITUDE data: a flat list of alternating time, value entries (possibly many
+  // pairs per line), appended to the current amplitude curve.
+  void amplitude_data(const std::vector<std::string>& f, int line) {
+    if (cur_amplitude_.empty()) throw ParseError(line, "*AMPLITUDE data without NAME");
+    Amplitude& a = model_.amplitudes[cur_amplitude_];
+    for (std::size_t i = 0; i + 1 < f.size(); i += 2) {
+      if (f[i].empty() || f[i + 1].empty()) continue;
+      a.points.emplace_back(to_double(f[i], line), to_double(f[i + 1], line));
+    }
+  }
+
+  // *CHANGE MATERIAL, NAME=<mat>: re-open an existing material to redefine its
+  // properties within the step (followed by *CHANGE PLASTIC in CalculiX). The
+  // material must already exist. Only re-opens the context here; the actual
+  // property change is done by the following *CHANGE PLASTIC (deferred: no
+  // plasticity yet). (spec: loads-and-boundary-conditions — step property change.)
+  void begin_change_material(int line) {
+    const std::string name = param("NAME");
+    if (name.empty()) throw ParseError(line, "*CHANGE MATERIAL needs NAME=");
+    if (model_.materials.find(name) == model_.materials.end())
+      throw ParseError(line, "*CHANGE MATERIAL: unknown material '" + name + "'");
+    cur_material_ = name;
+  }
+
   bool is_data_card() const {
     static const std::vector<std::string> data_cards = {
-        "*NODE",    "*ELEMENT",     "*NSET",     "*ELSET", "*MATERIAL",
-        "*ELASTIC", "*DENSITY",     "*SOLIDSECTION", "*BOUNDARY", "*CLOAD",
-        "*DLOAD",   "*SURFACE"};
+        "*NODE",    "*ELEMENT",  "*NSET",         "*ELSET",     "*MATERIAL",
+        "*ELASTIC", "*DENSITY",  "*SOLIDSECTION", "*BOUNDARY",  "*CLOAD",
+        "*DLOAD",   "*DSLOAD",   "*SURFACE",      "*STATIC",    "*CONTROLS",
+        "*TIMEPOINTS", "*AMPLITUDE", "*CHANGEPLASTIC"};
     return std::find(data_cards.begin(), data_cards.end(), card_) != data_cards.end();
   }
 
@@ -206,9 +338,14 @@ class Parser {
     if (card_ == "*BOUNDARY") return boundary(f, line);
     if (card_ == "*CLOAD") return cload(f, line);
     if (card_ == "*DLOAD") return dload(f, line);
+    if (card_ == "*DSLOAD") return dsload(f, line);
     if (card_ == "*SURFACE") return surface_data(f, line);
-    // *SOLID SECTION optional thickness line, output requests, step/static
-    // control lines, amplitudes: accepted and ignored in Phase 1.
+    if (card_ == "*STATIC") return static_data(f, line);
+    if (card_ == "*CONTROLS") return controls_data(f, line);
+    if (card_ == "*TIMEPOINTS") return time_points_data(f, line);
+    if (card_ == "*AMPLITUDE") return amplitude_data(f, line);
+    // *SOLID SECTION optional thickness line, output requests, amplitudes:
+    // accepted and ignored in Phase 1.
   }
 
   void node(const std::vector<std::string>& f, int line) {
@@ -287,17 +424,19 @@ class Parser {
     const int d1 = static_cast<int>(to_index(f[1], line));
     const int d2 = f.size() > 2 && !f[2].empty() ? static_cast<int>(to_index(f[2], line)) : d1;
     const Real val = f.size() > 3 ? to_double(f[3], line) : 0.0;
+    const std::string amp = param("AMPLITUDE");
     for (const Index nd : node_refs(f[0], line))
       for (int c = d1; c <= d2 && c <= kDofsPerNode; ++c)
-        model_.spcs.push_back(Spc{nd, c, val});
+        model_.spcs.push_back(Spc{nd, c, val, amp});
   }
 
   void cload(const std::vector<std::string>& f, int line) {
     if (f.size() < 3) throw ParseError(line, "*CLOAD needs node,dof,value");
     const int dof = static_cast<int>(to_index(f[1], line));
     const Real val = to_double(f[2], line);
+    const std::string amp = param("AMPLITUDE");
     for (const Index nd : node_refs(f[0], line))
-      model_.cloads.push_back(Cload{nd, dof, val});
+      model_.cloads.push_back(Cload{nd, dof, val, amp});
   }
 
   // Expand an element reference (integer id or elset name) to element ids.
@@ -310,16 +449,75 @@ class Parser {
     return it->second;
   }
 
+  // *DLOAD: pressure "elem, P<face>, magnitude"; body loads "GRAV, g, nx,ny,nz"
+  // and "elset, CENTRIF, omega2, px,py,pz, ax,ay,az".
   void dload(const std::vector<std::string>& f, int line) {
-    if (f.size() < 3) throw ParseError(line, "*DLOAD needs element,P<face>,magnitude");
+    if (f.size() < 2) throw ParseError(line, "*DLOAD needs at least a label");
     const std::string label = upper(f[1]);
+    const std::string amp = param("AMPLITUDE");
+    if (label == "GRAV") return gravity_load(f, line, amp);
+    if (label == "CENTRIF") return centrif_load(f, line, amp);
     if (label.empty() || label[0] != 'P')
       throw ParseError(line, "unsupported *DLOAD type '" + f[1] +
-                                 "' (Phase 1 supports pressure P<face> only)");
+                                 "' (supports P<face>, GRAV, CENTRIF)");
+    if (f.size() < 3) throw ParseError(line, "*DLOAD needs element,P<face>,magnitude");
     const int face = static_cast<int>(to_index(label.substr(1), line));
     const Real p = to_double(f[2], line);
     for (const Index eid : elem_refs(f[0], line))
-      model_.dloads.push_back(Dload{eid, face, p});
+      model_.dloads.push_back(Dload{eid, face, p, amp});
+  }
+
+  // *DLOAD GRAV: "elset, GRAV, g, nx, ny, nz". A blank/numeric elset -> all elements.
+  void gravity_load(const std::vector<std::string>& f, int line,
+                    const std::string& amp) {
+    if (f.size() < 6) throw ParseError(line, "*DLOAD GRAV needs elset, g, nx, ny, nz");
+    BodyLoad bl;
+    bl.kind = BodyLoad::Kind::Gravity;
+    bl.elset = elset_name(f[0]);
+    bl.magnitude = to_double(f[2], line);
+    bl.dir = {to_double(f[3], line), to_double(f[4], line), to_double(f[5], line)};
+    bl.amplitude = amp;
+    model_.body_loads.push_back(std::move(bl));
+  }
+
+  // *DLOAD CENTRIF: "elset, CENTRIF, omega2, px, py, pz, ax, ay, az".
+  void centrif_load(const std::vector<std::string>& f, int line,
+                    const std::string& amp) {
+    if (f.size() < 9)
+      throw ParseError(line, "*DLOAD CENTRIF needs omega2, px,py,pz, ax,ay,az");
+    BodyLoad bl;
+    bl.kind = BodyLoad::Kind::Centrifugal;
+    bl.elset = elset_name(f[0]);
+    bl.magnitude = to_double(f[2], line);  // omega^2
+    bl.point = {to_double(f[3], line), to_double(f[4], line), to_double(f[5], line)};
+    bl.dir = {to_double(f[6], line), to_double(f[7], line), to_double(f[8], line)};
+    bl.amplitude = amp;
+    model_.body_loads.push_back(std::move(bl));
+  }
+
+  // Interpret a *DLOAD/CENTRIF first field as an elset name (empty -> all elements).
+  // A bare integer is treated as a singleton — but body loads are set-scoped, so an
+  // integer element id is uncommon; keep the name form (empty means all).
+  std::string elset_name(const std::string& tok) const {
+    const std::string t = upper(trim(tok));
+    if (t.empty() || std::isdigit(static_cast<unsigned char>(t.front())) != 0)
+      return {};  // blank or numeric -> apply to all elements
+    return t;
+  }
+
+  // *DSLOAD: distributed surface load "elem, P<face>, magnitude" — same consistent
+  // pressure-face machinery as *DLOAD P<face>. (Surface-name form deferred.)
+  void dsload(const std::vector<std::string>& f, int line) {
+    if (f.size() < 3) throw ParseError(line, "*DSLOAD needs element,P<face>,magnitude");
+    const std::string label = upper(f[1]);
+    if (label.empty() || label[0] != 'P')
+      throw ParseError(line, "unsupported *DSLOAD type '" + f[1] +
+                                 "' (supports pressure P<face>)");
+    const int face = static_cast<int>(to_index(label.substr(1), line));
+    const Real p = to_double(f[2], line);
+    const std::string amp = param("AMPLITUDE");
+    for (const Index eid : elem_refs(f[0], line))
+      model_.dloads.push_back(Dload{eid, face, p, amp});
   }
 
   // Start a new named *SURFACE (TYPE=ELEMENT default, or TYPE=NODE).

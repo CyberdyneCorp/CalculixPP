@@ -17,6 +17,7 @@ LinearSystem assemble_linear_static(const Model& model) {
   LinearSystem sys;
   sys.dof_eq.assign(n_dof, -1);
   sys.prescribed.assign(n_dof, 0.0);
+  sys.prescribed_amp.assign(n_dof, std::string{});
   std::vector<bool> constrained(n_dof, false);
 
   // Apply single-point constraints.
@@ -29,6 +30,7 @@ LinearSystem assemble_linear_static(const Model& model) {
                           static_cast<std::size_t>(spc.comp - 1);
     constrained[g] = true;
     sys.prescribed[g] = spc.value;
+    sys.prescribed_amp[g] = spc.amplitude;
   }
 
   // Number the free DOFs.

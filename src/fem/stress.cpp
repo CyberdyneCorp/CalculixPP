@@ -60,7 +60,56 @@ void extrapolate_to_nodes(ElementType type, int n,
                  nodal[static_cast<std::size_t>(kMid[mnode][1])][static_cast<std::size_t>(comp)]);
 }
 
+// Scatter one element's internal force Ke_e u_e into the global vector f_int.
+void accumulate_internal_force(ElementType type,
+                               const std::vector<Vec3>& coords,
+                               const std::vector<Index>& nidx,
+                               const std::vector<Vec3>& ue, const ElasticIso& mat,
+                               std::vector<Real>& f_int) {
+  const int n = nodes_per_element(type);
+  const std::vector<Real> Ke = element_stiffness(type, coords, mat);
+  const int ndof = n * kDofsPerNode;
+  for (int a = 0; a < ndof; ++a) {
+    Real v = 0.0;
+    for (int b = 0; b < ndof; ++b)
+      v += Ke[static_cast<std::size_t>(a) * static_cast<std::size_t>(ndof) + static_cast<std::size_t>(b)] *
+           ue[static_cast<std::size_t>(b / kDofsPerNode)][static_cast<std::size_t>(b % kDofsPerNode)];
+    f_int[static_cast<std::size_t>(nidx[static_cast<std::size_t>(a / kDofsPerNode)]) * kDofsPerNode +
+          static_cast<std::size_t>(a % kDofsPerNode)] += v;
+  }
+}
+
+// Gather an element's node indices, coordinates, and current displacements.
+void gather_element(const Mesh& mesh, const Element& elem,
+                    const std::vector<Vec3>& u, std::vector<Vec3>& coords,
+                    std::vector<Index>& nidx, std::vector<Vec3>& ue) {
+  const int n = nodes_per_element(elem.type);
+  coords.resize(static_cast<std::size_t>(n));
+  nidx.resize(static_cast<std::size_t>(n));
+  ue.resize(static_cast<std::size_t>(n));
+  for (int i = 0; i < n; ++i) {
+    const Index ni = mesh.node_index(elem.nodes[static_cast<std::size_t>(i)]);
+    nidx[static_cast<std::size_t>(i)] = ni;
+    coords[static_cast<std::size_t>(i)] = mesh.nodes()[static_cast<std::size_t>(ni)].x;
+    ue[static_cast<std::size_t>(i)] = u[static_cast<std::size_t>(ni)];
+  }
+}
+
 }  // namespace
+
+std::vector<Real> internal_force(const Model& model, const std::vector<Vec3>& u) {
+  const Mesh& mesh = model.mesh;
+  std::vector<Real> f_int(mesh.num_nodes() * kDofsPerNode, 0.0);
+  const std::vector<ElasticIso> elastic = model.element_elastic();
+  std::vector<Vec3> coords, ue;
+  std::vector<Index> nidx;
+  for (std::size_t e = 0; e < mesh.num_elements(); ++e) {
+    const Element& elem = mesh.elements()[e];
+    gather_element(mesh, elem, u, coords, nidx, ue);
+    accumulate_internal_force(elem.type, coords, nidx, ue, elastic[e], f_int);
+  }
+  return f_int;
+}
 
 void recover_fields(const Model& model, StaticFields& fields) {
   const Mesh& mesh = model.mesh;
@@ -89,16 +138,7 @@ void recover_fields(const Model& model, StaticFields& fields) {
     const D6 D = elastic_iso_D(elastic[e]);
 
     // Internal force f_int_e = Ke_e u_e, scattered to global DOFs.
-    const std::vector<Real> Ke = element_stiffness(elem.type, coords, elastic[e]);
-    const int ndof = n * kDofsPerNode;
-    for (int a = 0; a < ndof; ++a) {
-      Real v = 0.0;
-      for (int b = 0; b < ndof; ++b)
-        v += Ke[static_cast<std::size_t>(a) * static_cast<std::size_t>(ndof) + static_cast<std::size_t>(b)] *
-             ue[static_cast<std::size_t>(b / kDofsPerNode)][static_cast<std::size_t>(b % kDofsPerNode)];
-      f_int[static_cast<std::size_t>(nidx[static_cast<std::size_t>(a / kDofsPerNode)]) * kDofsPerNode +
-            static_cast<std::size_t>(a % kDofsPerNode)] += v;
-    }
+    accumulate_internal_force(elem.type, coords, nidx, ue, elastic[e], f_int);
 
     // Integration-point strains and stresses.
     const auto rule = gauss_rule(elem.type);
