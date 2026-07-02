@@ -14,11 +14,11 @@
 // (spec: linear-algebra-and-solvers, static-analysis, compute-backend.)
 namespace cxpp::numerics {
 
-// PERFORMANCE CAVEAT (SciPP#10): scipp::sparse::spsolve currently densifies the
-// matrix (O(N^2) mem / O(N^3) time) — correct but caps mesh size at ~hundreds of
-// DOF; scipp::sparse::cg is unpreconditioned and may NOT converge on stiff FE
-// systems (silently wrong). Revisit defaults once SciPP ships a sparse Cholesky/
-// LDLT + preconditioned CG. See https://github.com/CyberdyneCorp/SciPP/issues/10
+// Solver notes (SciPP#10, resolved in SciPP v1.2.0): scipp::sparse::spsolve now
+// factors genuinely sparsely (SPD -> Cholesky, else LU, with RCM fill-reducing
+// ordering) — an ~280x speedup at 8k DOF and no longer memory-bound. The CG path
+// (compute/cpu_backend.cpp) uses IC0-preconditioned cg_report and raises on
+// non-convergence. Direct remains the default.
 //
 // SolverKind lives in the compute layer (compute/backend.hpp) so the backend
 // interface and numerics share one enum; re-exported here for existing callers.

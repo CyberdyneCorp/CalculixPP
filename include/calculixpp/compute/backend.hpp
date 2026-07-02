@@ -17,12 +17,12 @@
 // build or run error.
 namespace cxpp::compute {
 
-// Which sparse solver the backend should use for a solve. Direct maps to a direct
-// factorization (SciPP spsolve today), CG to the SPD iterative path (SciPP cg).
-// (Same caveats as SciPP#10 apply — see numerics/linear_static.hpp.)
+// Which sparse solver the backend should use for a solve. Direct maps to a sparse
+// direct factorization (SciPP v1.2.0 spsolve: SPD Cholesky / LU + RCM ordering),
+// CG to the IC0-preconditioned SPD iterative path (cg_report, checks convergence).
 enum class SolverKind {
-  Direct,  // scipp::sparse::spsolve (dense LU today — see caveat)
-  CG,      // scipp::sparse::cg (unpreconditioned — see caveat)
+  Direct,  // scipp::sparse::spsolve (sparse Cholesky/LU)
+  CG,      // scipp::sparse::cg_report + IC0 preconditioner
 };
 
 // Which compute backend to run on. CPU is the reference implementation and the

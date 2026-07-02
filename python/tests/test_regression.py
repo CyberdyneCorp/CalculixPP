@@ -110,6 +110,26 @@ def test_c3d4_pressure_equilibrium():
         assert abs(total[c] - 50.0) < 1e-6, f"reaction sum[{c}]={total[c]}"
 
 
+def test_large_deck_solvers_agree():
+    """Scaling + convergence (SciPP#10, v1.2.0): on a larger FE system the sparse
+    direct solve and the IC0-preconditioned CG agree. Skipped if the deck is absent."""
+    import calculixpp
+
+    inp = os.path.join(CCX_TEST, "segmentunsmooth.inp")
+    if not os.path.exists(inp):
+        pytest.skip("segmentunsmooth deck not available")
+    d = calculixpp.solve(inp, solver="direct")
+    c = calculixpp.solve(inp, solver="cg")
+    ud, uc = d["displacement"], c["displacement"]
+    num = den = 0.0
+    for k in range(len(ud)):
+        for j in range(3):
+            num += (float(ud[k][j]) - float(uc[k][j])) ** 2
+            den += float(ud[k][j]) ** 2
+    rel = math.sqrt(num / den) if den else 0.0
+    assert rel < 1e-5, f"direct vs IC0-CG disagree: relL2={rel:.3e}"
+
+
 def test_exception_propagation():
     import calculixpp
 

@@ -11,9 +11,9 @@
 
 // CPU reference backend (spec: compute-backend, linear-algebra-and-solvers).
 // Wraps the SciPP sparse path: COO triplets -> CsrMatrix::from_coo -> spsolve
-// (direct) / cg (SPD iterative). This is the numerics path used since Phase 1 and
-// is behavior-preserving — the routing through ComputeBackend does not change the
-// assembled matrix, the solver, or the results.
+// (sparse Cholesky for SPD / LU otherwise, SciPP v1.2.0) or IC0-preconditioned
+// CG. Direct is the default; CG uses cg_report + IC0 and checks convergence so a
+// non-converged result raises rather than returning a silently-wrong vector.
 namespace cxpp::compute {
 namespace {
 
@@ -49,9 +49,21 @@ class CpuBackend final : public ComputeBackend {
     for (std::int64_t i = 0; i < dim; ++i)
       b.set_item<double>({i}, rhs[static_cast<std::size_t>(i)]);
 
-    const numpp::ndarray x = (solver == SolverKind::CG)
-                                 ? scipp::sparse::cg(A, b)
-                                 : scipp::sparse::spsolve(A, b);
+    numpp::ndarray x;
+    if (solver == SolverKind::CG) {
+      // IC0-preconditioned CG for the SPD FE system, with a convergence check.
+      const scipp::sparse::IterationResult res =
+          scipp::sparse::cg_report(A, b, scipp::sparse::Preconditioner::IC0);
+      if (!res.converged)
+        throw std::runtime_error(
+            "CG did not converge (relative residual " +
+            std::to_string(res.final_residual) + " after " +
+            std::to_string(res.iterations) +
+            " iterations); use SOLVER=default (direct)");
+      x = res.x;
+    } else {
+      x = scipp::sparse::spsolve(A, b);  // sparse Cholesky (SPD) / LU
+    }
 
     std::vector<Real> u(static_cast<std::size_t>(dim));
     for (std::int64_t i = 0; i < dim; ++i)
