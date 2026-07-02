@@ -5,8 +5,9 @@
 #include "calculixpp/core/model.hpp"
 
 // Abaqus-style input-deck parser (spec: input-deck-parsing — Phase-1 subset).
-// Supported cards: *NODE, *ELEMENT (C3D4/C3D10), *NSET, *ELSET, *MATERIAL,
-// *ELASTIC, *DENSITY, *SOLID SECTION, *BOUNDARY, *CLOAD, *STEP, *STATIC.
+// Supported cards: *NODE, *ELEMENT (C3D4/C3D10), *NSET, *ELSET, *SURFACE,
+// *MATERIAL, *ELASTIC, *DENSITY, *SOLID SECTION, *BOUNDARY, *CLOAD, *STEP,
+// *STATIC.
 // Output-request cards (*NODE PRINT, *EL PRINT, *NODE FILE, *EL FILE, ...) are
 // accepted and ignored. Unsupported cards raise ParseError.
 namespace cxpp::io {

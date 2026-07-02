@@ -56,4 +56,13 @@ const std::vector<Index>* Mesh::elset(const std::string& name) const {
   return it == elsets_.end() ? nullptr : &it->second;
 }
 
+void Mesh::add_surface(Surface surface) {
+  surfaces_[surface.name] = std::move(surface);
+}
+
+const Surface* Mesh::surface(const std::string& name) const {
+  const auto it = surfaces_.find(name);
+  return it == surfaces_.end() ? nullptr : &it->second;
+}
+
 }  // namespace cxpp

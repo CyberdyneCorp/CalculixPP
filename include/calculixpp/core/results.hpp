@@ -12,6 +12,7 @@ using Voigt6 = std::array<Real, 6>;  // stress/strain: xx, yy, zz, xy, xz, yz
 struct StaticFields {
   std::vector<Vec3> displacement;  // U
   std::vector<Voigt6> stress;      // S (averaged nodal stress)
+  std::vector<Voigt6> strain;      // E (averaged nodal strain, engineering shear)
   std::vector<Vec3> reaction;      // RF (f_int - f_ext)
 };
 

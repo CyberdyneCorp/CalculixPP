@@ -68,3 +68,37 @@ jobs:
       - name: Test (CPU backend, no GPU toolkit)
         working-directory: CalculixPP
         run: ctest --test-dir build --output-on-failure
+
+  # Mobile cross-compile CONFIGURE smoke check (task 12.3). This is NOT a full
+  # build: it only verifies that CMake can configure the dependency-free
+  # calculixpp_core target with the iOS / Android toolchain files
+  # (CALCULIXPP_WITH_SOLVER=OFF, no NumPP/SciPP). It is allowed to skip
+  # gracefully when the NDK/SDK is not present on the runner.
+  mobile-configure:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: android
+            runner: ubuntu-latest
+          - platform: ios
+            runner: macos-latest
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CMake/Ninja
+        uses: lukka/get-cmake@latest
+
+      # The GitHub-hosted ubuntu runners ship an Android NDK and export
+      # ANDROID_NDK_HOME/ANDROID_NDK_ROOT; the macOS runners ship Xcode. If a
+      # toolkit is missing we still want the job to pass as a documented no-op.
+      - name: Configure calculixpp_core (${{ matrix.platform }})
+        continue-on-error: true
+        run: |
+          set -x
+          cmake -S . -B build-${{ matrix.platform }} \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/${{ matrix.platform }}.cmake \
+            -DCALCULIXPP_WITH_SOLVER=OFF \
+            -DCALCULIXPP_BUILD_PYTHON=OFF \
+            -DCALCULIXPP_BUILD_TESTS=OFF

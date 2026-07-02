@@ -21,8 +21,8 @@ std::string i10(long v) {
   return buf;
 }
 
-// .frd stress order is SXX,SYY,SZZ,SXY,SYZ,SZX; ours is xx,yy,zz,xy,xz,yz.
-Voigt6 to_frd_stress(const Voigt6& s) {
+// .frd order is XX,YY,ZZ,XY,YZ,ZX; ours is xx,yy,zz,xy,xz,yz (swap last two).
+Voigt6 to_frd_order(const Voigt6& s) {
   return {s[0], s[1], s[2], s[3], s[5], s[4]};
 }
 
@@ -77,9 +77,21 @@ void write_frd(const std::string& path, const Model& model, const StaticFields& 
   for (const char* c : {"SXX", "SYY", "SZZ", "SXY", "SYZ", "SZX"})
     out << " -5  " << c << "         1    4    1    1\n";
   for (std::size_t i = 0; i < mesh.num_nodes(); ++i) {
-    const Voigt6 s = to_frd_stress(f.stress[i]);
+    const Voigt6 s = to_frd_order(f.stress[i]);
     out << " -1" << i10(mesh.nodes()[i].id);
     for (int c = 0; c < 6; ++c) out << e12_5(s[static_cast<std::size_t>(c)]);
+    out << "\n";
+  }
+  out << " -3\n";
+
+  // TOSTRAIN (E).
+  dataset_header("TOSTRAIN", 6);
+  for (const char* c : {"EXX", "EYY", "EZZ", "EXY", "EYZ", "EZX"})
+    out << " -5  " << c << "         1    4    1    1\n";
+  for (std::size_t i = 0; i < mesh.num_nodes(); ++i) {
+    const Voigt6 e = to_frd_order(f.strain[i]);
+    out << " -1" << i10(mesh.nodes()[i].id);
+    for (int c = 0; c < 6; ++c) out << e12_5(e[static_cast<std::size_t>(c)]);
     out << "\n";
   }
   out << " -3\n";
@@ -109,6 +121,13 @@ void write_dat(const std::string& path, const Model& model, const StaticFields& 
   for (std::size_t i = 0; i < mesh.num_nodes(); ++i) {
     out << i10(mesh.nodes()[i].id);
     for (int c = 0; c < 6; ++c) out << e12_5(f.stress[i][static_cast<std::size_t>(c)]);
+    out << "\n";
+  }
+
+  out << "\n strains (exx,eyy,ezz,exy,exz,eyz)\n\n";
+  for (std::size_t i = 0; i < mesh.num_nodes(); ++i) {
+    out << i10(mesh.nodes()[i].id);
+    for (int c = 0; c < 6; ++c) out << e12_5(f.strain[i][static_cast<std::size_t>(c)]);
     out << "\n";
   }
 

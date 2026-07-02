@@ -127,6 +127,8 @@ class Parser {
   std::unordered_map<std::string, std::string> params_;     // normalized key -> value
   std::string cur_material_;
   std::unordered_map<std::string, std::vector<Index>> nsets_, elsets_;
+  std::vector<Surface> surfaces_;  // built incrementally; flushed at end
+  int cur_surface_ = -1;           // index into surfaces_, or -1 outside a surface
 
   std::string param(const std::string& key) const {
     const auto it = params_.find(key);
@@ -150,14 +152,39 @@ class Parser {
         "*NODEPRINT", "*ELPRINT",  "*NODEFILE", "*ELFILE", "*CONTACTFILE",
         "*OUTPUT",    "*RESTART",  "*STEP",     "*STATIC", "*ENDSTEP",
         "*HEADING",   "*AMPLITUDE"};
-    if (card_ == "*MATERIAL") {
+    if (card_ == "*STATIC") {
+      select_solver(line);
+    } else if (card_ == "*MATERIAL") {
       cur_material_ = param("NAME");
       model_.materials[cur_material_].name = cur_material_;
+    } else if (card_ == "*SURFACE") {
+      begin_surface(line);
     } else if (card_ == "*SOLIDSECTION") {
       model_.sections.push_back(SolidSection{param("ELSET"), param("MATERIAL")});
     } else if (std::find(ignored.begin(), ignored.end(), card_) == ignored.end() &&
                !is_data_card()) {
       throw ParseError(line, "unsupported card '" + fields.front() + "'");
+    }
+  }
+
+  // Map SOLVER= on *STATIC onto a RequestedSolver (spec 9.2/9.3). Direct family
+  // (SPOOLES/PARDISO/PASTIX) -> Direct; ITERATIVE*/CG -> CG; empty -> default
+  // Direct. An unrecognized/unavailable name throws with the requested name,
+  // mirroring CalculiX's 'solver not available' behavior.
+  void select_solver(int line) {
+    std::string name = param("SOLVER");
+    name.erase(std::remove_if(name.begin(), name.end(),
+                              [](unsigned char c) { return std::isspace(c) != 0; }),
+               name.end());
+    if (name.empty()) {
+      model_.solver = RequestedSolver::Direct;
+    } else if (name == "SPOOLES" || name == "PARDISO" || name == "PASTIX" ||
+               name == "DIRECT") {
+      model_.solver = RequestedSolver::Direct;
+    } else if (name == "CG" || name.rfind("ITERATIVE", 0) == 0) {
+      model_.solver = RequestedSolver::CG;
+    } else {
+      throw ParseError(line, "solver not available: SOLVER=" + param("SOLVER"));
     }
   }
 
@@ -179,8 +206,9 @@ class Parser {
     if (card_ == "*BOUNDARY") return boundary(f, line);
     if (card_ == "*CLOAD") return cload(f, line);
     if (card_ == "*DLOAD") return dload(f, line);
+    if (card_ == "*SURFACE") return surface_data(f, line);
     // *SOLID SECTION optional thickness line, output requests, step/static
-    // control lines, surfaces, amplitudes: accepted and ignored in Phase 1.
+    // control lines, amplitudes: accepted and ignored in Phase 1.
   }
 
   void node(const std::vector<std::string>& f, int line) {
@@ -294,9 +322,57 @@ class Parser {
       model_.dloads.push_back(Dload{eid, face, p});
   }
 
+  // Start a new named *SURFACE (TYPE=ELEMENT default, or TYPE=NODE).
+  void begin_surface(int line) {
+    const std::string name = param("NAME");
+    if (name.empty()) throw ParseError(line, "*SURFACE without NAME");
+    const std::string type = param("TYPE");
+    Surface s;
+    s.name = name;
+    if (type.empty() || type == "ELEMENT") {
+      s.type = Surface::Type::Element;
+    } else if (type == "NODE") {
+      s.type = Surface::Type::Node;
+    } else {
+      throw ParseError(line, "unsupported *SURFACE TYPE=" + type +
+                                 " (expected ELEMENT or NODE)");
+    }
+    cur_surface_ = static_cast<int>(surfaces_.size());
+    surfaces_.push_back(std::move(s));
+  }
+
+  // Parse a face id 'S<n>' -> n (1..4 for tets); reject anything else.
+  int surface_face(const std::string& tok, int line) {
+    const std::string t = upper(tok);
+    if (t.size() < 2 || t[0] != 'S')
+      throw ParseError(line, "*SURFACE face must be S<n>, got '" + tok + "'");
+    const int face = static_cast<int>(to_index(t.substr(1), line));
+    if (face < 1 || face > 4)
+      throw ParseError(line, "*SURFACE face out of range (1..4): '" + tok + "'");
+    return face;
+  }
+
+  void surface_data(const std::vector<std::string>& f, int line) {
+    if (cur_surface_ < 0) throw ParseError(line, "*SURFACE data without a surface");
+    Surface& s = surfaces_[static_cast<std::size_t>(cur_surface_)];
+    if (s.type == Surface::Type::Node) {
+      if (f.empty()) throw ParseError(line, "*SURFACE (NODE) needs a node id or nset");
+      for (const std::string& tok : f)
+        for (const Index nd : node_refs(tok, line)) s.nodes.push_back(nd);
+      return;
+    }
+    // TYPE=ELEMENT: "elset_or_elem, S<face>".
+    if (f.size() < 2)
+      throw ParseError(line, "*SURFACE (ELEMENT) needs 'elset_or_elem, S<face>'");
+    const int face = surface_face(f[1], line);
+    for (const Index eid : elem_refs(f[0], line))
+      s.faces.emplace_back(eid, face);
+  }
+
   void flush_sets() {
     for (auto& [name, ids] : nsets_) model_.mesh.add_nset(name, ids);
     for (auto& [name, ids] : elsets_) model_.mesh.add_elset(name, ids);
+    for (auto& s : surfaces_) model_.mesh.add_surface(std::move(s));
   }
 };
 

@@ -22,6 +22,17 @@ stock CalculiX (`beam10p.dat.ref`) to **relative L2 ≈ 5e-8**. Remaining Phase-
 `*DLOAD` pressure, the full reference-deck corpus, and CI. See
 `openspec/changes/phase-1-foundation/tasks.md`.
 
+### Run a deck (CLI)
+
+```bash
+cmake -S . -B build -G Ninja -DCALCULIXPP_WITH_SOLVER=ON
+cmake --build build
+build/apps/ccxpp model.inp -o model --solver direct   # writes model.frd, model.dat
+```
+
+`ccxpp <model.inp> [-o <basename>] [--solver direct|cg]` parses the deck, solves
+`K u = f`, and writes CGX-compatible `.frd` and tabular `.dat` output.
+
 ### Python
 
 ```bash

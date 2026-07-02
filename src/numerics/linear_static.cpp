@@ -1,44 +1,20 @@
 #include "calculixpp/numerics/linear_static.hpp"
 
-#include <cstdint>
-
+#include "calculixpp/compute/backend.hpp"
 #include "calculixpp/fem/stress.hpp"
-#include "numpp/core/creation.hpp"
-#include "numpp/core/dtype.hpp"
-#include "scipp/sparse/sparse.hpp"
 
 namespace cxpp::numerics {
 
+SolverKind solver_kind(const Model& model) {
+  return model.solver == RequestedSolver::CG ? SolverKind::CG : SolverKind::Direct;
+}
+
 std::vector<Real> solve_reduced(const fem::LinearSystem& sys, SolverKind kind) {
-  const std::int64_t n = sys.n_free;
-  const std::int64_t nnz = static_cast<std::int64_t>(sys.vals.size());
-
-  scipp::sparse::CooMatrix coo;
-  coo.rows = n;
-  coo.cols = n;
-  coo.data = numpp::zeros({nnz}, numpp::kFloat64);
-  coo.row = numpp::zeros({nnz}, numpp::kInt64);
-  coo.col = numpp::zeros({nnz}, numpp::kInt64);
-  for (std::int64_t i = 0; i < nnz; ++i) {
-    coo.data.set_item<double>({i}, sys.vals[static_cast<std::size_t>(i)]);
-    coo.row.set_item<std::int64_t>({i}, sys.rows[static_cast<std::size_t>(i)]);
-    coo.col.set_item<std::int64_t>({i}, sys.cols[static_cast<std::size_t>(i)]);
-  }
-
-  const scipp::sparse::CsrMatrix A = scipp::sparse::CsrMatrix::from_coo(coo);
-
-  numpp::ndarray b = numpp::zeros({n}, numpp::kFloat64);
-  for (std::int64_t i = 0; i < n; ++i)
-    b.set_item<double>({i}, sys.rhs[static_cast<std::size_t>(i)]);
-
-  const numpp::ndarray x = (kind == SolverKind::CG)
-                               ? scipp::sparse::cg(A, b)
-                               : scipp::sparse::spsolve(A, b);
-
-  std::vector<Real> u(static_cast<std::size_t>(n));
-  for (std::int64_t i = 0; i < n; ++i)
-    u[static_cast<std::size_t>(i)] = x.item<double>({i});
-  return u;
+  // Route the sparse SPD solve through the compute backend (CPU reference backend
+  // wraps the SciPP path). Behavior-preserving: same COO triplets, same solver.
+  const compute::ComputeBackend& backend = compute::select_backend();
+  return backend.solve_sparse(sys.rows, sys.cols, sys.vals, sys.n_free, sys.rhs,
+                              kind);
 }
 
 StaticFields solve_linear_static(const Model& model, SolverKind kind) {

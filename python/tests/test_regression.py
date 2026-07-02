@@ -115,3 +115,91 @@ def test_exception_propagation():
 
     with pytest.raises(RuntimeError):
         calculixpp.solve_text("*ELEMENT, TYPE=C3D4\n1, 1, 2, 3\n")  # too few nodes
+
+
+def test_unknown_solver_raises():
+    """An unrecognized SOLVER= on *STATIC must raise (solver not available)."""
+    import calculixpp
+
+    deck = C3D4_PRESSURE_DECK.replace("*STATIC", "*STATIC, SOLVER=BOGUS")
+    with pytest.raises(RuntimeError):
+        calculixpp.solve_text(deck)
+
+
+def test_available_and_selected_backend():
+    """Backend introspection: cpu is always present and is the resolved default."""
+    import calculixpp
+
+    backends = calculixpp.available_backends()
+    assert "cpu" in backends
+    # Empty request resolves to the default (cpu); an unimplemented backend falls
+    # back to cpu rather than erroring; an unknown name raises.
+    assert calculixpp.selected_backend() == "cpu"
+    assert calculixpp.selected_backend("cpu") == "cpu"
+    assert calculixpp.selected_backend("cuda") == "cpu"
+    with pytest.raises(ValueError):
+        calculixpp.selected_backend("bogus")
+
+
+def test_solve_records_backend():
+    """solve_text echoes the backend that ran; an unimplemented one falls back."""
+    import calculixpp
+
+    res = calculixpp.solve_text(C3D4_PRESSURE_DECK)
+    assert res["backend"] == "cpu"
+
+    # Explicit unimplemented backend must not change results and reports cpu.
+    fallback = calculixpp.solve_text(C3D4_PRESSURE_DECK, backend="metal")
+    assert fallback["backend"] == "cpu"
+    for c in range(3):
+        a = sum(float(res["reaction"][k][c]) for k in range(len(res["reaction"])))
+        b = sum(float(fallback["reaction"][k][c]) for k in range(len(fallback["reaction"])))
+        assert abs(a - b) < 1e-12
+
+    with pytest.raises(ValueError):
+        calculixpp.solve_text(C3D4_PRESSURE_DECK, backend="bogus")
+
+
+def test_summary_without_solving():
+    """summary_text reports parsed counts/materials without running a solve."""
+    import calculixpp
+
+    s = calculixpp.summary_text(C3D4_PRESSURE_DECK)
+    assert int(s["num_nodes"]) == 4
+    assert int(s["num_elements"]) == 1
+    assert int(s["num_materials"]) == 1
+    assert list(s["materials"]) == ["EL"]
+    assert s["requested_solver"] == "direct"
+
+    cg = calculixpp.summary_text(
+        C3D4_PRESSURE_DECK.replace("*STATIC", "*STATIC, SOLVER=CG")
+    )
+    assert cg["requested_solver"] == "cg"
+
+
+def test_summary_file_matches_solve():
+    """summary() on the beam10p deck agrees with solve()'s reported counts."""
+    import calculixpp
+
+    inp = os.path.join(CCX_TEST, "beam10p.inp")
+    if not os.path.exists(inp):
+        pytest.skip("beam10p deck not available")
+    s = calculixpp.summary(inp)
+    res = calculixpp.solve(inp)
+    assert int(s["num_nodes"]) == int(res["num_nodes"])
+    assert int(s["num_elements"]) == int(res["num_elements"])
+    assert int(s["num_materials"]) >= 1
+
+
+def test_solver_selection_matches_default():
+    """SOLVER=SPOOLES (direct family) yields the same result as the default."""
+    import calculixpp
+
+    default = calculixpp.solve_text(C3D4_PRESSURE_DECK)
+    spooles = calculixpp.solve_text(
+        C3D4_PRESSURE_DECK.replace("*STATIC", "*STATIC, SOLVER=SPOOLES")
+    )
+    for c in range(3):
+        d = sum(float(default["reaction"][k][c]) for k in range(len(default["reaction"])))
+        s = sum(float(spooles["reaction"][k][c]) for k in range(len(spooles["reaction"])))
+        assert abs(d - s) < 1e-9

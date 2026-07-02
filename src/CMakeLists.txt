@@ -10,7 +10,8 @@ add_library(calculixpp_core
   fem/stress.cpp
   fem/loads.cpp
   io/inp_parser.cpp
-  io/results_writer.cpp)
+  io/results_writer.cpp
+  geometry/cad_mesher.cpp)
 
 target_include_directories(calculixpp_core
   PUBLIC ${CMAKE_SOURCE_DIR}/include)
@@ -20,8 +21,12 @@ target_link_libraries(calculixpp_core PRIVATE calculixpp_warnings)
 add_library(calculixpp::core ALIAS calculixpp_core)
 
 # Numerics layer: sparse solve via SciPP (scipp::sparse) on top of NumPP.
+# The CPU reference ComputeBackend lives here since it links SciPP; the backend
+# abstraction (compute/backend.hpp) itself is header-only and dependency-free.
 if(CALCULIXPP_WITH_SOLVER)
-  add_library(calculixpp_numerics numerics/linear_static.cpp)
+  add_library(calculixpp_numerics
+    compute/cpu_backend.cpp
+    numerics/linear_static.cpp)
   target_link_libraries(calculixpp_numerics PUBLIC calculixpp_core scipp::scipp)
   target_link_libraries(calculixpp_numerics PRIVATE calculixpp_warnings)
   target_compile_features(calculixpp_numerics PUBLIC cxx_std_20)

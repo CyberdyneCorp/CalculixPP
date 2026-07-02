@@ -47,6 +47,10 @@ void test_uniaxial_patch() {
   for (std::size_t i = 0; i < m.mesh.num_nodes(); ++i) {
     CX_NEAR(f.stress[i][0], S, 1e-6);      // SXX = S
     for (int c = 1; c < 6; ++c) CX_NEAR(f.stress[i][static_cast<std::size_t>(c)], 0.0, 1e-6);
+    CX_NEAR(f.strain[i][0], exx, 1e-9);    // EXX = S/E
+    CX_NEAR(f.strain[i][1], elat, 1e-9);   // EYY = -nu*S/E
+    CX_NEAR(f.strain[i][2], elat, 1e-9);   // EZZ = -nu*S/E
+    for (int c = 3; c < 6; ++c) CX_NEAR(f.strain[i][static_cast<std::size_t>(c)], 0.0, 1e-9);
   }
 }
 
@@ -66,7 +70,9 @@ void test_writers() {
   CX_CHECK(fs.str().find(" -3") != std::string::npos);       // frd block terminator
   CX_CHECK(fs.str().find("DISP") != std::string::npos);
   CX_CHECK(fs.str().find("STRESS") != std::string::npos);
+  CX_CHECK(fs.str().find("TOSTRAIN") != std::string::npos);
   CX_CHECK(ds.str().find("displacements") != std::string::npos);
+  CX_CHECK(ds.str().find("strains") != std::string::npos);
 }
 
 }  // namespace
