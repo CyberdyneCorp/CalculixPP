@@ -177,7 +177,7 @@ class Parser {
                               [](unsigned char c) { return std::isspace(c) != 0; }),
                name.end());
     if (name.empty()) {
-      model_.solver = RequestedSolver::Direct;
+      model_.solver = RequestedSolver::Auto;  // size-based choice at solve time
     } else if (name == "SPOOLES" || name == "PARDISO" || name == "PASTIX" ||
                name == "DIRECT") {
       model_.solver = RequestedSolver::Direct;

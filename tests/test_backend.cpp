@@ -110,9 +110,9 @@ std::string deck_with_static(const std::string& static_card) {
 }
 
 void test_solver_selection() {
-  // Unspecified -> Direct.
+  // Unspecified -> Auto (size-based).
   CX_CHECK(io::parse_inp(deck_with_static("*STATIC")).solver ==
-           RequestedSolver::Direct);
+           RequestedSolver::Auto);
   // Direct family.
   CX_CHECK(io::parse_inp(deck_with_static("*STATIC, SOLVER=SPOOLES")).solver ==
            RequestedSolver::Direct);
@@ -126,11 +126,19 @@ void test_solver_selection() {
   CX_CHECK(io::parse_inp(deck_with_static("*STATIC, SOLVER=CG")).solver ==
            RequestedSolver::CG);
 
-  // solver_kind maps the model request onto the numeric SolverKind.
-  CX_CHECK(numerics::solver_kind(io::parse_inp(deck_with_static("*STATIC"))) ==
+  // resolve_solver_kind: Auto is size-based (Direct at/below the threshold, CG
+  // above); explicit Direct/CG pass through regardless of size.
+  const Index thr = numerics::kAutoDirectMaxDof;
+  CX_CHECK(numerics::resolve_solver_kind(RequestedSolver::Auto, thr) ==
            numerics::SolverKind::Direct);
-  CX_CHECK(numerics::solver_kind(
-               io::parse_inp(deck_with_static("*STATIC, SOLVER=CG"))) ==
+  CX_CHECK(numerics::resolve_solver_kind(RequestedSolver::Auto, thr + 1) ==
+           numerics::SolverKind::CG);
+  CX_CHECK(numerics::resolve_solver_kind(RequestedSolver::Direct, thr + 1) ==
+           numerics::SolverKind::Direct);
+  CX_CHECK(numerics::resolve_solver_kind(RequestedSolver::CG, 1) ==
+           numerics::SolverKind::CG);
+  // Custom threshold override.
+  CX_CHECK(numerics::resolve_solver_kind(RequestedSolver::Auto, 100, 50) ==
            numerics::SolverKind::CG);
 }
 

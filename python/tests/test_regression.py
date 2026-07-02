@@ -189,7 +189,7 @@ def test_summary_without_solving():
     assert int(s["num_elements"]) == 1
     assert int(s["num_materials"]) == 1
     assert list(s["materials"]) == ["EL"]
-    assert s["requested_solver"] == "direct"
+    assert s["requested_solver"] == "auto"
 
     cg = calculixpp.summary_text(
         C3D4_PRESSURE_DECK.replace("*STATIC", "*STATIC, SOLVER=CG")

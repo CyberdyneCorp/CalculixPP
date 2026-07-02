@@ -32,12 +32,14 @@ struct Dload {
 };
 
 // Which linear solver the step requested (via SOLVER= on *STATIC). Maps the
-// CalculiX solver names onto the two paths CalculiX++ implements: a direct
-// factorization or an SPD iterative (CG) solve. Default is Direct when SOLVER= is
-// unspecified. (spec: linear-algebra-and-solvers 9.2/9.3.)
+// CalculiX solver names onto the paths CalculiX++ implements. When SOLVER= is
+// unspecified the request is Auto: the numerics layer picks sparse-direct for
+// small/medium systems and IC0-preconditioned CG for large ones (memory-scalable
+// on 3D/mobile). (spec: linear-algebra-and-solvers 9.2/9.3.)
 enum class RequestedSolver {
-  Direct,  // default; SPOOLES/PARDISO/PASTIX map here (spsolve)
-  CG,      // ITERATIVE*/CG (scipp::sparse::cg)
+  Auto,    // default; size-based direct-vs-CG choice (see resolve_solver_kind)
+  Direct,  // SPOOLES/PARDISO/PASTIX/DIRECT map here (sparse spsolve)
+  CG,      // ITERATIVE*/CG (IC0-preconditioned cg)
 };
 
 // The assembled analysis model for the linear-static slice.
@@ -50,8 +52,8 @@ class Model {
   std::vector<Cload> cloads;
   std::vector<Dload> dloads;
 
-  // Solver requested by the *STATIC step (SOLVER=), Direct when unspecified.
-  RequestedSolver solver{RequestedSolver::Direct};
+  // Solver requested by the *STATIC step (SOLVER=), Auto when unspecified.
+  RequestedSolver solver{RequestedSolver::Auto};
 
   // Elastic properties per element (aligned with mesh.elements()), resolved from
   // the solid sections. Throws std::runtime_error on a missing elset/material or an

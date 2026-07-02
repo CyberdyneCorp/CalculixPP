@@ -5,8 +5,17 @@
 
 namespace cxpp::numerics {
 
-SolverKind solver_kind(const Model& model) {
-  return model.solver == RequestedSolver::CG ? SolverKind::CG : SolverKind::Direct;
+SolverKind resolve_solver_kind(RequestedSolver req, Index n_free,
+                               Index direct_max_dof) {
+  switch (req) {
+    case RequestedSolver::Direct:
+      return SolverKind::Direct;
+    case RequestedSolver::CG:
+      return SolverKind::CG;
+    case RequestedSolver::Auto:
+    default:
+      return n_free > direct_max_dof ? SolverKind::CG : SolverKind::Direct;
+  }
 }
 
 std::vector<Real> solve_reduced(const fem::LinearSystem& sys, SolverKind kind) {
@@ -17,8 +26,11 @@ std::vector<Real> solve_reduced(const fem::LinearSystem& sys, SolverKind kind) {
                               kind);
 }
 
-StaticFields solve_linear_static(const Model& model, SolverKind kind) {
+StaticFields solve_linear_static(const Model& model,
+                                 std::optional<SolverKind> forced) {
   const fem::LinearSystem sys = fem::assemble_linear_static(model);
+  const SolverKind kind =
+      forced ? *forced : resolve_solver_kind(model.solver, sys.n_free);
   const std::vector<Real> uf = solve_reduced(sys, kind);
 
   StaticFields res;

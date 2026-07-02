@@ -1,4 +1,5 @@
 #pragma once
+#include <optional>
 #include <vector>
 
 #include "calculixpp/compute/backend.hpp"
@@ -24,16 +25,28 @@ namespace cxpp::numerics {
 // interface and numerics share one enum; re-exported here for existing callers.
 using SolverKind = compute::SolverKind;
 
-// Map the model's requested solver (from SOLVER= on *STATIC) to a SolverKind.
-SolverKind solver_kind(const Model& model);
+// DOF count above which the Auto policy prefers IC0-CG over sparse-direct.
+// Heuristic: sparse Cholesky is fastest and exact for small/medium systems, but
+// its factor fill-in grows super-linearly for large 3D meshes and can exceed
+// device memory (esp. mobile); above the threshold, IC0-CG stays O(nnz) in
+// memory. Tunable per platform. (Direct is still faster at ~10^4 DOF — the switch
+// trades speed for memory scalability at large N.)
+inline constexpr Index kAutoDirectMaxDof = 50000;
+
+// Resolve a requested solver + system size to a concrete SolverKind. Auto ->
+// Direct for n_free <= direct_max_dof, else CG; Direct/CG pass through.
+SolverKind resolve_solver_kind(RequestedSolver req, Index n_free,
+                               Index direct_max_dof = kAutoDirectMaxDof);
 
 // Solve the reduced free/free system; returns the free-DOF solution (size n_free).
 std::vector<Real> solve_reduced(const fem::LinearSystem& sys,
                                 SolverKind kind = SolverKind::Direct);
 
 // Assemble and solve a linear-static step end to end, returning nodal
-// displacement, averaged stress, and reaction forces.
+// displacement, averaged stress, and reaction forces. When `forced` is empty the
+// solver is chosen from the model's SOLVER= request via resolve_solver_kind
+// (Auto uses the system size); pass a value to override.
 StaticFields solve_linear_static(const Model& model,
-                                 SolverKind kind = SolverKind::Direct);
+                                 std::optional<SolverKind> forced = std::nullopt);
 
 }  // namespace cxpp::numerics

@@ -2,6 +2,7 @@
 // Exposes deck parsing and the linear-static solve, returning results as NumPy
 // arrays for scripting and regression testing. C++ exceptions (incl. ParseError)
 // propagate to Python as RuntimeError via pybind11's std::exception translation.
+#include <optional>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -34,11 +35,19 @@ py::array_t<double> vec3_to_array(const std::vector<Vec3>& v) {
   return rows_to_array<3>(v);
 }
 
-// Resolve the requested solver: an empty string honors the deck's SOLVER=
-// (default Direct when unspecified); "cg"/"direct" force the path explicitly.
-numerics::SolverKind kind_of(const std::string& s, const Model& m) {
-  if (s.empty()) return numerics::solver_kind(m);
+// Resolve the requested solver: an empty string honors the deck's SOLVER= (Auto
+// by default, size-based); "cg"/"direct" force the path explicitly.
+std::optional<numerics::SolverKind> kind_of(const std::string& s) {
+  if (s.empty()) return std::nullopt;
   return s == "cg" ? numerics::SolverKind::CG : numerics::SolverKind::Direct;
+}
+
+std::string requested_solver_name(RequestedSolver r) {
+  switch (r) {
+    case RequestedSolver::Direct: return "direct";
+    case RequestedSolver::CG: return "cg";
+    default: return "auto";
+  }
 }
 
 // Resolve and record the compute backend actually used for a solve. An empty
@@ -73,7 +82,7 @@ py::dict summary_dict(const Model& m) {
   d["num_materials"] = m.materials.size();
   d["materials"] = materials;
   d["requested_solver"] =
-      m.solver == RequestedSolver::CG ? std::string("cg") : std::string("direct");
+      requested_solver_name(m.solver);
   return d;
 }
 
@@ -105,7 +114,7 @@ py::dict solve_model(const Model& m, const std::string& solver,
   // Validate/select the backend first (may raise on an unknown name) and record
   // the one that actually ran. Phase 1 routes every solve through the CPU path.
   const std::string used = resolve_backend(backend);
-  py::dict d = result_dict(m, numerics::solve_linear_static(m, kind_of(solver, m)));
+  py::dict d = result_dict(m, numerics::solve_linear_static(m, kind_of(solver)));
   d["backend"] = used;
   return d;
 }

@@ -3,6 +3,7 @@
 // Parses an Abaqus-style deck, solves K u = f, and writes <basename>.frd/.dat.
 #include <cmath>
 #include <cstdio>
+#include <optional>
 #include <string>
 
 #include "calculixpp/io/inp_parser.hpp"
@@ -30,16 +31,14 @@ std::string stem(const std::string& path) {
 
 int main(int argc, char** argv) {
   std::string input, out;
-  auto kind = numerics::SolverKind::Direct;
-  bool solver_from_cli = false;
+  std::optional<numerics::SolverKind> forced;  // empty -> deck SOLVER= / Auto
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "-o" && i + 1 < argc) {
       out = argv[++i];
     } else if (a == "--solver" && i + 1 < argc) {
       const std::string s = argv[++i];
-      kind = (s == "cg") ? numerics::SolverKind::CG : numerics::SolverKind::Direct;
-      solver_from_cli = true;
+      forced = (s == "cg") ? numerics::SolverKind::CG : numerics::SolverKind::Direct;
     } else if (!a.empty() && a[0] != '-') {
       input = a;
     } else {
@@ -55,9 +54,8 @@ int main(int argc, char** argv) {
 
   try {
     const Model model = cxpp::io::parse_inp_file(input);
-    // Honor the deck's SOLVER= unless --solver was given explicitly.
-    if (!solver_from_cli) kind = numerics::solver_kind(model);
-    const StaticFields f = numerics::solve_linear_static(model, kind);
+    // --solver overrides; otherwise honor the deck's SOLVER= (Auto by default).
+    const StaticFields f = numerics::solve_linear_static(model, forced);
 
     Real umax = 0.0, svm_max = 0.0;
     for (std::size_t i = 0; i < model.mesh.num_nodes(); ++i) {
