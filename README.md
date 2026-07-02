@@ -13,13 +13,24 @@ for CAD/meshing (later phases). The specification and phased roadmap live in
 
 ## Status
 
-**Phase 1 (Foundation) — in progress.** The linear-static pipeline runs end to end:
-an Abaqus-style `.inp` deck is parsed, assembled (C3D4/C3D10 linear elasticity with
-single-point-constraint elimination), and solved as a sparse system via SciPP
-(`scipp::sparse` `spsolve`/`cg`). The reference `beam10p.inp` cantilever parses (90
-nodes, 31 elements), solves, and deflects correctly. Next: stress recovery, `.frd`/`.dat`
-output, Python bindings, and the reference-deck regression harness. See
+**Phase 1 (Foundation) — validated end to end.** An Abaqus-style `.inp` deck is parsed,
+assembled (C3D4/C3D10 linear elasticity with single-point-constraint elimination), solved
+as a sparse system via SciPP (`scipp::sparse` `spsolve`/`cg`), and post-processed for
+nodal stresses and reactions, with `.frd`/`.dat` output, a `ccxpp` CLI, and Python
+bindings. The reference `beam10p.inp` cantilever solves and its nodal displacements match
+stock CalculiX (`beam10p.dat.ref`) to **relative L2 ≈ 5e-8**. Remaining Phase-1 work:
+`*DLOAD` pressure, the full reference-deck corpus, and CI. See
 `openspec/changes/phase-1-foundation/tasks.md`.
+
+### Python
+
+```bash
+cmake -S . -B build -G Ninja -DCALCULIXPP_BUILD_PYTHON=ON
+cmake --build build
+PYTHONPATH=build/python python3 -c \
+  "import calculixpp; r=calculixpp.solve('model.inp'); print(r['displacement'])"
+```
+Requires Python dev headers + `pybind11` (`pip install pybind11 pytest`).
 
 ## Architecture
 

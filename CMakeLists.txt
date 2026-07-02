@@ -14,9 +14,13 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+# Position-independent code so the static core/SciPP libs can link into the
+# Python extension module (and any future shared library).
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(CALCULIXPP_BUILD_TESTS  "Build the test suite"                 ON)
 option(CALCULIXPP_WITH_SOLVER  "Build the SciPP/NumPP sparse solver layer" ON)
+option(CALCULIXPP_BUILD_PYTHON "Build the pybind11 Python module"     OFF)
 option(CALCULIXPP_WARNINGS_AS_ERRORS "Treat warnings as errors on the core" OFF)
 
 # Portability guardrail (spec: build-and-tooling / compute-backend):
@@ -39,14 +43,21 @@ if(CALCULIXPP_WITH_SOLVER)
   include(cmake/Dependencies.cmake)
 endif()
 
+# enable_testing() must precede any add_test(), including those in python/.
+if(CALCULIXPP_BUILD_TESTS)
+  enable_testing()
+endif()
+
 add_subdirectory(src)
 
 if(CALCULIXPP_WITH_SOLVER)
   add_subdirectory(apps)
+  if(CALCULIXPP_BUILD_PYTHON)
+    add_subdirectory(python)
+  endif()
 endif()
 
 if(CALCULIXPP_BUILD_TESTS)
-  enable_testing()
   add_subdirectory(tests)
 endif()
 

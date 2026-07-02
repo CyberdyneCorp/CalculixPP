@@ -14,7 +14,7 @@ Tasks reference the capability they implement. Spec deltas exist only for
 
 - [x] 2.1 Integrate NumPP (`find_package`) + SciPP (`add_subdirectory`; provides the sparse module); smoke test a sparse solve. NOTE: sparse lives in SciPP, not NumPP; see `scripts/bootstrap_deps.sh`
 - [ ] 2.2 Integrate CyberCadKernel at a pinned version; smoke test loading a B-rep
-- [ ] 2.3 Integrate pybind11; build an empty `calculixpp` Python module
+- [x] 2.3 Integrate pybind11; build an empty `calculixpp` Python module
 - [ ] 2.4 Clear configure-time failure when a dependency/version is unresolved
 
 ## 3. Compute backend — CPU (spec: compute-backend, linear-algebra-and-solvers)
@@ -71,10 +71,10 @@ Tasks reference the capability they implement. Spec deltas exist only for
 
 ## 11. Python bindings & regression harness (spec: python-bindings, build-and-tooling)
 
-- [ ] 11.1 Bind: build model, load deck, select backend, run, read results as NumPy arrays
-- [ ] 11.2 Propagate C++ exceptions as Python exceptions with actionable messages
-- [ ] 11.3 Corpus: `beam10p.inp` (C3D10 *CLOAD), `contact4tet.inp` (C3D10 *DLOAD pressure), + hand-authored minimal C3D4 deck; generate reference results with stock CalculiX; per-deck tolerance manifest
-- [ ] 11.4 pytest harness: solve each deck, compare U (rel. L2) and S (max rel.) to reference
+- [~] 11.1 Bind: build model, load deck, select backend, run, read results as NumPy arrays
+- [x] 11.2 Propagate C++ exceptions as Python exceptions with actionable messages
+- [~] 11.3 Corpus: `beam10p.inp` (C3D10 *CLOAD), `contact4tet.inp` (C3D10 *DLOAD pressure), + hand-authored minimal C3D4 deck; generate reference results with stock CalculiX; per-deck tolerance manifest
+- [x] 11.4 pytest harness: solve each deck, compare U (rel. L2) and S (max rel.) to reference
 
 ## 12. CI & docs (spec: build-and-tooling)
 
