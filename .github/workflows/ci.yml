@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Spec gate: always runs, no heavy dependencies.
+  openspec:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm install -g @fission-ai/openspec@latest
+      - run: openspec validate --all --strict
+
+  # Build the solver core + SciPP layer + Python module, then run the tests.
+  # NumPP and SciPP are separate repositories; if they are private, add a
+  # repo-scoped PAT as the DEPS_TOKEN secret. The core (calculixpp_core) also
+  # builds standalone without them (CALCULIXPP_WITH_SOLVER=OFF).
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: CalculixPP
+      - uses: actions/checkout@v4
+        with:
+          repository: CyberdyneCorp/NumPP
+          path: NumPP
+          token: ${{ secrets.DEPS_TOKEN || github.token }}
+      - uses: actions/checkout@v4
+        with:
+          repository: CyberdyneCorp/SciPP
+          path: SciPP
+          token: ${{ secrets.DEPS_TOKEN || github.token }}
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install --upgrade pip pybind11 pytest numpy
+
+      - name: Bootstrap NumPP (build + install)
+        working-directory: CalculixPP
+        run: ./scripts/bootstrap_deps.sh --numpp ../NumPP --scipp ../SciPP
+
+      - name: Configure
+        working-directory: CalculixPP
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCALCULIXPP_WITH_SOLVER=ON
+          -DCALCULIXPP_BUILD_PYTHON=ON
+          -DCALCULIXPP_SCIPP_DIR=${{ github.workspace }}/SciPP
+          -DPython3_EXECUTABLE=$(which python)
+
+      - name: Build
+        working-directory: CalculixPP
+        run: cmake --build build -j
+
+      - name: Test (CPU backend, no GPU toolkit)
+        working-directory: CalculixPP
+        run: ctest --test-dir build --output-on-failure

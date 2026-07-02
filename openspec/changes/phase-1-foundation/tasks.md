@@ -54,7 +54,7 @@ Tasks reference the capability they implement. Spec deltas exist only for
 
 - [x] 8.1 Element stiffness kernels for `C3D4`/`C3D10` (Gauss integration)
 - [x] 8.2 Global assembly into COO triplets → SciPP `CsrMatrix::from_coo` (compute-backend abstraction still to be formalized)
-- [~] 8.3 Concentrated loads (`*CLOAD`) done; pressure loads (`*DLOAD`) pending
+- [x] 8.3 Concentrated loads (`*CLOAD`) and pressure loads (`*DLOAD` P<face>, surface integration)
 - [x] 8.4 Apply Dirichlet BCs (`*BOUNDARY`) via elimination/penalty
 
 ## 9. Linear solve (spec: linear-algebra-and-solvers)
@@ -73,12 +73,12 @@ Tasks reference the capability they implement. Spec deltas exist only for
 
 - [~] 11.1 Bind: build model, load deck, select backend, run, read results as NumPy arrays
 - [x] 11.2 Propagate C++ exceptions as Python exceptions with actionable messages
-- [~] 11.3 Corpus: `beam10p.inp` (C3D10 *CLOAD), `contact4tet.inp` (C3D10 *DLOAD pressure), + hand-authored minimal C3D4 deck; generate reference results with stock CalculiX; per-deck tolerance manifest
+- [x] 11.3 Corpus: `beam10p.inp` (C3D10, validated vs committed `beam10p.dat.ref`) + hand-authored C3D4 pressure deck (analytical equilibrium). NOTE: contact4tet=S8 shells, circ11p=*USE REFINED MESH, segmentunsmooth too slow — beam10p is the only small clean CalculiX-ref tet deck
 - [x] 11.4 pytest harness: solve each deck, compare U (rel. L2) and S (max rel.) to reference
 
 ## 12. CI & docs (spec: build-and-tooling)
 
-- [ ] 12.1 CI: build + `ctest` + pytest regression on the CPU backend
-- [ ] 12.2 CI: `openspec validate --all --strict` gate
+- [x] 12.1 CI: build + `ctest` + pytest regression on the CPU backend
+- [x] 12.2 CI: `openspec validate --all --strict` gate
 - [ ] 12.3 Add iOS/Android toolchain files as configure-only CI checks
-- [ ] 12.4 Update README/docs with the working end-to-end example
+- [x] 12.4 Update README/docs with the working end-to-end example

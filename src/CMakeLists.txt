@@ -8,6 +8,7 @@ add_library(calculixpp_core
   fem/element.cpp
   fem/assembly.cpp
   fem/stress.cpp
+  fem/loads.cpp
   io/inp_parser.cpp
   io/results_writer.cpp)
 

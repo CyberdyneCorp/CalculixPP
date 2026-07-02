@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "calculixpp/fem/element.hpp"
+#include "calculixpp/fem/loads.hpp"
 
 namespace cxpp::fem {
 namespace {
@@ -114,13 +115,8 @@ void recover_fields(const Model& model, StaticFields& fields) {
     if (count[i] > 0)
       for (int comp = 0; comp < 6; ++comp) fields.stress[i][static_cast<std::size_t>(comp)] /= count[i];
 
-  // External load vector, then RF = f_int - f_ext.
-  std::vector<Real> f_ext(n_nodes * kDofsPerNode, 0.0);
-  for (const Cload& cl : model.cloads) {
-    const Index ni = mesh.node_index(cl.node_id);
-    if (ni >= 0 && cl.comp >= 1 && cl.comp <= kDofsPerNode)
-      f_ext[static_cast<std::size_t>(ni) * kDofsPerNode + static_cast<std::size_t>(cl.comp - 1)] += cl.value;
-  }
+  // External load vector (*CLOAD + *DLOAD), then RF = f_int - f_ext.
+  const std::vector<Real> f_ext = external_load_vector(model);
   for (std::size_t i = 0; i < n_nodes; ++i)
     for (int c = 0; c < kDofsPerNode; ++c)
       fields.reaction[i][static_cast<std::size_t>(c)] =

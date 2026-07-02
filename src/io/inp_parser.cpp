@@ -163,8 +163,9 @@ class Parser {
 
   bool is_data_card() const {
     static const std::vector<std::string> data_cards = {
-        "*NODE", "*ELEMENT", "*NSET", "*ELSET", "*MATERIAL", "*ELASTIC",
-        "*DENSITY", "*SOLIDSECTION", "*BOUNDARY", "*CLOAD", "*SURFACE"};
+        "*NODE",    "*ELEMENT",     "*NSET",     "*ELSET", "*MATERIAL",
+        "*ELASTIC", "*DENSITY",     "*SOLIDSECTION", "*BOUNDARY", "*CLOAD",
+        "*DLOAD",   "*SURFACE"};
     return std::find(data_cards.begin(), data_cards.end(), card_) != data_cards.end();
   }
 
@@ -177,6 +178,7 @@ class Parser {
     if (card_ == "*DENSITY") return density(f, line);
     if (card_ == "*BOUNDARY") return boundary(f, line);
     if (card_ == "*CLOAD") return cload(f, line);
+    if (card_ == "*DLOAD") return dload(f, line);
     // *SOLID SECTION optional thickness line, output requests, step/static
     // control lines, surfaces, amplitudes: accepted and ignored in Phase 1.
   }
@@ -268,6 +270,28 @@ class Parser {
     const Real val = to_double(f[2], line);
     for (const Index nd : node_refs(f[0], line))
       model_.cloads.push_back(Cload{nd, dof, val});
+  }
+
+  // Expand an element reference (integer id or elset name) to element ids.
+  std::vector<Index> elem_refs(const std::string& tok, int line) {
+    if (!tok.empty() && (std::isdigit(static_cast<unsigned char>(tok.front())) ||
+                         tok.front() == '-' || tok.front() == '+'))
+      return {to_index(tok, line)};
+    const auto it = elsets_.find(upper(tok));
+    if (it == elsets_.end()) throw ParseError(line, "unknown element set '" + tok + "'");
+    return it->second;
+  }
+
+  void dload(const std::vector<std::string>& f, int line) {
+    if (f.size() < 3) throw ParseError(line, "*DLOAD needs element,P<face>,magnitude");
+    const std::string label = upper(f[1]);
+    if (label.empty() || label[0] != 'P')
+      throw ParseError(line, "unsupported *DLOAD type '" + f[1] +
+                                 "' (Phase 1 supports pressure P<face> only)");
+    const int face = static_cast<int>(to_index(label.substr(1), line));
+    const Real p = to_double(f[2], line);
+    for (const Index eid : elem_refs(f[0], line))
+      model_.dloads.push_back(Dload{eid, face, p});
   }
 
   void flush_sets() {

@@ -23,6 +23,14 @@ struct Cload {
   Real value{0.0};
 };
 
+// Distributed pressure on an element face (*DLOAD, P<face>). Positive pressure
+// acts into the element (opposite the outward face normal). Face is 1..4 (tet).
+struct Dload {
+  Index elem_id{};
+  int face{};      // 1..4
+  Real pressure{0.0};
+};
+
 // The assembled analysis model for the linear-static slice.
 class Model {
  public:
@@ -31,6 +39,7 @@ class Model {
   std::vector<SolidSection> sections;
   std::vector<Spc> spcs;
   std::vector<Cload> cloads;
+  std::vector<Dload> dloads;
 
   // Elastic properties per element (aligned with mesh.elements()), resolved from
   // the solid sections. Throws std::runtime_error on a missing elset/material or an

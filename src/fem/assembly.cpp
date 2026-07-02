@@ -5,6 +5,7 @@
 #include <unordered_map>
 
 #include "calculixpp/fem/element.hpp"
+#include "calculixpp/fem/loads.hpp"
 
 namespace cxpp::fem {
 
@@ -83,16 +84,11 @@ LinearSystem assemble_linear_static(const Model& model) {
     }
   }
 
-  // Concentrated loads on free DOFs.
-  for (const Cload& cl : model.cloads) {
-    const Index ni = mesh.node_index(cl.node_id);
-    if (ni < 0) throw std::runtime_error("*CLOAD references unknown node");
-    if (cl.comp < 1 || cl.comp > kDofsPerNode)
-      throw std::runtime_error("*CLOAD dof out of range");
-    const std::size_t g = static_cast<std::size_t>(ni) * kDofsPerNode +
-                          static_cast<std::size_t>(cl.comp - 1);
+  // External loads (*CLOAD + *DLOAD pressure) on free DOFs.
+  const std::vector<Real> fext = external_load_vector(model);
+  for (std::size_t g = 0; g < n_dof; ++g) {
     const Index eq = sys.dof_eq[g];
-    if (eq >= 0) sys.rhs[static_cast<std::size_t>(eq)] += cl.value;
+    if (eq >= 0) sys.rhs[static_cast<std::size_t>(eq)] += fext[g];
   }
 
   sys.rows.reserve(kmap.size());
