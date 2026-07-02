@@ -7,12 +7,12 @@ Tasks reference the capability they implement. Spec deltas exist only for
 
 - [ ] 1.1 Create module layout: `core/`, `numerics/`, `geometry/`, `cli/`, `python/`, `tests/`, `cmake/`
 - [ ] 1.2 Top-level `CMakeLists.txt` enforcing C++20; core library + CLI targets
-- [ ] 1.3 Add `.clang-format`/`.clang-tidy` and wire warnings-as-errors on the core
+- [x] 1.3 Add `.clang-format`/`.clang-tidy` and wire warnings-as-errors on the core
 - [ ] 1.4 README quickstart (configure, build, run a deck, run Python)
 
 ## 2. Dependency integration (spec: build-and-tooling)
 
-- [ ] 2.1 Integrate NumPP via FetchContent at a pinned tag (`-DCPP_USE_SYSTEM_DEPS=ON` escape hatch); smoke test a sparse solve
+- [ ] 2.1 Integrate NumPP (`find_package`) + SciPP (`add_subdirectory`; provides the sparse module); smoke test a sparse solve. NOTE: sparse lives in SciPP, not NumPP; see `scripts/bootstrap_deps.sh`
 - [ ] 2.2 Integrate CyberCadKernel at a pinned version; smoke test loading a B-rep
 - [ ] 2.3 Integrate pybind11; build an empty `calculixpp` Python module
 - [ ] 2.4 Clear configure-time failure when a dependency/version is unresolved
@@ -20,17 +20,17 @@ Tasks reference the capability they implement. Spec deltas exist only for
 ## 3. Compute backend — CPU (spec: compute-backend, linear-algebra-and-solvers)
 
 - [ ] 3.1 Define `ComputeBackend` interface: assembly scatter, SpMV, sparse factor/solve
-- [ ] 3.2 Implement CPU reference backend over NumPP (default, always available)
+- [ ] 3.2 Implement CPU reference backend over SciPP sparse (+ NumPP dense/ndarray) (default, always available)
 - [ ] 3.3 Backend selection surface (explicit → best available → CPU fallback), CPU-only for now
 - [ ] 3.4 Guarantee build + tests pass with no GPU toolkit present (CI job)
 
 ## 4. Core FE data model (spec: mesh-and-model)
 
-- [ ] 4.1 Node store (ids, coordinates) and element store (connectivity, type)
-- [ ] 4.2 `C3D4` and `C3D10` tetrahedral element types
+- [x] 4.1 Node store (ids, coordinates) and element store (connectivity, type)
+- [x] 4.2 `C3D4` and `C3D10` tetrahedral element types
 - [ ] 4.3 Node sets / element sets (`*NSET`/`*ELSET`) and surfaces (`*SURFACE`)
-- [ ] 4.4 DOF numbering / equation map
-- [ ] 4.5 Central `cpp_index_t` (32-bit signed) typedef used by all node/element/DOF indexing
+- [x] 4.4 DOF numbering / equation map
+- [x] 4.5 Central `cpp_index_t` (32-bit signed) typedef used by all node/element/DOF indexing
 
 ## 5. Mesh import bypass (spec: mesh-processing)
 
@@ -47,19 +47,19 @@ Tasks reference the capability they implement. Spec deltas exist only for
 
 ## 7. Material & section (spec: material-models, element-sections)
 
-- [ ] 7.1 Isotropic linear-elastic constitutive model (E, ν) and density
-- [ ] 7.2 `*SOLID SECTION` binding material to element set; local orientation hook (identity for now)
+- [x] 7.1 Isotropic linear-elastic constitutive model (E, ν) and density
+- [x] 7.2 `*SOLID SECTION` binding material to element set; local orientation hook (identity for now)
 
 ## 8. Assembly & loads (spec: static-analysis, loads-and-boundary-conditions)
 
-- [ ] 8.1 Element stiffness kernels for `C3D4`/`C3D10` (Gauss integration)
-- [ ] 8.2 Global `K` assembly into NumPP CSR via ComputeBackend scatter
-- [ ] 8.3 Concentrated loads (`*CLOAD`) and pressure loads (`*DLOAD`) into `f`
-- [ ] 8.4 Apply Dirichlet BCs (`*BOUNDARY`) via elimination/penalty
+- [x] 8.1 Element stiffness kernels for `C3D4`/`C3D10` (Gauss integration)
+- [~] 8.2 Global assembly into COO triplets (done in core); hand to SciPP `CsrMatrix::from_coo` via the compute backend (pending)
+- [~] 8.3 Concentrated loads (`*CLOAD`) done; pressure loads (`*DLOAD`) pending
+- [x] 8.4 Apply Dirichlet BCs (`*BOUNDARY`) via elimination/penalty
 
 ## 9. Linear solve (spec: linear-algebra-and-solvers)
 
-- [ ] 9.1 Assemble reduced system and solve SPD `K u = f` with NumPP symmetric direct factorization (Cholesky/LDLᵀ)
+- [ ] 9.1 Solve SPD `K u = f` via SciPP sparse (`spsolve` direct / `cg` SPD-iterative). NOTE: NumPP/SciPP expose no sparse Cholesky; `spsolve`/`cg` are the paths
 - [ ] 9.2 Honor `SOLVER=` selection; default solver when unspecified
 - [ ] 9.3 Unavailable-solver policy: clear report + documented stop/fallback
 

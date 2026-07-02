@@ -1,0 +1,7 @@
+/build/
+/build-*/
+/.deps/
+/compile_commands.json
+__pycache__/
+*.o
+*.a
