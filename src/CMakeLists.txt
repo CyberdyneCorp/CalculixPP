@@ -7,7 +7,9 @@ add_library(calculixpp_core
   core/model.cpp
   fem/element.cpp
   fem/assembly.cpp
-  io/inp_parser.cpp)
+  fem/stress.cpp
+  io/inp_parser.cpp
+  io/results_writer.cpp)
 
 target_include_directories(calculixpp_core
   PUBLIC ${CMAKE_SOURCE_DIR}/include)

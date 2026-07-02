@@ -75,7 +75,7 @@ int main() {
   }
 
   // Full pipeline: node 4 (index 3) displaces in -z and matches the reference.
-  const numerics::LinearStaticResult res = numerics::solve_linear_static(m);
+  const StaticFields res = numerics::solve_linear_static(m);
   CX_CHECK(res.displacement.size() == 4);
   CX_CHECK(res.displacement[3][2] < 0.0);
   CX_NEAR(res.displacement[3][0], uref[0], 1e-8 * (1.0 + std::fabs(uref[0])));

@@ -49,7 +49,7 @@ void test_embedded() {
   CX_CHECK(m.cloads.size() == 1);
   CX_CHECK(m.mesh.nset("FIX") != nullptr);
 
-  const numerics::LinearStaticResult r = numerics::solve_linear_static(m);
+  const StaticFields r = numerics::solve_linear_static(m);
   CX_CHECK(r.displacement.size() == 4);
   CX_CHECK(r.displacement[3][2] < 0.0);  // apex pushed in -z
 }
@@ -65,7 +65,7 @@ void test_beam10p() {
   CX_CHECK(m.mesh.num_nodes() == 90);
   CX_CHECK(m.mesh.num_elements() == 31);
 
-  const numerics::LinearStaticResult r = numerics::solve_linear_static(m);
+  const StaticFields r = numerics::solve_linear_static(m);
   // Cantilever loaded in +y at the free (z=8) end -> tip deflects +y.
   const Index tip = m.mesh.node_index(11);
   CX_CHECK(tip >= 0);

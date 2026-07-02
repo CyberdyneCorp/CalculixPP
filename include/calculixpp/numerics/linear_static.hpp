@@ -2,6 +2,7 @@
 #include <vector>
 
 #include "calculixpp/core/model.hpp"
+#include "calculixpp/core/results.hpp"
 #include "calculixpp/core/types.hpp"
 #include "calculixpp/fem/assembly.hpp"
 
@@ -20,13 +21,9 @@ enum class SolverKind {
 std::vector<Real> solve_reduced(const fem::LinearSystem& sys,
                                 SolverKind kind = SolverKind::Direct);
 
-struct LinearStaticResult {
-  // Nodal displacement, aligned with mesh node indices.
-  std::vector<Vec3> displacement;
-};
-
-// Assemble and solve a linear-static step end to end.
-LinearStaticResult solve_linear_static(const Model& model,
-                                       SolverKind kind = SolverKind::Direct);
+// Assemble and solve a linear-static step end to end, returning nodal
+// displacement, averaged stress, and reaction forces.
+StaticFields solve_linear_static(const Model& model,
+                                 SolverKind kind = SolverKind::Direct);
 
 }  // namespace cxpp::numerics

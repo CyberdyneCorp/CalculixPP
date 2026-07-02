@@ -41,6 +41,10 @@ endif()
 
 add_subdirectory(src)
 
+if(CALCULIXPP_WITH_SOLVER)
+  add_subdirectory(apps)
+endif()
+
 if(CALCULIXPP_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)

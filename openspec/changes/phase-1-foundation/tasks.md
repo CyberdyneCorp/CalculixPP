@@ -6,7 +6,7 @@ Tasks reference the capability they implement. Spec deltas exist only for
 ## 1. Repository & build scaffolding (spec: build-and-tooling)
 
 - [ ] 1.1 Create module layout: `core/`, `numerics/`, `geometry/`, `cli/`, `python/`, `tests/`, `cmake/`
-- [ ] 1.2 Top-level `CMakeLists.txt` enforcing C++20; core library + CLI targets
+- [x] 1.2 Top-level `CMakeLists.txt` enforcing C++20; core library + CLI targets
 - [x] 1.3 Add `.clang-format`/`.clang-tidy` and wire warnings-as-errors on the core
 - [ ] 1.4 README quickstart (configure, build, run a deck, run Python)
 
@@ -65,9 +65,9 @@ Tasks reference the capability they implement. Spec deltas exist only for
 
 ## 10. Results (spec: static-analysis, results-output)
 
-- [ ] 10.1 Recover element strains/stresses; extrapolate to nodes; reaction forces
-- [ ] 10.2 Write `.frd` (U, S, E, RF) CGX-compatible
-- [ ] 10.3 Write `.dat` tabular output honoring output requests
+- [x] 10.1 Recover element strains/stresses; extrapolate to nodes; reaction forces
+- [~] 10.2 Write `.frd` (U, S, E, RF) CGX-compatible
+- [x] 10.3 Write `.dat` tabular output honoring output requests
 
 ## 11. Python bindings & regression harness (spec: python-bindings, build-and-tooling)
 

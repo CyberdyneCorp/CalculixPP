@@ -2,6 +2,7 @@
 
 #include <cstdint>
 
+#include "calculixpp/fem/stress.hpp"
 #include "numpp/core/creation.hpp"
 #include "numpp/core/dtype.hpp"
 #include "scipp/sparse/sparse.hpp"
@@ -40,11 +41,11 @@ std::vector<Real> solve_reduced(const fem::LinearSystem& sys, SolverKind kind) {
   return u;
 }
 
-LinearStaticResult solve_linear_static(const Model& model, SolverKind kind) {
+StaticFields solve_linear_static(const Model& model, SolverKind kind) {
   const fem::LinearSystem sys = fem::assemble_linear_static(model);
   const std::vector<Real> uf = solve_reduced(sys, kind);
 
-  LinearStaticResult res;
+  StaticFields res;
   const std::size_t n_nodes = model.mesh.num_nodes();
   res.displacement.assign(n_nodes, Vec3{0, 0, 0});
   for (std::size_t ni = 0; ni < n_nodes; ++ni) {
@@ -55,6 +56,7 @@ LinearStaticResult solve_linear_static(const Model& model, SolverKind kind) {
           (eq >= 0) ? uf[static_cast<std::size_t>(eq)] : sys.prescribed[g];
     }
   }
+  fem::recover_fields(model, res);  // fills stress + reaction
   return res;
 }
 
