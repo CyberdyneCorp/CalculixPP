@@ -6,7 +6,8 @@ add_library(calculixpp_core
   core/mesh.cpp
   core/model.cpp
   fem/element.cpp
-  fem/assembly.cpp)
+  fem/assembly.cpp
+  io/inp_parser.cpp)
 
 target_include_directories(calculixpp_core
   PUBLIC ${CMAKE_SOURCE_DIR}/include)

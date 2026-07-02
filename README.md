@@ -13,11 +13,13 @@ for CAD/meshing (later phases). The specification and phased roadmap live in
 
 ## Status
 
-**Phase 1 (Foundation) — in progress.** The dependency-free solver core is up:
-domain model, tetrahedral element kernels (C3D4/C3D10 linear elasticity), and global
-assembly with single-point-constraint elimination — all unit-tested. Next: the SciPP
-sparse solve, the `.inp` parser, stress recovery, `.frd`/`.dat` output, and Python
-bindings. See `openspec/changes/phase-1-foundation/tasks.md`.
+**Phase 1 (Foundation) — in progress.** The linear-static pipeline runs end to end:
+an Abaqus-style `.inp` deck is parsed, assembled (C3D4/C3D10 linear elasticity with
+single-point-constraint elimination), and solved as a sparse system via SciPP
+(`scipp::sparse` `spsolve`/`cg`). The reference `beam10p.inp` cantilever parses (90
+nodes, 31 elements), solves, and deflects correctly. Next: stress recovery, `.frd`/`.dat`
+output, Python bindings, and the reference-deck regression harness. See
+`openspec/changes/phase-1-foundation/tasks.md`.
 
 ## Architecture
 

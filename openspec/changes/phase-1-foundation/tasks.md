@@ -34,16 +34,16 @@ Tasks reference the capability they implement. Spec deltas exist only for
 
 ## 5. Mesh import bypass (spec: mesh-processing)
 
-- [ ] 5.1 Import mesh directly from the deck (`*NODE`/`*ELEMENT`), bypassing CAD meshing
+- [x] 5.1 Import mesh directly from the deck (`*NODE`/`*ELEMENT`), bypassing CAD meshing
 - [ ] 5.2 Stub CyberCadKernel geometry-import/triangulate/tet interfaces (validated later phase)
 
 ## 6. Input deck parser — Phase-1 subset (spec: input-deck-parsing)
 
-- [ ] 6.1 Keyword tokenizer/lexer for Abaqus-style cards (case-insensitive, comments, continuations)
-- [ ] 6.2 Parse `*NODE`, `*ELEMENT`, `*NSET`, `*ELSET`, `*SURFACE`
-- [ ] 6.3 Parse `*MATERIAL`, `*ELASTIC`, `*DENSITY`, `*SOLID SECTION`
-- [ ] 6.4 Parse `*BOUNDARY`, `*CLOAD`, `*DLOAD` (pressure), `*STEP`/`*STATIC`, `*AMPLITUDE` (constant/step)
-- [ ] 6.5 Actionable parse errors with card + line context
+- [x] 6.1 Keyword tokenizer/lexer for Abaqus-style cards (case-insensitive, comments, continuations)
+- [x] 6.2 Parse `*NODE`, `*ELEMENT`, `*NSET`, `*ELSET`, `*SURFACE`
+- [x] 6.3 Parse `*MATERIAL`, `*ELASTIC`, `*DENSITY`, `*SOLID SECTION`
+- [~] 6.4 Parse `*BOUNDARY`, `*CLOAD`, `*DLOAD` (pressure), `*STEP`/`*STATIC`, `*AMPLITUDE` (constant/step)
+- [x] 6.5 Actionable parse errors with card + line context
 
 ## 7. Material & section (spec: material-models, element-sections)
 
