@@ -12,9 +12,14 @@
 // (spec: linear-algebra-and-solvers, static-analysis.)
 namespace cxpp::numerics {
 
+// PERFORMANCE CAVEAT (SciPP#10): scipp::sparse::spsolve currently densifies the
+// matrix (O(N^2) mem / O(N^3) time) — correct but caps mesh size at ~hundreds of
+// DOF; scipp::sparse::cg is unpreconditioned and may NOT converge on stiff FE
+// systems (silently wrong). Revisit defaults once SciPP ships a sparse Cholesky/
+// LDLT + preconditioned CG. See https://github.com/CyberdyneCorp/SciPP/issues/10
 enum class SolverKind {
-  Direct,  // scipp::sparse::spsolve (LU-based direct)
-  CG,      // scipp::sparse::cg (SPD iterative)
+  Direct,  // scipp::sparse::spsolve (dense LU today — see caveat)
+  CG,      // scipp::sparse::cg (unpreconditioned — see caveat)
 };
 
 // Solve the reduced free/free system; returns the free-DOF solution (size n_free).
