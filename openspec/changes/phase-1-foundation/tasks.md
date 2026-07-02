@@ -12,7 +12,7 @@ Tasks reference the capability they implement. Spec deltas exist only for
 
 ## 2. Dependency integration (spec: build-and-tooling)
 
-- [ ] 2.1 Integrate NumPP (`find_package`) + SciPP (`add_subdirectory`; provides the sparse module); smoke test a sparse solve. NOTE: sparse lives in SciPP, not NumPP; see `scripts/bootstrap_deps.sh`
+- [x] 2.1 Integrate NumPP (`find_package`) + SciPP (`add_subdirectory`; provides the sparse module); smoke test a sparse solve. NOTE: sparse lives in SciPP, not NumPP; see `scripts/bootstrap_deps.sh`
 - [ ] 2.2 Integrate CyberCadKernel at a pinned version; smoke test loading a B-rep
 - [ ] 2.3 Integrate pybind11; build an empty `calculixpp` Python module
 - [ ] 2.4 Clear configure-time failure when a dependency/version is unresolved
@@ -53,13 +53,13 @@ Tasks reference the capability they implement. Spec deltas exist only for
 ## 8. Assembly & loads (spec: static-analysis, loads-and-boundary-conditions)
 
 - [x] 8.1 Element stiffness kernels for `C3D4`/`C3D10` (Gauss integration)
-- [~] 8.2 Global assembly into COO triplets (done in core); hand to SciPP `CsrMatrix::from_coo` via the compute backend (pending)
+- [x] 8.2 Global assembly into COO triplets → SciPP `CsrMatrix::from_coo` (compute-backend abstraction still to be formalized)
 - [~] 8.3 Concentrated loads (`*CLOAD`) done; pressure loads (`*DLOAD`) pending
 - [x] 8.4 Apply Dirichlet BCs (`*BOUNDARY`) via elimination/penalty
 
 ## 9. Linear solve (spec: linear-algebra-and-solvers)
 
-- [ ] 9.1 Solve SPD `K u = f` via SciPP sparse (`spsolve` direct / `cg` SPD-iterative). NOTE: NumPP/SciPP expose no sparse Cholesky; `spsolve`/`cg` are the paths
+- [x] 9.1 Solve SPD `K u = f` via SciPP sparse (`spsolve` direct / `cg` SPD-iterative). NOTE: NumPP/SciPP expose no sparse Cholesky; `spsolve`/`cg` are the paths
 - [ ] 9.2 Honor `SOLVER=` selection; default solver when unspecified
 - [ ] 9.3 Unavailable-solver policy: clear report + documented stop/fallback
 

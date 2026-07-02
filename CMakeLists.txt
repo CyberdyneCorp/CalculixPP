@@ -31,6 +31,14 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   endif()
 endif()
 
+if(CALCULIXPP_WITH_SOLVER)
+  # Auto-discover the local bootstrap prefix (scripts/bootstrap_deps.sh).
+  if(EXISTS "${CMAKE_SOURCE_DIR}/.deps/install")
+    list(PREPEND CMAKE_PREFIX_PATH "${CMAKE_SOURCE_DIR}/.deps/install")
+  endif()
+  include(cmake/Dependencies.cmake)
+endif()
+
 add_subdirectory(src)
 
 if(CALCULIXPP_BUILD_TESTS)

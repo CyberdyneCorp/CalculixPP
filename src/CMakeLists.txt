@@ -14,3 +14,12 @@ target_compile_features(calculixpp_core PUBLIC cxx_std_20)
 target_link_libraries(calculixpp_core PRIVATE calculixpp_warnings)
 
 add_library(calculixpp::core ALIAS calculixpp_core)
+
+# Numerics layer: sparse solve via SciPP (scipp::sparse) on top of NumPP.
+if(CALCULIXPP_WITH_SOLVER)
+  add_library(calculixpp_numerics numerics/linear_static.cpp)
+  target_link_libraries(calculixpp_numerics PUBLIC calculixpp_core scipp::scipp)
+  target_link_libraries(calculixpp_numerics PRIVATE calculixpp_warnings)
+  target_compile_features(calculixpp_numerics PUBLIC cxx_std_20)
+  add_library(calculixpp::numerics ALIAS calculixpp_numerics)
+endif()
