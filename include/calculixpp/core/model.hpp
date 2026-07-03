@@ -153,6 +153,28 @@ enum class Procedure {
   // The one-way (sequential) scheme solves the steady thermal field first, then
   // applies its thermal strain to a mechanical solve. (spec: heat-transfer — coupled.)
   Coupled,
+  // *FREQUENCY: natural-frequency / mode-shape extraction — the generalized symmetric
+  // eigenproblem K x = λ M x for the lowest N modes (spec: modal-and-buckling-analysis).
+  Frequency,
+  // *MODAL DYNAMIC: transient response by modal superposition over a preceding
+  // *FREQUENCY basis — each decoupled modal SDOF integrated, recombined to the physical
+  // response (spec: dynamic-analysis — modal dynamic).
+  ModalDynamic,
+  // *STEADY STATE DYNAMICS: harmonic response amplitude/phase over a frequency sweep by
+  // modal superposition with damping (spec: dynamic-analysis — steady-state dynamics).
+  SteadyStateDynamics,
+  // *DYNAMIC: direct time integration of M a + C v + K u = f(t) by the implicit HHT-α
+  // scheme in physical coordinates (spec: dynamic-analysis — direct-integration
+  // dynamics). Carries inertia + nonlinear material/contact tangents together; the
+  // undamped α=0 scheme conserves energy. (numerics/direct_dynamics.)
+  Dynamic,
+  // *SUBSTRUCTURE GENERATE: condense the model onto the retained (master) DOFs of
+  // *RETAINED NODAL DOFS, producing a superelement. Static (Guyan) reduction of the
+  // interior DOFs gives the reduced stiffness Schur complement; when a mass matrix is
+  // present, Craig-Bampton adds fixed-interface normal modes and a reduced mass. The
+  // reduced matrices are exported by *SUBSTRUCTURE MATRIX OUTPUT / *MATRIX ASSEMBLE.
+  // (spec: substructure-generation.) (numerics/substructure.)
+  Substructure,
 };
 
 // Solution scheme for a *COUPLED TEMPERATURE-DISPLACEMENT step (spec: heat-transfer
@@ -190,6 +212,23 @@ struct ContactPairChange {
 struct PhysicalConstants {
   Real absolute_zero{0.0};  // e.g. -273.15 for Celsius decks
   Real sigma{0.0};          // Stefan-Boltzmann constant
+};
+
+// Rayleigh (proportional) damping C = alpha*M + beta*K from *DAMPING, ALPHA=, BETA=
+// (spec: dynamic-analysis — damping). Both zero (the default / no card) is undamped.
+struct Rayleigh {
+  Real alpha{0.0};  // mass-proportional coefficient
+  Real beta{0.0};   // stiffness-proportional coefficient
+  bool active{false};
+};
+
+// Base motion (support excitation) from *BASE MOTION (spec: dynamic-analysis — base
+// motion). `dof` is the excitation translational direction (1=x,2=y,3=z); `magnitude`
+// is the base acceleration amplitude applied along it. Inert unless active.
+struct BaseMotion {
+  int dof{0};             // excitation direction 1..3 (0 = none)
+  Real magnitude{0.0};    // base acceleration amplitude
+  bool active{false};
 };
 
 // The assembled analysis model for the linear-static slice.
@@ -343,6 +382,55 @@ class Model {
 
   // Solver requested by the *STATIC step (SOLVER=), Auto when unspecified.
   RequestedSolver solver{RequestedSolver::Auto};
+
+  // Number of eigenvalues requested by a *FREQUENCY step (first data-line field).
+  // Inert unless procedure == Frequency. The eigensolution engine extracts the lowest
+  // `num_eigenvalues` modes of K x = λ M x. (spec: modal-and-buckling — *FREQUENCY.)
+  int num_eigenvalues{0};
+
+  // Dynamics-step controls (spec: dynamic-analysis). Inert unless procedure is
+  // ModalDynamic or SteadyStateDynamics. These carry the modal-superposition step
+  // parameters parsed from *MODAL DYNAMIC / *STEADY STATE DYNAMICS and the damping model
+  // (*DAMPING Rayleigh + *MODAL DAMPING ratios). The eigenbasis itself is extracted from
+  // this same model (the mass/stiffness are procedure-independent), so a single-deck
+  // modal-dynamic run reuses the *FREQUENCY extraction. `num_eigenvalues` selects how
+  // many modes the superposition uses.
+  Rayleigh rayleigh{};                 // *DAMPING, ALPHA=, BETA=
+  std::vector<Real> modal_damping;     // *MODAL DAMPING ratios, indexed by mode
+  Real dynamic_dt{0.0};                // *MODAL DYNAMIC time increment (data line 1)
+  Real dynamic_t_end{0.0};             // *MODAL DYNAMIC step time (data line 2)
+  Real steady_f_lo{0.0};               // *STEADY STATE DYNAMICS lower frequency
+  Real steady_f_hi{0.0};               // *STEADY STATE DYNAMICS upper frequency
+  int steady_num_points{0};            // *STEADY STATE DYNAMICS number of sweep points
+  BaseMotion base_motion{};            // *BASE MOTION support excitation
+
+  // *DYNAMIC direct-integration controls (spec: dynamic-analysis — direct dynamics).
+  // Inert unless procedure == Dynamic. `dynamic_dt` / `dynamic_t_end` are shared with the
+  // modal path (data line "dt, t_end"). `dynamic_alpha` is the HHT-α numerical-damping
+  // knob (α ∈ [-1/3, 0]; 0 = energy-conserving trapezoidal Newmark), from the ALPHA=
+  // parameter on *DYNAMIC. `dynamic_nonlinear` routes the step through the per-step Newton
+  // driver (NLGEOM / a nonlinear material / contact), including the mass term in the
+  // effective tangent; a linear model uses the factored effective-stiffness path.
+  Real dynamic_alpha{0.0};             // *DYNAMIC, ALPHA= (HHT numerical damping)
+  bool dynamic_nonlinear{false};       // *DYNAMIC, NLGEOM / nonlinear direct dynamics
+
+  // *SUBSTRUCTURE GENERATE controls (spec: substructure-generation). Inert unless
+  // procedure == Substructure. `retained_dofs` is the ordered set of retained (master)
+  // nodal DOFs declared by *RETAINED NODAL DOFS — one entry per (node, comp) with comp
+  // in 1..3. The exported superelement's DOFs are exactly these, in declaration order
+  // (SORTED=NO) — the eliminated interior DOFs are Schur-condensed. The output flags
+  // mirror *SUBSTRUCTURE MATRIX OUTPUT (STIFFNESS=/MASS=): a reduced mass is formed
+  // (Craig-Bampton) only when `substructure_mass` is requested. `substructure_modes` is
+  // the number of fixed-interface normal modes retained (0 -> pure Guyan static
+  // reduction); it comes from a *FREQUENCY card inside the substructure step, or 0.
+  struct RetainedDof {
+    Index node_id{};
+    int comp{};  // 1..3 (x,y,z)
+  };
+  std::vector<RetainedDof> retained_dofs;
+  bool substructure_stiffness{true};   // *SUBSTRUCTURE MATRIX OUTPUT, STIFFNESS=YES
+  bool substructure_mass{false};       // *SUBSTRUCTURE MATRIX OUTPUT, MASS=YES
+  int substructure_modes{0};           // fixed-interface modes (Craig-Bampton); 0 = Guyan
 
   // Nonlinear-solution controls, parsed from *CONTROLS / *STATIC / *TIME POINTS.
   // Unused by the default linear path; consumed by solve_nonlinear_static.

@@ -80,6 +80,27 @@ std::vector<Real> element_conduction(ElementType type, std::span<const Vec3> coo
 std::vector<Real> element_capacitance(ElementType type, std::span<const Vec3> coords,
                                       Real rho_c);
 
+// Dense consistent mass matrix (3n x 3n, row-major), DOF order node-major
+// [u1,v1,w1, u2,v2,w2, ...] — the mechanical analog of element_capacitance
+// (spec: modal-and-buckling-analysis — *FREQUENCY consistent mass). For a
+// density rho the translational mass couples like the scalar term N_a N_b on
+// each of the three translational DOFs and is otherwise block-diagonal in the
+// direction index:
+//   M_e[3a+i][3b+j] = delta_ij * Sigma_gp rho * N_a N_b * detJ * w.
+// This reuses the exact same shape functions, Gauss rule, and physical_gradients
+// (detJ only) as element_capacitance, so every solid element family is covered.
+// Zero rho yields a zero matrix. (ref: mass matrix e_c3d.f mass branch.)
+std::vector<Real> element_mass(ElementType type, std::span<const Vec3> coords,
+                               Real rho);
+
+// Dense LUMPED (diagonal) mass matrix (3n x 3n, row-major), same DOF order. The
+// diagonal is the row sum of the consistent mass (HRZ-free simple row-sum lumping,
+// which is exact for the total translational mass rho*V per direction); off-diagonal
+// entries are zero. Zero rho yields a zero matrix. (spec: modal-and-buckling —
+// lumped mass option.)
+std::vector<Real> element_mass_lumped(ElementType type, std::span<const Vec3> coords,
+                                      Real rho);
+
 // Thermal-strain equivalent nodal load (spec: heat-transfer — thermal expansion).
 // For a thermal strain eps_th = alpha (T - Tref) on the normal components (Voigt
 // xx,yy,zz), the mechanical residual gains f_th = ∫ Bᵀ D eps_th dV, so heating a

@@ -750,6 +750,53 @@ std::vector<Real> element_capacitance(ElementType type, std::span<const Vec3> co
   return Ce;
 }
 
+std::vector<Real> element_mass(ElementType type, std::span<const Vec3> coords,
+                               Real rho) {
+  const int n = nodes_per_element(type);
+  const int ndof = n * kDofsPerNode;
+  std::vector<Real> Me(static_cast<std::size_t>(ndof) * static_cast<std::size_t>(ndof),
+                       0.0);
+  if (rho == 0.0) return Me;
+  std::array<std::array<Real, 3>, kMaxNodes> g{};
+  for (const GaussPoint& gp : gauss_rule(type)) {
+    const Shape s = shape(type, gp.xi, gp.et, gp.ze);
+    const Real det = physical_gradients(s, coords, g);  // detJ only
+    const Real scale = rho * det * gp.w;
+    // The scalar consistent mass m_ab = rho * N_a N_b * detJ * w spreads onto each
+    // of the three translational DOFs (block-diagonal in the direction index).
+    for (int a = 0; a < n; ++a)
+      for (int b = 0; b < n; ++b) {
+        const Real m = scale * s.N[static_cast<std::size_t>(a)] *
+                       s.N[static_cast<std::size_t>(b)];
+        for (int d = 0; d < kDofsPerNode; ++d) {
+          const int ia = a * kDofsPerNode + d, ib = b * kDofsPerNode + d;
+          Me[static_cast<std::size_t>(ia) * static_cast<std::size_t>(ndof) +
+             static_cast<std::size_t>(ib)] += m;
+        }
+      }
+  }
+  return Me;
+}
+
+std::vector<Real> element_mass_lumped(ElementType type, std::span<const Vec3> coords,
+                                      Real rho) {
+  const int n = nodes_per_element(type);
+  const int ndof = n * kDofsPerNode;
+  const std::vector<Real> Mc = element_mass(type, coords, rho);
+  std::vector<Real> Ml(Mc.size(), 0.0);
+  // Simple row-sum lumping: the diagonal takes the row sum of the consistent mass,
+  // which preserves the total translational mass rho*V per direction.
+  for (int i = 0; i < ndof; ++i) {
+    Real row = 0.0;
+    for (int j = 0; j < ndof; ++j)
+      row += Mc[static_cast<std::size_t>(i) * static_cast<std::size_t>(ndof) +
+                static_cast<std::size_t>(j)];
+    Ml[static_cast<std::size_t>(i) * static_cast<std::size_t>(ndof) +
+       static_cast<std::size_t>(i)] = row;
+  }
+  return Ml;
+}
+
 ElasticIsoMaterial::ElasticIsoMaterial(const ElasticIso& props)
     : D_(elastic_iso_D(props)) {}
 

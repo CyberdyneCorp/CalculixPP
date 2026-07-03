@@ -48,4 +48,15 @@ Model parse_inp_file(const std::string& path);
 std::vector<Model> parse_inp_steps(const std::string& text);
 std::vector<Model> parse_inp_steps_file(const std::string& path);
 
+// Enforce the preceding-*FREQUENCY-step requirement (spec: modal-and-buckling-analysis
+// — "modal-superposition procedures SHALL require a preceding *FREQUENCY step in the
+// same job"). Given the ordered per-step models of a job, a *MODAL DYNAMIC / *STEADY
+// STATE DYNAMICS / *COMPLEX FREQUENCY step MUST be preceded by a *FREQUENCY step (which
+// produced the eigenmodes it superposes over). Throws std::runtime_error naming the
+// offending step when the required eigenmode source is absent. A job whose modal step is
+// the FIRST step with no prior *FREQUENCY fails this check. (Single-step modal decks that
+// extract their own basis from the same model are validated at solve dispatch — see the
+// note in tasks 2.4; this checker covers the multi-step chaining case.)
+void validate_preceding_frequency(const std::vector<Model>& steps);
+
 }  // namespace cxpp::io

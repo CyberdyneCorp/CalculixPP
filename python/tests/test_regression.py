@@ -1971,3 +1971,524 @@ def test_contact_deferred_mortar_rejects_clearly():
         cx.solve_text(deck)
     msg = str(exc.value).lower()
     assert "surface-to-surface" in msg or "surface to surface" in msg or "mortar" in msg
+
+
+# --- Phase 4: *FREQUENCY natural-frequency validation (tasks 1.1-1.4, 2.1) --------
+def _parse_ref_eigenvalues(path):
+    """Parse the 'E I G E N V A L U E   O U T P U T' block of a CalculiX .dat.ref,
+    returning [(mode_no, eigenvalue, real_rad, real_cycles), ...]."""
+    out = []
+    with open(path) as fh:
+        lines = fh.readlines()
+    in_block = False
+    for ln in lines:
+        if "E I G E N V A L U E" in ln:
+            in_block = True
+            continue
+        if in_block:
+            # The PARTICIPATION / EFFECTIVE-MASS blocks that follow are spelled
+            # letter-spaced ("P A R T I C I P A T I O N"); their data rows also lead
+            # with an integer mode number, so stop as soon as the mode numbering
+            # restarts at 1 (a new block) — that bounds us to the eigenvalue block.
+            parts = ln.split()
+            if len(parts) >= 4:
+                try:
+                    mode = int(parts[0])
+                    eig = float(parts[1])
+                    rad = float(parts[2])
+                    cyc = float(parts[3])
+                except ValueError:
+                    continue
+                if out and mode <= out[-1][0]:
+                    break  # mode number reset -> next block started
+                out.append((mode, eig, rad, cyc))
+    return out
+
+
+_beam8f_cache = {}
+
+
+def _beam8f_solve():
+    """Solve beam8f once and cache the result (the dense eigensolve is expensive)."""
+    inp = os.path.join(CCX_TEST, "beam8f.inp")
+    ref_path = os.path.join(CCX_TEST, "beam8f.dat.ref")
+    if not (os.path.exists(inp) and os.path.exists(ref_path)):
+        pytest.skip("beam8f reference deck not available")
+    if "res" not in _beam8f_cache:
+        import calculixpp as cx
+
+        _beam8f_cache["res"] = cx.solve(inp)
+        _beam8f_cache["ref_path"] = ref_path
+    return _beam8f_cache["res"], _beam8f_cache["ref_path"]
+
+
+@pytest.mark.slow
+def test_frequency_beam8f_matches_calculix():
+    """(2.1) The stock *FREQUENCY cantilever beam8f (C3D8) reproduces the reference
+    .dat.ref eigenvalues AND natural frequencies (cycles/time) within tolerance — the
+    dense generalized eigensolver validated against stock CalculiX."""
+    res, ref_path = _beam8f_solve()
+    assert res["procedure"] == "frequency"
+    ref = _parse_ref_eigenvalues(ref_path)
+    assert len(ref) == 10, f"expected 10 reference modes, got {len(ref)}"
+    eig = res["eigenvalue"]
+    freq = res["frequency"]
+    assert len(eig) == 10
+    for i, (_mode, ref_eig, _rad, ref_cyc) in enumerate(ref):
+        rel_e = abs(float(eig[i]) - ref_eig) / abs(ref_eig)
+        rel_f = abs(float(freq[i]) - ref_cyc) / abs(ref_cyc)
+        assert rel_e < 1e-4, f"mode {i+1} eigenvalue rel-err {rel_e:.2e}"
+        assert rel_f < 1e-4, f"mode {i+1} frequency rel-err {rel_f:.2e}"
+
+
+@pytest.mark.slow
+def test_frequency_participation_beam8f():
+    """(1.4) beam8f modal participation factors + effective mass match the reference
+    .dat.ref X-direction column, and the effective masses sum to the reported total."""
+    res, _ref_path = _beam8f_solve()
+    # X-direction participation, reference column 1 (X-COMPONENT), modes 1..10.
+    ref_x_factor = [0.2390869e-3, -0.1309328e-15, -0.1350728e-3, -0.1855304e-16,
+                    -0.2173511e-17, 0.4393173e-18, -0.8007351e-4, -0.3530553e-18,
+                    0.1630485e-17, 0.5724300e-4]
+    part = res["participation"]      # (n_modes, 3)
+    effm = res["effective_mass"]     # (n_modes, 3)
+    total = res["total_effective_mass"]  # (3,)
+    # Compare |Γ| (eigenvector sign is arbitrary) on the modes with a non-trivial X.
+    for i, ref_g in enumerate(ref_x_factor):
+        if abs(ref_g) < 1e-8:
+            continue  # near-zero (orthogonal) — sign/scale noise, skip
+        assert abs(abs(float(part[i][0])) - abs(ref_g)) < 1e-4 * abs(ref_g) + 1e-10
+    # Total X effective mass matches the reference TOTAL row (0.8509573E-07).
+    assert abs(float(total[0]) - 0.8509573e-7) < 1e-4 * 0.8509573e-7
+    # Effective mass is the square of the participation factor.
+    for i in range(len(ref_x_factor)):
+        assert abs(float(effm[i][0]) - float(part[i][0]) ** 2) < 1e-20 + 1e-9 * abs(
+            float(effm[i][0])
+        )
+
+
+# --- Phase-4 modal superposition dynamics (tasks 1.5, 4.1, 4.2, 4.3) ----------
+# Validated ANALYTICALLY against the closed-form single-DOF oscillator: a grounded
+# SPRING1 (stiffness k on dof 1) plus a MASS m gives one mode ω = sqrt(k/m). This
+# exercises the FULL parse -> assemble -> eigen -> modal-superposition -> bindings
+# path (self-contained; no CalculiX test tree needed).
+
+def _sdof_deck(k, mass, step_card, damping=""):
+    """A one-node SDOF: grounded spring k on x (dof 1) + point mass m, x free, y/z
+    fixed. `step_card` is the dynamics *STEP body; `damping` an optional *MODAL
+    DAMPING / *DAMPING block placed before it."""
+    return f"""*NODE
+1, 0., 0., 0.
+*ELEMENT,TYPE=SPRING1,ELSET=SP
+1,1
+*ELEMENT,TYPE=MASS,ELSET=MS
+2,1
+*SPRING,ELSET=SP
+1
+{k}
+*MASS,ELSET=MS
+{mass}
+*BOUNDARY
+1,2,3
+{damping}*STEP
+{step_card}
+*CLOAD
+1,1,1.0
+*END STEP
+"""
+
+
+def test_modal_dynamic_sdof_step_response():
+    """(4.1) *MODAL DYNAMIC step response of an undamped SDOF matches the closed-form
+    u(t) = (F/k)(1 - cos ω t): the exact modal integrator reproduces the natural
+    period 2π/ω with no algorithmic damping."""
+    import calculixpp as cx
+
+    k, mass = 400.0, 1.0            # ω = 20 rad/s
+    omega = math.sqrt(k / mass)
+    period = 2.0 * math.pi / omega
+    dt = period / 200.0
+    t_end = 3.0 * period
+    deck = _sdof_deck(k, mass, f"*MODAL DYNAMIC\n{dt},{t_end}")
+    res = cx.solve_text(deck)
+    assert res["procedure"] == "modal dynamic"
+    t = res["time"]
+    ux = res["displacement"][:, 0, 0]  # node 0, x
+    F = 1.0
+    for i in range(len(t)):
+        exact = (F / k) * (1.0 - math.cos(omega * float(t[i])))
+        assert abs(float(ux[i]) - exact) < 1e-7, f"step {i}: {ux[i]} vs {exact}"
+
+
+def test_steady_state_sdof_resonance():
+    """(4.2/4.3) *STEADY STATE DYNAMICS harmonic sweep of a damped SDOF: the amplitude
+    peaks at the natural frequency with peak ≈ (F/k)·Q, Q = 1/(2ζ) (modal damping)."""
+    import calculixpp as cx
+
+    k, mass = 100.0, 1.0            # ω = 10 rad/s -> f = 10/2π
+    zeta = 0.02
+    omega = math.sqrt(k / mass)
+    f_nat = omega / (2.0 * math.pi)
+    # Sweep a band straddling the natural frequency with fine resolution.
+    step = ("*STEADY STATE DYNAMICS\n"
+            f"{0.5 * f_nat},{1.5 * f_nat},400")
+    damping = f"*MODAL DAMPING\n1,1,{zeta}\n"
+    deck = _sdof_deck(k, mass, step, damping)
+    res = cx.solve_text(deck)
+    assert res["procedure"] == "steady state dynamics"
+    freqs = res["frequency"]
+    amp = res["amplitude"][:, 0, 0]  # node 0, x magnitude
+    # Peak location and value.
+    ipeak = max(range(len(amp)), key=lambda i: float(amp[i]))
+    f_peak = float(freqs[ipeak])
+    a_peak = float(amp[ipeak])
+    # Static deflection F/k, resonant amplification Q = 1/(2ζ).
+    u_static = 1.0 / k
+    Q = 1.0 / (2.0 * zeta)
+    # Peak within a sweep-spacing of the natural frequency.
+    assert abs(f_peak - f_nat) < 0.01 * f_nat, f"peak at {f_peak}, nat {f_nat}"
+    assert abs(a_peak - u_static * Q) < 0.02 * u_static * Q, (
+        f"peak amp {a_peak} vs {u_static * Q}")
+
+
+@pytest.mark.slow
+def test_steady_state_beam8f_resonates_at_an_eigenfrequency():
+    """(4.2) End-to-end on the real beam8f C3D8 cantilever mesh: a *STEADY STATE
+    DYNAMICS sweep spanning the extracted mode band peaks AT one of the model's natural
+    frequencies (a harmonic resonance coincides with an eigenfrequency of the full
+    system). The eigenfrequencies themselves are validated against the reference
+    .dat.ref by test_frequency_beam8f_matches_calculix; here we confirm the
+    modal-superposition harmonic response resonates at one of them."""
+    import calculixpp as cx
+    import numpy as np
+
+    inp = os.path.join(CCX_TEST, "beam8f.inp")
+    ref_path = os.path.join(CCX_TEST, "beam8f.dat.ref")
+    if not (os.path.exists(inp) and os.path.exists(ref_path)):
+        pytest.skip("beam8f reference deck not available")
+    # Natural cyclic frequencies from the frequency solve (10 modes).
+    freq_res = cx.solve(inp)
+    fnat = [float(v) for v in freq_res["frequency"]]
+    f1, flast = fnat[0], fnat[-1]
+    # Build a steady-state deck from beam8f's model blocks (everything before *STEP),
+    # driving a transverse tip load and sweeping across the whole mode band with a fine
+    # resolution so a resonance peak lands close to one eigenfrequency.
+    with open(inp) as fh:
+        text = fh.read()
+    head = text.split("*STEP")[0]
+    step = (
+        "*STEP\n*STEADY STATE DYNAMICS\n"
+        f"{0.9 * f1},{1.05 * flast},400\n"
+        "*MODAL DAMPING\n1,10,0.01\n"
+        "*CLOAD\nLAST,2,-1.0\n*END STEP\n"
+    )
+    # Model blocks + a *STEADY STATE step: the eigenbasis is extracted from the model
+    # directly by the engine (single-deck run, no separate *FREQUENCY step needed).
+    deck = head + step
+    res = cx.solve_text(deck)
+    assert res["procedure"] == "steady state dynamics"
+    freqs = np.asarray(res["frequency"], dtype=float)
+    amp = np.asarray(res["amplitude"], dtype=float)  # (n_freq, n_nodes, 3)
+    # Peak total amplitude across all nodes/components per frequency.
+    per_freq_max = np.max(np.abs(amp).reshape(len(freqs), -1), axis=1)
+    f_peak = float(freqs[int(np.argmax(per_freq_max))])
+    # The dominant resonance coincides with SOME natural frequency (within the sweep
+    # spacing ~ band/400 ≈ a couple percent of the nearest mode).
+    nearest = min(fnat, key=lambda fn: abs(fn - f_peak))
+    assert abs(f_peak - nearest) < 0.03 * nearest, (
+        f"resonance at {f_peak}, nearest mode {nearest}, modes {fnat}")
+
+
+def test_dynamic_sdof_step_response():
+    """(3.1) *DYNAMIC direct HHT-alpha integration of an undamped SDOF under a suddenly
+    applied step load reproduces the closed-form u(t) = (F/k)(1 - cos ω t) to the
+    second-order time-discretization error (fine step)."""
+    import calculixpp as cx
+
+    k, mass = 400.0, 1.0            # ω = 20 rad/s
+    omega = math.sqrt(k / mass)
+    period = 2.0 * math.pi / omega
+    dt = period / 400.0
+    t_end = 3.0 * period
+    deck = _sdof_deck(k, mass, f"*DYNAMIC\n{dt},{t_end}")
+    res = cx.solve_text(deck)
+    assert res["procedure"] == "dynamic"
+    t = res["time"]
+    ux = res["displacement"][:, 0, 0]
+    F = 1.0
+    max_err = 0.0
+    for i in range(len(t)):
+        exact = (F / k) * (1.0 - math.cos(omega * float(t[i])))
+        max_err = max(max_err, abs(float(ux[i]) - exact))
+    assert max_err < 2e-4, f"max_err {max_err}"
+
+
+def test_dynamic_energy_conserved_undamped():
+    """(3.3) An undamped α=0 *DYNAMIC free vibration (initial condition supplied by a
+    brief impulse-free release is not exposed via the deck, so we drive a step load and
+    confirm the TOTAL energy history stays bounded and the reported energy drift over a
+    forced run is finite/small). For the analytical energy-conservation proof see the
+    C++ test test_direct_dynamics (free vibration from a nonzero initial displacement,
+    drift < 1e-10). Here we exercise the deck path and the energy field."""
+    import calculixpp as cx
+
+    k, mass = 250.0, 2.0
+    omega = math.sqrt(k / mass)
+    period = 2.0 * math.pi / omega
+    dt = period / 200.0
+    t_end = 5.0 * period
+    deck = _sdof_deck(k, mass, f"*DYNAMIC\n{dt},{t_end}")
+    res = cx.solve_text(deck)
+    assert res["procedure"] == "dynamic"
+    assert abs(float(res["hht_alpha"])) < 1e-12   # default α=0
+    energy = res["total_energy"]
+    assert len(energy) == len(res["time"])
+    # Energy stays bounded by the work the step load can do (< 2·F²/k over the swing).
+    assert max(float(e) for e in energy) < 4.0 * (1.0 * 1.0) / k
+
+
+def test_dynamic_hht_alpha_dissipates():
+    """(3.3) *DYNAMIC, ALPHA=-0.3 introduces controllable numerical damping: the peak
+    displacement of the step response decays relative to the undamped (α=0) run, so the
+    HHT knob is wired through the deck."""
+    import calculixpp as cx
+
+    k, mass = 250.0, 2.0
+    omega = math.sqrt(k / mass)
+    period = 2.0 * math.pi / omega
+    dt = period / 40.0
+    t_end = 40.0 * period
+    undamped = cx.solve_text(_sdof_deck(k, mass, f"*DYNAMIC\n{dt},{t_end}"))
+    damped = cx.solve_text(
+        _sdof_deck(k, mass, f"*DYNAMIC,ALPHA=-0.3\n{dt},{t_end}"))
+    assert abs(float(damped["hht_alpha"]) + 0.3) < 1e-12
+    # Late-time peak displacement is smaller with numerical damping.
+    n = len(undamped["time"])
+    tail = slice(3 * n // 4, n)
+    u_undamped = max(abs(float(v)) for v in undamped["displacement"][tail, 0, 0])
+    u_damped = max(abs(float(v)) for v in damped["displacement"][tail, 0, 0])
+    assert u_damped < u_undamped
+
+
+# --- Phase-4 substructure / superelement generation (tasks 5.1-5.3) -----------
+# Craig-Bampton / Guyan reduction through the Python bindings. Validated against the
+# stock-CalculiX substructure.inp reduced stiffness (its .dat.ref *MATRIX block) and,
+# self-contained, against the empty-retained-DOF error and a Craig-Bampton reduced-model
+# eigenfrequency check that approximates the full model.
+
+def _parse_ref_reduced_matrix(ref_path, mtype="STIFFNESS"):
+    """Read the lower-triangular *MATRIX TYPE=<mtype> block from a substructure
+    .dat.ref, returning the flat list of entries (row 0 has 1, row 1 has 2, ...)."""
+    vals = []
+    in_block = False
+    with open(ref_path) as f:
+        for line in f:
+            if line.strip().startswith("*MATRIX TYPE="):
+                in_block = ("TYPE=" + mtype) in line.replace(" ", "")
+                continue
+            if not in_block:
+                continue
+            for tok in line.split():
+                try:
+                    vals.append(float(tok))
+                except ValueError:
+                    in_block = False
+                    break
+    return vals
+
+
+def test_substructure_reduced_stiffness_matches_calculix():
+    """(5.1-5.3) The stock *SUBSTRUCTURE GENERATE deck substructure.inp (Guyan static
+    reduction onto 60 retained DOFs, STIFFNESS output) reproduces the reference
+    .dat.ref reduced-stiffness *MATRIX block within tolerance, via the bindings."""
+    import calculixpp as cx
+
+    inp = os.path.join(CCX_TEST, "substructure.inp")
+    ref_path = os.path.join(CCX_TEST, "substructure.dat.ref")
+    if not (os.path.exists(inp) and os.path.exists(ref_path)):
+        pytest.skip("substructure reference deck not available")
+    res = cx.solve(inp)
+    assert res["procedure"] == "substructure generate"
+    dim = int(res["dim"])
+    assert dim == 60
+    assert int(res["num_retained"]) == 60
+    assert int(res["num_modes"]) == 0  # STIFFNESS-only -> pure Guyan
+    K = res["k_reduced"]  # (60, 60)
+    ref = _parse_ref_reduced_matrix(ref_path, "STIFFNESS")
+    assert len(ref) == 60 * 61 // 2
+    idx = 0
+    max_rel = 0.0
+    for i in range(60):
+        for j in range(i + 1):
+            ours = float(K[i][j])
+            theirs = ref[idx]
+            idx += 1
+            denom = max(abs(theirs), 1.0)
+            max_rel = max(max_rel, abs(ours - theirs) / denom)
+    assert max_rel < 1e-6, f"reduced stiffness max relative error {max_rel:.2e}"
+
+
+def test_substructure_empty_retained_errors():
+    """(5.2) A *SUBSTRUCTURE GENERATE step with no *RETAINED NODAL DOFS reports an
+    error that the retained DOF set is empty (spec scenario)."""
+    import calculixpp as cx
+
+    deck = """*NODE
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 1., 1., 0.
+4, 0., 1., 0.
+5, 0., 0., 1.
+6, 1., 0., 1.
+7, 1., 1., 1.
+8, 0., 1., 1.
+*ELEMENT,TYPE=C3D8,ELSET=EALL
+1,1,2,3,4,5,6,7,8
+*MATERIAL,NAME=EL
+*ELASTIC
+210000.,0.3
+*DENSITY
+7.8e-9
+*SOLID SECTION,ELSET=EALL,MATERIAL=EL
+*BOUNDARY
+1,1,3
+*STEP
+*SUBSTRUCTURE GENERATE
+*END STEP
+"""
+    with pytest.raises(Exception):
+        cx.solve_text(deck)
+
+
+def test_substructure_craig_bampton_reduces_full_model():
+    """(5.1-5.2) Craig-Bampton reduction (mass + fixed-interface modes) of a small
+    cantilever column: the reduced model's lowest eigenfrequencies approximate the full
+    model's *FREQUENCY within a few percent, validating fixed-interface + constraint
+    modes end-to-end through the bindings."""
+    import calculixpp as cx
+    import numpy as np
+
+    # 3-layer unit-square column, z=0 clamped, top face retained + 6 fixed-interface
+    # modes. Full free DOFs = 24; reduced = 12 retained + 6 modal = 18.
+    nodes = []
+    nid = 1
+    for z in (0.0, 1.0, 2.0):
+        for (x, y) in ((0, 0), (1, 0), (1, 1), (0, 1)):
+            nodes.append(f"{nid}, {x}., {y}., {z}.")
+            nid += 1
+    node_block = "\n".join(nodes)
+    common = f"""*NODE
+{node_block}
+*ELEMENT,TYPE=C3D8,ELSET=EALL
+1,1,2,3,4,5,6,7,8
+2,5,6,7,8,9,10,11,12
+*MATERIAL,NAME=EL
+*ELASTIC
+210000.,0.3
+*DENSITY
+7.8e-9
+*SOLID SECTION,ELSET=EALL,MATERIAL=EL
+*NSET,NSET=TOP
+9,10,11,12
+*BOUNDARY
+1,1,3
+2,1,3
+3,1,3
+4,1,3
+"""
+    freq_deck = common + """*STEP
+*FREQUENCY
+6
+*END STEP
+"""
+    sub_deck = common + """*STEP
+*SUBSTRUCTURE GENERATE
+*FREQUENCY
+6
+*RETAINED NODAL DOFS,SORTED=NO
+TOP,1,3
+*SUBSTRUCTURE MATRIX OUTPUT,STIFFNESS=YES,MASS=YES
+*END STEP
+"""
+    full = cx.solve_text(freq_deck)
+    sub = cx.solve_text(sub_deck)
+    assert sub["procedure"] == "substructure generate"
+    assert int(sub["num_retained"]) == 12
+    assert int(sub["num_modes"]) == 6
+    Kr = np.asarray(sub["k_reduced"], dtype=float)
+    Mr = np.asarray(sub["m_reduced"], dtype=float)
+    # Solve the small reduced generalized eigenproblem K_r x = λ M_r x.
+    from scipy.linalg import eigh  # noqa: WPS433 (test-only)
+
+    lam = eigh(Kr, Mr, eigvals_only=True)
+    lam = np.sort(lam[lam > 1e-6])
+    fr = np.sqrt(lam) / (2.0 * math.pi)
+    ff = np.asarray(full["frequency"], dtype=float)
+    for i in range(3):
+        rel = abs(fr[i] - ff[i]) / ff[i]
+        assert rel < 0.02, f"reduced mode {i+1} freq rel-err {rel:.2e}"
+
+
+# --- Phase-4 API parity (task 7.2) --------------------------------------------
+
+def test_api_parity_phase4():
+    """(7.2) API parity for Phase 4: every Phase-4 procedure exposed in C++ has a
+    Python solve() path that returns its documented result payload, summary()
+    reports the procedure without solving, and every BLOCKED Phase-4 card raises a
+    clear, actionable error naming its deferral (never a silent wrong solve)."""
+    import calculixpp as cx
+
+    k, mass = 100.0, 1.0
+    omega = math.sqrt(k / mass)
+    period = 2.0 * math.pi / omega
+
+    # *FREQUENCY: eigenpairs + participation / effective mass (built on the mass matrix).
+    freq = cx.solve_text(_sdof_deck(k, mass, "*FREQUENCY\n1"))
+    assert freq["procedure"] == "frequency"
+    for key in ("eigenvalue", "omega", "frequency", "mode_shape",
+                "participation", "effective_mass", "total_effective_mass"):
+        assert key in freq, f"frequency result missing '{key}'"
+    assert abs(float(freq["omega"][0]) - omega) < 1e-6 * omega
+
+    # *DYNAMIC: implicit HHT direct integration -> full state + energy history.
+    dyn = cx.solve_text(_sdof_deck(k, mass, f"*DYNAMIC\n{period/50},{2*period}"))
+    assert dyn["procedure"] == "dynamic"
+    for key in ("time", "displacement", "velocity", "acceleration",
+                "total_energy", "hht_alpha", "energy_drift"):
+        assert key in dyn, f"dynamic result missing '{key}'"
+
+    # *MODAL DYNAMIC: modal superposition transient -> time + displacement history.
+    md = cx.solve_text(_sdof_deck(k, mass, f"*MODAL DYNAMIC\n{period/50},{2*period}"))
+    assert md["procedure"] == "modal dynamic"
+    for key in ("time", "displacement"):
+        assert key in md, f"modal dynamic result missing '{key}'"
+
+    # *STEADY STATE DYNAMICS: harmonic sweep -> frequency / amplitude / phase arrays.
+    fn = omega / (2.0 * math.pi)
+    ss = cx.solve_text(
+        _sdof_deck(k, mass, f"*STEADY STATE DYNAMICS\n{0.1*fn},{2.0*fn},50",
+                   damping="*MODAL DAMPING\n1,0.02\n"))
+    assert ss["procedure"] == "steady state dynamics"
+    for key in ("frequency", "amplitude", "phase"):
+        assert key in ss, f"steady-state result missing '{key}'"
+
+    # summary()/summary_text() report each dynamics procedure WITHOUT solving.
+    assert cx.summary_text(_sdof_deck(k, mass, "*FREQUENCY\n1"))["procedure"] == \
+        "frequency"
+    assert cx.summary_text(
+        _sdof_deck(k, mass, f"*DYNAMIC\n{period/50},{period}"))["procedure"] == \
+        "dynamic"
+
+    # Every BLOCKED Phase-4 card raises an actionable error naming its deferral.
+    blocked = [
+        ("*BUCKLE\n5", "buckling"),
+        ("*COMPLEX FREQUENCY\n5", "complex"),
+        ("*GREEN", "green-function"),
+    ]
+    for step_card, needle in blocked:
+        deck = _sdof_deck(k, mass, step_card)
+        with pytest.raises(RuntimeError) as ei:
+            cx.solve_text(deck)
+        msg = str(ei.value).lower()
+        assert needle in msg and "deferred" in msg, \
+            f"blocked card '{step_card}' -> unclear error: {ei.value}"

@@ -39,7 +39,11 @@ if(CALCULIXPP_WITH_SOLVER)
     numerics/linear_static.cpp
     numerics/nonlinear_static.cpp
     numerics/heat_transfer.cpp
-    numerics/multistep.cpp)
+    numerics/multistep.cpp
+    numerics/eigensolution.cpp
+    numerics/modal_dynamics.cpp
+    numerics/direct_dynamics.cpp
+    numerics/substructure.cpp)
   target_link_libraries(calculixpp_numerics PUBLIC calculixpp_core scipp::scipp)
   target_link_libraries(calculixpp_numerics PRIVATE calculixpp_warnings)
   target_compile_features(calculixpp_numerics PUBLIC cxx_std_20)
