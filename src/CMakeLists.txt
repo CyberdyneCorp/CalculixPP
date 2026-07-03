@@ -2,10 +2,16 @@
 # assembly to COO triplets). No external deps so it builds and tests everywhere,
 # including mobile toolchains. The SciPP/NumPP sparse-solve layer links on top.
 add_library(calculixpp_core
+  core/amplitude.cpp
   core/element.cpp
   core/mesh.cpp
   core/model.cpp
+  core/constraints.cpp
   fem/element.cpp
+  fem/constraint_transform.cpp
+  fem/plasticity.cpp
+  fem/hyperelastic.cpp
+  fem/user_material.cpp
   fem/assembly.cpp
   fem/stress.cpp
   fem/loads.cpp
@@ -26,7 +32,8 @@ add_library(calculixpp::core ALIAS calculixpp_core)
 if(CALCULIXPP_WITH_SOLVER)
   add_library(calculixpp_numerics
     compute/cpu_backend.cpp
-    numerics/linear_static.cpp)
+    numerics/linear_static.cpp
+    numerics/nonlinear_static.cpp)
   target_link_libraries(calculixpp_numerics PUBLIC calculixpp_core scipp::scipp)
   target_link_libraries(calculixpp_numerics PRIVATE calculixpp_warnings)
   target_compile_features(calculixpp_numerics PUBLIC cxx_std_20)

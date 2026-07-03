@@ -147,6 +147,290 @@ void test_beam10p() {
   CX_CHECK(r.displacement[static_cast<std::size_t>(tip)][1] > 0.0);
 }
 
+// *PLASTIC / *CYCLIC HARDENING parsing: the hardening table lands on the material,
+// HARDENING= selects the kind, and a plastic material flips has_plasticity().
+void test_plastic_card() {
+  const char* deck = R"(
+*NODE
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 0., 1., 0.
+4, 0., 0., 1.
+*ELEMENT, TYPE=C3D4, ELSET=EALL
+100, 1, 2, 3, 4
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000., 0.3
+*PLASTIC, HARDENING=ISOTROPIC
+800., 0.
+960., 0.02
+*SOLID SECTION, ELSET=EALL, MATERIAL=STEEL
+)";
+  const Model m = io::parse_inp(deck);
+  CX_CHECK(m.has_plasticity());
+  const auto& mat = m.materials.at("STEEL");
+  CX_CHECK(mat.plastic.has_value());
+  CX_CHECK(mat.plastic->hardening == Plastic::Hardening::Isotropic);
+  CX_CHECK(mat.plastic->yield.size() == 2);
+  CX_NEAR(mat.plastic->yield[0], 800.0, 1e-12);
+  CX_NEAR(mat.plastic->eqplastic[1], 0.02, 1e-12);
+
+  // element_plastic() aligns with mesh.elements(); the single element is plastic.
+  const auto ep = m.element_plastic();
+  CX_CHECK(ep.size() == 1);
+  CX_CHECK(ep[0].has_value());
+
+  // An elastic-only deck stays non-plastic (linear path unaffected).
+  const char* elastic = R"(
+*NODE
+1, 0., 0., 0.
+*MATERIAL, NAME=EL
+*ELASTIC
+210000., 0.3
+)";
+  CX_CHECK(!io::parse_inp(elastic).has_plasticity());
+}
+
+// *USER MATERIAL / *DEPVAR / *RATEDEPENDENT and *HYPERELASTIC parsing (spec 4.3/4.6).
+void test_user_and_hyperelastic_cards() {
+  const char* user = R"(
+*NODE
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 0., 1., 0.
+4, 0., 0., 1.
+*ELEMENT, TYPE=C3D4, ELSET=EALL
+100, 1, 2, 3, 4
+*MATERIAL, NAME=UMAT
+*USER MATERIAL, CONSTANTS=2, NAME=LINEAR_ELASTIC_USER
+210000., 0.3
+*DEPVAR
+3
+*RATEDEPENDENT
+1.5
+*SOLID SECTION, ELSET=EALL, MATERIAL=UMAT
+)";
+  const Model mu = io::parse_inp(user);
+  CX_CHECK(mu.has_nonlinear_material());
+  const auto& um = mu.materials.at("UMAT").user;
+  CX_CHECK(um.has_value());
+  CX_CHECK(um->name == "LINEAR_ELASTIC_USER");
+  CX_CHECK(um->constants.size() == 2);
+  CX_NEAR(um->constants[0], 210000.0, 1e-9);
+  CX_CHECK(um->ndepvar == 3);
+  CX_CHECK(um->rate_scale.has_value());
+  CX_NEAR(*um->rate_scale, 1.5, 1e-12);
+  // effective_elastic() derives (E,nu) from the user constants (no *ELASTIC given).
+  const auto eff = mu.materials.at("UMAT").effective_elastic();
+  CX_CHECK(eff.has_value());
+  CX_NEAR(eff->E, 210000.0, 1e-6);
+
+  const char* hyper = R"(
+*NODE
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 0., 1., 0.
+4, 0., 0., 1.
+*ELEMENT, TYPE=C3D4, ELSET=EALL
+100, 1, 2, 3, 4
+*MATERIAL, NAME=RUBBER
+*HYPERELASTIC, N=1
+0.5, 0.001
+*SOLID SECTION, ELSET=EALL, MATERIAL=RUBBER
+)";
+  const Model mh = io::parse_inp(hyper);
+  CX_CHECK(mh.has_nonlinear_material());
+  const auto& hy = mh.materials.at("RUBBER").hyperelastic;
+  CX_CHECK(hy.has_value());
+  CX_NEAR(hy->c10, 0.5, 1e-12);
+  CX_NEAR(hy->mu, 1.0, 1e-12);       // mu = 2*C10
+  CX_NEAR(hy->kappa, 2000.0, 1e-9);  // kappa = 2/D1
+}
+
+// Parse the constraint cards and check they populate the Model and expand correctly.
+void test_constraint_cards() {
+  const char* deck = R"(
+*NODE
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 1., 1., 0.
+4, 0., 1., 0.
+5, 0., 0., 1.
+6, 1., 0., 1.
+7, 1., 1., 1.
+8, 0., 1., 1.
+*ELEMENT, TYPE=C3D8, ELSET=EALL
+1, 1,2,3,4,5,6,7,8
+*NSET, NSET=TOP
+5,6,7,8
+*EQUATION
+2
+6, 1, 1.0, 7, 1, -1.0
+*MPC
+BEAM, 5, 6
+*RIGID BODY, NSET=TOP, REF NODE=5
+*COUPLING, REF NODE=5, SURFACE=TOP
+*KINEMATIC
+1,3
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000., 0.3
+*SOLID SECTION, MATERIAL=STEEL, ELSET=EALL
+)";
+  const Model m = io::parse_inp(deck);
+  CX_CHECK(m.equations.size() == 1);
+  CX_CHECK(m.equations[0].terms.size() == 2);
+  CX_CHECK(m.equations[0].terms[0].node_id == 6);
+  CX_NEAR(m.equations[0].terms[0].coeff, 1.0, 1e-12);
+  CX_CHECK(m.mpcs.size() == 1);
+  CX_CHECK(m.mpcs[0].kind == Mpc::Kind::Beam);
+  CX_CHECK(m.rigid_bodies.size() == 1);
+  CX_CHECK(m.rigid_bodies[0].ref_node == 5);
+  CX_CHECK(m.couplings.size() == 1);
+  CX_CHECK(m.couplings[0].kind == Coupling::Kind::Kinematic);
+  CX_CHECK(m.couplings[0].ref_node == 5);
+  // Expansion turns the four constraint kinds into a flat equation list.
+  const std::vector<Equation> eqs = m.expand_constraints();
+  CX_CHECK(eqs.size() >= 1 + 3 + 3 + 9);  // eq + beam(3) + rigid(3 nodes*3) + coupling(3*3)
+}
+
+// A minimal C3D4 material header, reused by the deferred-card sweep.
+const char* kMatHeader = R"(
+*NODE
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 0., 1., 0.
+4, 0., 0., 1.
+*ELEMENT, TYPE=C3D4, ELSET=EALL
+100, 1, 2, 3, 4
+*MATERIAL, NAME=M
+*ELASTIC
+210000., 0.3
+)";
+
+// Assert that parsing `deck` throws a ParseError whose message contains `needle`.
+bool throws_with(const std::string& deck, const std::string& needle) {
+  try {
+    io::parse_inp(deck);
+  } catch (const io::ParseError& e) {
+    return std::string(e.what()).find(needle) != std::string::npos;
+  }
+  return false;
+}
+
+// (6.1) Deferred Phase-2 cards must fail with a CLEAR, ACTIONABLE ParseError that
+// names the deferral — never a crash and never a silent no-op that would yield a
+// wrong solve. Each of these is a recognized Phase-2 capability documented as
+// deferred in tasks.md workstreams 3/4.
+void test_deferred_cards_reject_clearly() {
+  const char* sect = "*SOLID SECTION, ELSET=EALL, MATERIAL=M\n";
+  struct Case {
+    std::string block;
+    std::string needle;
+  };
+  const Case material_cases[] = {
+      {"*HYPERFOAM, N=1\n1.,2.,0.1\n", "hyperelastic foam"},
+      {"*CREEP, LAW=NORTON\n1e-10, 5., 0.\n", "creep"},
+      {"*VISCO\n", "viscoelasticity"},
+      {"*MOHR COULOMB\n30., 5.\n", "Mohr-Coulomb"},
+      {"*DAMAGE INITIATION, CRITERION=DUCTILE\n0.1, 0., 0.\n", "damage initiation"},
+      {"*DEFORMATION PLASTICITY\n2e5,0.3,4e2,10.,0.2\n", "deformation"},
+  };
+  for (const Case& c : material_cases) {
+    const std::string deck = std::string(kMatHeader) + c.block + sect;
+    // The message must name the specific deferred capability and state it is not
+    // yet implemented (actionable), not just "unsupported card".
+    CX_CHECK(throws_with(deck, c.needle));
+    CX_CHECK(throws_with(deck, "not yet implemented"));
+  }
+
+  // Deferred SECTION cards (need shell/beam kinematics).
+  const Case section_cases[] = {
+      {"*SHELL SECTION, ELSET=EALL, MATERIAL=M\n0.01\n", "shell sections"},
+      {"*BEAM SECTION, ELSET=EALL, MATERIAL=M, SECTION=RECT\n0.1, 0.1\n",
+       "beam sections"},
+      {"*MEMBRANE SECTION, ELSET=EALL, MATERIAL=M\n0.01\n", "membrane sections"},
+  };
+  for (const Case& c : section_cases) {
+    const std::string deck = std::string(kMatHeader) + c.block;
+    CX_CHECK(throws_with(deck, c.needle));
+    CX_CHECK(throws_with(deck, "not yet implemented"));
+  }
+
+  // A genuinely unknown keyword still gets the generic message (no false "Phase-2
+  // capability" claim).
+  CX_CHECK(throws_with(std::string(kMatHeader) + "*FLIBBERTIGIBBET\n",
+                       "unsupported card"));
+}
+
+// (6.1) The full Phase-2 IMPLEMENTED card set parses without crashing: connectors,
+// hex/wedge element types, amplitudes, body loads, controls/time points, changes,
+// and NLGEOM (accepted/ignored). One deck exercising the breadth.
+void test_phase2_card_sweep_parses() {
+  const char* deck = R"(
+*AMPLITUDE, NAME=RAMP, DEFINITION=TABULAR
+0., 0., 1., 1.
+*NODE
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 1., 1., 0.
+4, 0., 1., 0.
+5, 0., 0., 1.
+6, 1., 0., 1.
+7, 1., 1., 1.
+8, 0., 1., 1.
+9, 2., 0., 0.
+10, 2., 1., 0.
+11, 2., 0., 1.
+12, 2., 1., 1.
+*ELEMENT, TYPE=C3D8, ELSET=EHEX
+1, 1,2,3,4,5,6,7,8
+*ELEMENT, TYPE=C3D8R, ELSET=EHEXR
+2, 2,9,10,3,6,11,12,7
+*ELEMENT, TYPE=SPRINGA, ELSET=ESPR
+50, 7, 12
+*ELSET, ELSET=EALL
+1, 2
+*NSET, NSET=FIX
+1, 4, 5, 8
+*SPRING, ELSET=ESPR
+1000.
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000., 0.3
+*DENSITY
+7.8e-9
+*PLASTIC, HARDENING=COMBINED
+800., 0.
+960., 0.02
+*SOLID SECTION, ELSET=EALL, MATERIAL=STEEL
+*BOUNDARY
+FIX, 1, 3
+*STEP
+*STATIC, DIRECT, NLGEOM
+0.5, 1.0
+*CONTROLS, PARAMETERS=FIELD
+1e-3,,1e-3
+*TIME POINTS, NAME=TP
+0.25, 0.5, 0.75, 1.0
+*CLOAD, AMPLITUDE=RAMP
+9, 1, 100.
+*DLOAD
+EALL, GRAV, 9810., 0., 0., -1.
+*END STEP
+)";
+  const Model m = io::parse_inp(deck);
+  CX_CHECK(m.mesh.num_elements() == 2);        // 2 solids (spring is separate)
+  CX_CHECK(m.springs.size() == 1);
+  CX_CHECK(m.has_plasticity());
+  CX_CHECK(m.amplitudes.count("RAMP") == 1);
+  CX_CHECK(m.body_loads.size() == 1);
+  CX_CHECK(m.increment.direct);
+  CX_CHECK(m.time_points.times.size() == 4);
+  CX_CHECK(m.cloads.size() == 1);
+  CX_CHECK(m.cloads[0].amplitude == "RAMP");
+}
+
 }  // namespace
 
 int main() {
@@ -154,6 +438,11 @@ int main() {
   test_surface();
   test_surface_errors();
   test_beam10p();
+  test_plastic_card();
+  test_user_and_hyperelastic_cards();
+  test_constraint_cards();
+  test_deferred_cards_reject_clearly();
+  test_phase2_card_sweep_parses();
   if (cxtest::g_failures == 0) std::printf("test_parser: OK\n");
   CX_MAIN_RETURN();
 }
