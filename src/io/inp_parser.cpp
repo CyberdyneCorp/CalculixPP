@@ -201,9 +201,9 @@ class Parser {
     }
     // Cards that carry no data or need setup at declaration time.
     static const std::vector<std::string> ignored = {
-        "*NODEPRINT", "*ELPRINT",  "*NODEFILE", "*ELFILE", "*CONTACTFILE",
-        "*OUTPUT",    "*RESTART",  "*STEP",     "*ENDSTEP",
-        "*HEADING"};
+        "*NODEPRINT",   "*ELPRINT", "*NODEFILE",    "*ELFILE",
+        "*CONTACTFILE", "*OUTPUT",  "*RESTART",     "*STEP",
+        "*ENDSTEP",     "*HEADING", "*SECTIONPRINT"};
     if (card_ == "*STATIC") {
       select_solver(line);
       begin_static();
@@ -282,8 +282,45 @@ class Parser {
       model_.sections.push_back(SolidSection{param("ELSET"), param("MATERIAL")});
     } else if (std::find(ignored.begin(), ignored.end(), card_) == ignored.end() &&
                !is_data_card()) {
-      throw ParseError(line, "unsupported card '" + fields.front() + "'");
+      reject_card(fields.front(), line);
     }
+  }
+
+  // Reject a card the parser does not implement. Phase-2 capabilities that are
+  // deliberately DEFERRED (documented in tasks.md workstream 3/4) get a clear,
+  // actionable message that names the deferral, so a deck using them fails loudly
+  // and specifically rather than being silently mis-solved. Any other keyword is a
+  // generic "unsupported card". Either way this THROWS (never returns) — a deferred
+  // material/section card must never be silently ignored, which would yield a
+  // wrong solve. (spec: input-deck-parsing — graceful handling of unknown cards.)
+  [[noreturn]] void reject_card(const std::string& raw, int line) const {
+    // Normalized keyword -> the workstream/reason it is deferred.
+    static const std::unordered_map<std::string, std::string> deferred = {
+        {"*HYPERFOAM", "hyperelastic foam (Ogden) — deferred (tasks 4.3)"},
+        {"*CREEP", "creep — deferred, needs a transient driver (tasks 4.4)"},
+        {"*VISCO", "viscoelasticity — deferred, needs a transient driver (tasks 4.4)"},
+        {"*VALUESATINFINITY",
+         "viscoelastic long-term moduli — deferred with *VISCO (tasks 4.4)"},
+        {"*DEFORMATIONPLASTICITY",
+         "deformation (total-strain) plasticity — deferred (tasks 4.5)"},
+        {"*MOHRCOULOMB", "Mohr-Coulomb plasticity — deferred (tasks 4.5)"},
+        {"*MOHRCOULOMBHARDENING",
+         "Mohr-Coulomb hardening — deferred with *MOHR COULOMB (tasks 4.5)"},
+        {"*DAMAGEINITIATION", "damage initiation — deferred (tasks 4.5)"},
+        {"*SHELLSECTION",
+         "shell sections — deferred, needs shell kinematics (tasks 3.4)"},
+        {"*BEAMSECTION",
+         "beam sections — deferred, needs beam kinematics (tasks 3.4)"},
+        {"*MEMBRANESECTION",
+         "membrane sections — deferred, needs shell kinematics (tasks 3.4)"},
+    };
+    const auto it = deferred.find(card_);
+    if (it != deferred.end())
+      throw ParseError(line, "card '" + raw + "' is a recognized Phase-2 capability "
+                                             "that is not yet implemented: " +
+                                 it->second + ". Remove it or use an implemented "
+                                 "material/section; it cannot be silently ignored.");
+    throw ParseError(line, "unsupported card '" + raw + "'");
   }
 
   // Map SOLVER= on *STATIC onto a RequestedSolver (spec 9.2/9.3). Direct family

@@ -294,6 +294,143 @@ BEAM, 5, 6
   CX_CHECK(eqs.size() >= 1 + 3 + 3 + 9);  // eq + beam(3) + rigid(3 nodes*3) + coupling(3*3)
 }
 
+// A minimal C3D4 material header, reused by the deferred-card sweep.
+const char* kMatHeader = R"(
+*NODE
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 0., 1., 0.
+4, 0., 0., 1.
+*ELEMENT, TYPE=C3D4, ELSET=EALL
+100, 1, 2, 3, 4
+*MATERIAL, NAME=M
+*ELASTIC
+210000., 0.3
+)";
+
+// Assert that parsing `deck` throws a ParseError whose message contains `needle`.
+bool throws_with(const std::string& deck, const std::string& needle) {
+  try {
+    io::parse_inp(deck);
+  } catch (const io::ParseError& e) {
+    return std::string(e.what()).find(needle) != std::string::npos;
+  }
+  return false;
+}
+
+// (6.1) Deferred Phase-2 cards must fail with a CLEAR, ACTIONABLE ParseError that
+// names the deferral — never a crash and never a silent no-op that would yield a
+// wrong solve. Each of these is a recognized Phase-2 capability documented as
+// deferred in tasks.md workstreams 3/4.
+void test_deferred_cards_reject_clearly() {
+  const char* sect = "*SOLID SECTION, ELSET=EALL, MATERIAL=M\n";
+  struct Case {
+    std::string block;
+    std::string needle;
+  };
+  const Case material_cases[] = {
+      {"*HYPERFOAM, N=1\n1.,2.,0.1\n", "hyperelastic foam"},
+      {"*CREEP, LAW=NORTON\n1e-10, 5., 0.\n", "creep"},
+      {"*VISCO\n", "viscoelasticity"},
+      {"*MOHR COULOMB\n30., 5.\n", "Mohr-Coulomb"},
+      {"*DAMAGE INITIATION, CRITERION=DUCTILE\n0.1, 0., 0.\n", "damage initiation"},
+      {"*DEFORMATION PLASTICITY\n2e5,0.3,4e2,10.,0.2\n", "deformation"},
+  };
+  for (const Case& c : material_cases) {
+    const std::string deck = std::string(kMatHeader) + c.block + sect;
+    // The message must name the specific deferred capability and state it is not
+    // yet implemented (actionable), not just "unsupported card".
+    CX_CHECK(throws_with(deck, c.needle));
+    CX_CHECK(throws_with(deck, "not yet implemented"));
+  }
+
+  // Deferred SECTION cards (need shell/beam kinematics).
+  const Case section_cases[] = {
+      {"*SHELL SECTION, ELSET=EALL, MATERIAL=M\n0.01\n", "shell sections"},
+      {"*BEAM SECTION, ELSET=EALL, MATERIAL=M, SECTION=RECT\n0.1, 0.1\n",
+       "beam sections"},
+      {"*MEMBRANE SECTION, ELSET=EALL, MATERIAL=M\n0.01\n", "membrane sections"},
+  };
+  for (const Case& c : section_cases) {
+    const std::string deck = std::string(kMatHeader) + c.block;
+    CX_CHECK(throws_with(deck, c.needle));
+    CX_CHECK(throws_with(deck, "not yet implemented"));
+  }
+
+  // A genuinely unknown keyword still gets the generic message (no false "Phase-2
+  // capability" claim).
+  CX_CHECK(throws_with(std::string(kMatHeader) + "*FLIBBERTIGIBBET\n",
+                       "unsupported card"));
+}
+
+// (6.1) The full Phase-2 IMPLEMENTED card set parses without crashing: connectors,
+// hex/wedge element types, amplitudes, body loads, controls/time points, changes,
+// and NLGEOM (accepted/ignored). One deck exercising the breadth.
+void test_phase2_card_sweep_parses() {
+  const char* deck = R"(
+*AMPLITUDE, NAME=RAMP, DEFINITION=TABULAR
+0., 0., 1., 1.
+*NODE
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 1., 1., 0.
+4, 0., 1., 0.
+5, 0., 0., 1.
+6, 1., 0., 1.
+7, 1., 1., 1.
+8, 0., 1., 1.
+9, 2., 0., 0.
+10, 2., 1., 0.
+11, 2., 0., 1.
+12, 2., 1., 1.
+*ELEMENT, TYPE=C3D8, ELSET=EHEX
+1, 1,2,3,4,5,6,7,8
+*ELEMENT, TYPE=C3D8R, ELSET=EHEXR
+2, 2,9,10,3,6,11,12,7
+*ELEMENT, TYPE=SPRINGA, ELSET=ESPR
+50, 7, 12
+*ELSET, ELSET=EALL
+1, 2
+*NSET, NSET=FIX
+1, 4, 5, 8
+*SPRING, ELSET=ESPR
+1000.
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000., 0.3
+*DENSITY
+7.8e-9
+*PLASTIC, HARDENING=COMBINED
+800., 0.
+960., 0.02
+*SOLID SECTION, ELSET=EALL, MATERIAL=STEEL
+*BOUNDARY
+FIX, 1, 3
+*STEP
+*STATIC, DIRECT, NLGEOM
+0.5, 1.0
+*CONTROLS, PARAMETERS=FIELD
+1e-3,,1e-3
+*TIME POINTS, NAME=TP
+0.25, 0.5, 0.75, 1.0
+*CLOAD, AMPLITUDE=RAMP
+9, 1, 100.
+*DLOAD
+EALL, GRAV, 9810., 0., 0., -1.
+*END STEP
+)";
+  const Model m = io::parse_inp(deck);
+  CX_CHECK(m.mesh.num_elements() == 2);        // 2 solids (spring is separate)
+  CX_CHECK(m.springs.size() == 1);
+  CX_CHECK(m.has_plasticity());
+  CX_CHECK(m.amplitudes.count("RAMP") == 1);
+  CX_CHECK(m.body_loads.size() == 1);
+  CX_CHECK(m.increment.direct);
+  CX_CHECK(m.time_points.times.size() == 4);
+  CX_CHECK(m.cloads.size() == 1);
+  CX_CHECK(m.cloads[0].amplitude == "RAMP");
+}
+
 }  // namespace
 
 int main() {
@@ -304,6 +441,8 @@ int main() {
   test_plastic_card();
   test_user_and_hyperelastic_cards();
   test_constraint_cards();
+  test_deferred_cards_reject_clearly();
+  test_phase2_card_sweep_parses();
   if (cxtest::g_failures == 0) std::printf("test_parser: OK\n");
   CX_MAIN_RETURN();
 }
