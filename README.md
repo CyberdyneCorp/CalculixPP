@@ -10,7 +10,7 @@ Numerics come from in-house libraries — **[NumPP](https://github.com/Cyberdyne
 >
 > **Phase 2 (Nonlinear statics & materials) is in progress.** A Newton-Raphson driver (`solve_nonlinear`) with automatic incrementation now drives J2 plasticity, a C++ user-material seam, and the full hex/wedge element family (`C3D8`/`C3D20`/`C3D6`/`C3D15` + reduced `C3D8R`/`C3D20R`), plus amplitudes, body loads (`GRAV`/`CENTRIF`), springs/masses, and constraints (`*EQUATION`/`*MPC`/`*RIGID BODY`/`*COUPLING`/`*TIE`). New reference decks validate: `beam8p` (C3D8) and `beam20p` (C3D20) match stock CalculiX to **rel-L2 ~5.7 × 10⁻⁸**, and the nonlinear driver reproduces the linear solve to **< 10⁻¹⁰** in one increment.
 >
-> **Phase 3 (Thermal & contact) — the THERMAL track is landed and validated.** A scalar 1-DOF/node temperature field runs in parallel to the mechanical path, reusing the same mesh, shape functions/Gauss rules, and sparse solve: steady-state and transient (backward-Euler) conduction, `*CFLUX`/`*DFLUX` heat loads, convective `*FILM`, linearized surface `*RADIATE`, and one-way `*COUPLED TEMPERATURE-DISPLACEMENT` thermal stress (`*EXPANSION`), plus element/contact-pair `*MODEL CHANGE`. `solve()` auto-dispatches a `*HEAT TRANSFER` deck and returns nodal temperature (`NT`) and heat-flux reaction (`RFL`). Validated against stock CalculiX heat decks (`oneel20cf`/`df`/`fi` steady conduction to ~1e-9, `oneel20fi2` transient film relaxation to ~1e-4) and the `beamt` thermal-stress deck (rel-L2 ~2.4 × 10⁻⁶). **Contact (search engine, contact pairs, friction, thermal gap conductance) is the next workflow** — those cards are parsed but rejected with an actionable error rather than silently mis-solved.
+> **Phase 3 (Thermal & contact) — COMPLETE and validated.** A scalar 1-DOF/node temperature field runs in parallel to the mechanical path, reusing the same mesh, shape functions/Gauss rules, and sparse solve: steady-state and transient (backward-Euler) conduction, `*CFLUX`/`*DFLUX` heat loads, convective `*FILM`, linearized surface and gray-body cavity `*RADIATE`, monolithic + staggered `*COUPLED TEMPERATURE-DISPLACEMENT` thermal stress (`*EXPANSION`), and element/contact-pair `*MODEL CHANGE` on a multi-step engine. **Contact** is a nonlinear constraint contributing to the Newton tangent/residual: node-to-surface **penalty** contact with a spatial contact-search engine (uniform-grid broad phase + closest-point projection), `*SURFACE BEHAVIOR` (hard/linear/exponential), Coulomb `*FRICTION` (stick↔slip), thermal contact (`*GAP CONDUCTANCE` / `*GAP HEAT GENERATION`), `*CLEARANCE`, and CSTR contact output (status/pressure/gap/traction). `solve()` auto-dispatches `*HEAT TRANSFER` (returning `NT`/`RFL`) and `*CONTACT PAIR` (returning the mechanical fields plus a per-node `contact` list). Validated against stock CalculiX heat decks (`oneel20cf`/`df`/`fi` steady conduction to ~1e-9, `oneel20fi2` transient film relaxation to ~1e-4) and the `beamt` thermal-stress deck (rel-L2 ~2.4 × 10⁻⁶); contact and thermal contact against analytical two-block references (global equilibrium, penalty penetration `F/(4κ)`, series-resistance gap flux — the stock contact decks use NLGEOM + CalculiX's exact exponential law + MPCs and are not gated). **Surface-to-surface mortar contact is deferred** — a `TYPE=SURFACE TO SURFACE` pair is rejected with an actionable error rather than silently mis-solved.
 
 ---
 
@@ -229,6 +229,76 @@ print(calculixpp.summary_text(heat_cube)["procedure"])  # "heat transfer steady 
 
 Transient conduction (drop `STEADY STATE`, add `*SPECIFIC HEAT` / `*DENSITY` and an `*INITIAL CONDITIONS, TYPE=TEMPERATURE`) marches backward-Euler over the step period; `*COUPLED TEMPERATURE-DISPLACEMENT` returns both the temperature and the thermal-stress mechanical fields in one result dict.
 
+### Python — contact (Phase 3)
+
+A deck with a `*CONTACT PAIR` is a nonlinear constraint: `solve()` auto-dispatches it to the Newton driver, where node-to-surface **penalty** contact contributes to the tangent and residual each iteration. Two stacked cubes meeting only through a `*CONTACT PAIR` transmit a load across the interface — the base reaction balances the applied force (global equilibrium) with a small penalty penetration. The result dict carries the usual mechanical fields **plus** a `contact` list of per-slave-node CSTR records (status, normal pressure, signed gap, tangential traction):
+
+```python
+import calculixpp
+
+two_block = """
+*NODE, NSET=NALL
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 1., 1., 0.
+4, 0., 1., 0.
+5, 0., 0., 1.
+6, 1., 0., 1.
+7, 1., 1., 1.
+8, 0., 1., 1.
+9, 0., 0., 1.
+10, 1., 0., 1.
+11, 1., 1., 1.
+12, 0., 1., 1.
+13, 0., 0., 2.
+14, 1., 0., 2.
+15, 1., 1., 2.
+16, 0., 1., 2.
+*ELEMENT, TYPE=C3D8, ELSET=EBASE
+1, 1,2,3,4,5,6,7,8
+*ELEMENT, TYPE=C3D8, ELSET=ETOP
+2, 9,10,11,12,13,14,15,16
+*ELSET, ELSET=EALL
+EBASE, ETOP
+*NSET, NSET=NBOT
+1,2,3,4
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000., 0.3
+*SOLID SECTION, ELSET=EALL, MATERIAL=STEEL
+*BOUNDARY
+NALL,1,2
+NBOT,3,3
+*SURFACE, NAME=SMAST
+EBASE, S2
+*SURFACE, NAME=SSLAV, TYPE=NODE
+9,10,11,12
+*SURFACE INTERACTION, NAME=SI
+*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=LINEAR
+1.0e6
+*CONTACT PAIR, INTERACTION=SI, TYPE=NODE TO SURFACE
+SSLAV, SMAST
+*STEP
+*STATIC
+*CLOAD
+13,3,-25.
+14,3,-25.
+15,3,-25.
+16,3,-25.
+*END STEP
+"""
+
+r = calculixpp.solve_text(two_block)
+print(r["converged"])                                      # -> True
+rz = sum(r["reaction"][i][2] for i in range(4))            # base z-reaction ~ 100 (= F)
+print("base reaction:", rz)                                # transmits the full load
+for c in r["contact"]:                                     # CSTR per slave node
+    print(c["node"], c["closed"], round(c["pressure"], 3), c["gap"])
+    # 9 True 100.0 -2.5e-05  ... all CLOSED, p ~ 100, small penalty penetration
+```
+
+Add `*FRICTION` (Coulomb, stick↔slip) for tangential traction, `*GAP CONDUCTANCE` / `*GAP HEAT GENERATION` for thermal contact (heat crossing the interface, reachable from a `*HEAT TRANSFER` deck), and `*CLEARANCE` for an initial gap. `*MODEL CHANGE, TYPE=CONTACT PAIR` activates/deactivates a pair between steps. Surface-to-surface **mortar** contact is not implemented — a `TYPE=SURFACE TO SURFACE` pair is rejected with an actionable error rather than silently mis-solved.
+
 ### C++
 
 ```cpp
@@ -274,19 +344,20 @@ Direct is fastest and exact for small/medium systems; IC0-CG keeps memory linear
 - **Accuracy (Phase 2)** — the hex family matches stock CalculiX references: `beam8p` (C3D8) **rel-L2 = 5.71 × 10⁻⁸**, `beam20p` (C3D20) **rel-L2 = 5.76 × 10⁻⁸**; `achtel*` decks validate `*EQUATION` constraints and `GRAV`/`CENTRIF` body loads to rel-L2 ~1–2 × 10⁻⁷.
 - **Nonlinear gate** — the Newton-Raphson driver reproduces the linear direct solve to **rel-L2 < 10⁻¹⁰** in one increment (single-tet and beam10p), so nonlinear does not perturb linear results. J2 plasticity and the C++ user material are validated against their analytic solutions.
 - **Accuracy (Phase 3 — thermal)** — heat-transfer nodal temperatures (`NT`) vs stock CalculiX: steady conduction `oneel20cf`/`df`/`fi` (`*CFLUX`/`*DFLUX`/`*FILM`) to **max abs ~10⁻⁹**, transient film `oneel20fi2` relaxing to the end-of-step steady field to **~10⁻⁴** (reference uses adaptive sub-stepping, we march fixed sub-steps). One-way thermal stress `beamt` (C3D20R `*EXPANSION` + `*TEMPERATURE`) to **rel-L2 ~2.4 × 10⁻⁶**. The pure-mechanical path is byte-for-byte unchanged (a deck with no applied temperature never touches the thermal gates).
+- **Accuracy (Phase 3 — contact)** — node-to-surface penalty contact validated against **analytical** references (the stock contact decks use NLGEOM + CalculiX's exact exponential pressure-overclosure law + `*EQUATION` MPCs, a harder match not gated): a two-block stack transmits the load across the interface with the base reaction balancing the applied force to **~10⁻⁶** and a penalty penetration matching `F/(4κ)`; the CSTR output reports every slave node CLOSED with the equilibrium pressure. Coulomb `*FRICTION` stick↔slip is validated at the operator level (exact stick force below the cone, saturated `μp` traction above). Thermal contact (`*GAP CONDUCTANCE`) matches the closed-form series-resistance interface flux `Q = ΔT/(2/k + 1/h)` to **~10⁻⁶**. The pure-mechanical (contact-free) path is byte-for-byte unchanged.
 - **Scaling** — `segmentunsmooth` (8,268 DOF): sparse direct **0.34 s**; IC0-CG **1.30 s** — both to the same solution. (The earlier dense path took 94 s; see [SciPP #10](https://github.com/CyberdyneCorp/SciPP/issues/10).)
 - **Correctness harness** — analytical element patch tests (gradient consistency, uniaxial stress/strain, hex/wedge partition-of-unity + rigid-body null space), pressure-load equilibrium, consistent-tangent finite-difference checks, and reference-deck regression, all in CI.
 
 ## Roadmap
 
-Each phase implements physics from the baseline specs **and** adds one reusable *engine* capability. Phase 1 is done and Phase 2 is in progress; the rest are fully specified and queued.
+Each phase implements physics from the baseline specs **and** adds one reusable *engine* capability. Phases 1–3 are done; the rest are fully specified and queued.
 
 ```mermaid
 timeline
   title CalculiX++ phased roadmap
   Phase 1 (done) : Foundation and linear-static slice : engine build-and-tooling
-  Phase 2 (in progress) : Nonlinear statics and materials : engine nonlinear-solution-control
-  Phase 3 (thermal landed) : Thermal and contact : engine contact-search
+  Phase 2 (done) : Nonlinear statics and materials : engine nonlinear-solution-control
+  Phase 3 (done) : Thermal and contact : engine contact-search
   Phase 4 : Dynamics and eigenproblems : engine eigensolution
   Phase 5 : Advanced physics : engine field-coupling
 ```
@@ -294,8 +365,8 @@ timeline
 | Phase | Scope | Status |
 |---|---|---|
 | **1 — Foundation** | Build system, NumPP/SciPP, CPU backend, linear-static slice, Python bindings | ✅ complete |
-| **2 — Nonlinear** | Newton-Raphson, plasticity, user material, hex/wedge & load breadth, constraints | 🚧 in progress |
-| **3 — Thermal & contact** | Heat transfer, coupled thermomechanics, model change, contact | 🚧 thermal landed; contact next |
+| **2 — Nonlinear** | Newton-Raphson, plasticity, user material, hex/wedge & load breadth, constraints | ✅ complete |
+| **3 — Thermal & contact** | Heat transfer, coupled thermomechanics, model change, node-to-surface contact (mortar S2S deferred) | ✅ complete |
 | **4 — Dynamics** | Frequency, buckling, direct/modal dynamics, substructures | 📋 specified |
 | **5 — Advanced** | CFD/networks, electromagnetics, crack propagation, optimization | 📋 specified |
 

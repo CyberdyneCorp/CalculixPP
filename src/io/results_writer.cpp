@@ -127,6 +127,19 @@ void write_frd(const std::string& path, const Model& model, const StaticFields& 
     out << " -1" << i10(mesh.nodes()[i].id) << e12_5(f.reaction[i][0])
         << e12_5(f.reaction[i][1]) << e12_5(f.reaction[i][2]) << "\n";
   out << " -3\n";
+
+  // CONTACT (CSTR): per-slave-node contact pressure / status / gap. Nodal dataset over
+  // the slave nodes only (a contact deck; omitted otherwise). (spec: contact — output.)
+  if (!f.contact.empty()) {
+    dataset_header("CONTACT", 3);
+    out << " -5  CPRESS      1    1    1    0\n";
+    out << " -5  CSTATUS     1    1    1    0\n";
+    out << " -5  CGAP        1    1    1    0\n";
+    for (const ContactPoint& c : f.contact)
+      out << " -1" << i10(c.node_id) << e12_5(c.p)
+          << e12_5(c.closed ? 1.0 : 0.0) << e12_5(c.gap) << "\n";
+    out << " -3\n";
+  }
   out << " 9999\n";
 }
 
@@ -158,6 +171,16 @@ void write_dat(const std::string& path, const Model& model, const StaticFields& 
   for (std::size_t i = 0; i < mesh.num_nodes(); ++i)
     out << i10(mesh.nodes()[i].id) << e12_5(f.reaction[i][0])
         << e12_5(f.reaction[i][1]) << e12_5(f.reaction[i][2]) << "\n";
+
+  // Contact stresses CSTR per slave node (*CONTACT PRINT/FILE CSTR): status (1=CLOSED /
+  // 0=OPEN), normal pressure, signed gap, and tangential traction. Emitted only for a
+  // contact deck (f.contact non-empty). (spec: contact — contact output.)
+  if (!f.contact.empty()) {
+    out << "\n contact stress (slave node, status, pressure, gap, tang.traction)\n\n";
+    for (const ContactPoint& c : f.contact)
+      out << i10(c.node_id) << i10(c.closed ? 1 : 0).substr(6) << e12_5(c.p)
+          << e12_5(c.gap) << e12_5(c.tau) << "\n";
+  }
 }
 
 void write_frd(const std::string& path, const Model& model, const ThermalFields& t) {

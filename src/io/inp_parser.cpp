@@ -182,6 +182,12 @@ class Parser {
   std::vector<Surface> surfaces_;  // built incrementally; flushed at end
   int cur_surface_ = -1;           // index into surfaces_, or -1 outside a surface
 
+  // *SURFACE INTERACTION / *SURFACE BEHAVIOR / *CONTACT PAIR (spec: contact). The
+  // current interaction name (so a following *SURFACE BEHAVIOR attaches to it) and the
+  // pair whose slave/master come on its data line. -1 / empty outside those cards.
+  std::string cur_interaction_;
+  int cur_contact_pair_ = -1;  // index into model_.contact_pairs, or -1
+
   // Connector (discrete) elements: SPRINGA/SPRING1/SPRING2, MASS, DASHPOTA/1/2.
   // These are not isoparametric solids, so they live outside the Mesh. We keep
   // their connectivity keyed by element id and by elset so a following *SPRING /
@@ -248,7 +254,7 @@ class Parser {
     // Cards that carry no data or need setup at declaration time.
     static const std::vector<std::string> ignored = {
         "*NODEPRINT",   "*ELPRINT",     "*NODEFILE",    "*ELFILE",
-        "*CONTACTFILE", "*OUTPUT",      "*RESTART",
+        "*CONTACTFILE", "*CONTACTPRINT", "*CONTACTOUTPUT", "*OUTPUT", "*RESTART",
         "*HEADING",     "*SECTIONPRINT"};
     if (card_ == "*STEP") {
       begin_step();
@@ -300,6 +306,20 @@ class Parser {
       begin_amplitude(line);
     } else if (card_ == "*SURFACE") {
       begin_surface(line);
+    } else if (card_ == "*SURFACEINTERACTION") {
+      begin_surface_interaction(line);
+    } else if (card_ == "*SURFACEBEHAVIOR") {
+      begin_surface_behavior(line);
+    } else if (card_ == "*FRICTION") {
+      begin_friction(line);
+    } else if (card_ == "*GAPCONDUCTANCE") {
+      begin_gap_conductance(line);
+    } else if (card_ == "*GAPHEATGENERATION") {
+      begin_gap_heat_generation(line);
+    } else if (card_ == "*CONTACTPAIR") {
+      begin_contact_pair(line);
+    } else if (card_ == "*CLEARANCE") {
+      begin_clearance(line);
     } else if (card_ == "*SOLIDSECTION") {
       model_.sections.push_back(SolidSection{param("ELSET"), param("MATERIAL")});
     } else if (card_ == "*CLOAD") {
@@ -406,27 +426,10 @@ class Parser {
                                              "not yet implemented: " +
                                  it->second + ". Remove it or use an implemented "
                                  "material/section; it cannot be silently ignored.");
-    // Phase-3 CONTACT cards. The thermal track of Phase 3 is implemented; the
-    // contact workstreams (search engine, contact pairs, friction, thermal gap
-    // conductance) land in the NEXT workflow. Reject these loudly and specifically
-    // so a contact deck is never silently solved as a bare mechanical/thermal one.
-    static const std::unordered_map<std::string, std::string> contact = {
-        {"*CONTACTPAIR", "*CONTACT PAIR (node-to-surface / surface-to-surface)"},
-        {"*SURFACEINTERACTION", "*SURFACE INTERACTION"},
-        {"*SURFACEBEHAVIOR", "*SURFACE BEHAVIOR (pressure-overclosure)"},
-        {"*FRICTION", "*FRICTION (Coulomb / stick-slip)"},
-        {"*GAPCONDUCTANCE", "*GAP CONDUCTANCE (thermal contact)"},
-        {"*GAPHEATGENERATION", "*GAP HEAT GENERATION (thermal contact)"},
-        {"*CLEARANCE", "*CLEARANCE (contact modifier)"},
-    };
-    const auto ci = contact.find(card_);
-    if (ci != contact.end())
-      throw ParseError(line, "card '" + raw + "' is a Phase-3 CONTACT card (" +
-                                 ci->second + ") — the contact workstream is not "
-                                 "implemented yet (it is the next workflow after the "
-                                 "thermal track; tasks.md workstreams 1-2, 2.4). "
-                                 "Remove it or run a contact-free deck; it cannot be "
-                                 "silently ignored.");
+    // Phase-3 contact + thermal-contact cards (*CONTACT PAIR, *SURFACE INTERACTION,
+    // *SURFACE BEHAVIOR, *FRICTION, *GAP CONDUCTANCE, *GAP HEAT GENERATION, *CLEARANCE,
+    // *CONTACT FILE/PRINT/OUTPUT) are all handled above; anything reaching here is a
+    // genuinely unimplemented keyword.
     throw ParseError(line, "unsupported card '" + raw + "'");
   }
 
@@ -1180,6 +1183,8 @@ class Parser {
         "*USERMATERIAL", "*DEPVAR", "*RATEDEPENDENT", "*EQUATION", "*MPC",
         "*RIGIDBODY", "*COUPLING", "*DISTRIBUTINGCOUPLING", "*KINEMATIC",
         "*DISTRIBUTING", "*TIE", "*MODELCHANGE",
+        // Contact (Phase 3) data cards with a data line.
+        "*GAPCONDUCTANCE", "*GAPHEATGENERATION",
         // Thermal (Phase 3) data cards.
         "*HEATTRANSFER", "*CONDUCTIVITY", "*SPECIFICHEAT", "*EXPANSION", "*CFLUX",
         "*DFLUX", "*TEMPERATURE", "*FILM", "*RADIATE", "*INITIALCONDITIONS",
@@ -1205,6 +1210,11 @@ class Parser {
     if (card_ == "*DLOAD") return dload(f, line);
     if (card_ == "*DSLOAD") return dsload(f, line);
     if (card_ == "*SURFACE") return surface_data(f, line);
+    if (card_ == "*SURFACEBEHAVIOR") return surface_behavior_data(f, line);
+    if (card_ == "*FRICTION") return friction_data(f, line);
+    if (card_ == "*GAPCONDUCTANCE") return gap_conductance_data(f, line);
+    if (card_ == "*GAPHEATGENERATION") return gap_heat_generation_data(f, line);
+    if (card_ == "*CONTACTPAIR") return contact_pair_data(f, line);
     if (card_ == "*STATIC") return static_data(f, line);
     if (card_ == "*HEATTRANSFER") return static_data(f, line);  // same inc data line
     if (card_ == "*COUPLEDTEMPERATURE-DISPLACEMENT" ||
@@ -1559,14 +1569,14 @@ class Parser {
     surfaces_.push_back(std::move(s));
   }
 
-  // Parse a face id 'S<n>' -> n (1..4 for tets); reject anything else.
+  // Parse a face id 'S<n>' -> n (1..4 tet, 1..5 wedge, 1..6 hex); reject anything else.
   int surface_face(const std::string& tok, int line) {
     const std::string t = upper(tok);
     if (t.size() < 2 || t[0] != 'S')
       throw ParseError(line, "*SURFACE face must be S<n>, got '" + tok + "'");
     const int face = static_cast<int>(to_index(t.substr(1), line));
-    if (face < 1 || face > 4)
-      throw ParseError(line, "*SURFACE face out of range (1..4): '" + tok + "'");
+    if (face < 1 || face > 6)
+      throw ParseError(line, "*SURFACE face out of range (1..6): '" + tok + "'");
     return face;
   }
 
@@ -1585,6 +1595,175 @@ class Parser {
     const int face = surface_face(f[1], line);
     for (const Index eid : elem_refs(f[0], line))
       s.faces.emplace_back(eid, face);
+  }
+
+  // *SURFACE INTERACTION, NAME=<name>: open a named interaction that a *SURFACE BEHAVIOR
+  // fills and a *CONTACT PAIR references. (spec: contact — surface interaction.)
+  void begin_surface_interaction(int line) {
+    const std::string name = param("NAME");
+    if (name.empty()) throw ParseError(line, "*SURFACE INTERACTION without NAME");
+    cur_interaction_ = name;
+    SurfaceInteraction si;
+    si.name = name;
+    model_.surface_interactions[name] = si;
+  }
+
+  // *SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=HARD|LINEAR|EXPONENTIAL. The law is set from
+  // the parameter here; its parameters (slope / p0,c0) come on the data line. Attaches to
+  // the most recent *SURFACE INTERACTION. (spec: contact — surface behavior normal.)
+  void begin_surface_behavior(int line) {
+    if (cur_interaction_.empty())
+      throw ParseError(line, "*SURFACE BEHAVIOR outside a *SURFACE INTERACTION");
+    SurfaceInteraction& si = model_.surface_interactions[cur_interaction_];
+    std::string po = param("PRESSURE-OVERCLOSURE");
+    if (po.empty()) po = param("PRESSUREOVERCLOSURE");
+    if (po.empty() || po == "HARD") si.behavior.law = SurfaceBehavior::Law::Hard;
+    else if (po == "LINEAR") si.behavior.law = SurfaceBehavior::Law::Linear;
+    else if (po == "EXPONENTIAL") si.behavior.law = SurfaceBehavior::Law::Exponential;
+    else if (po == "TIED") si.behavior.law = SurfaceBehavior::Law::Hard;  // treat tied as hard
+    else throw ParseError(line, "unsupported *SURFACE BEHAVIOR PRESSURE-OVERCLOSURE=" + po);
+    si.has_behavior = true;
+  }
+
+  // *SURFACE BEHAVIOR data line: LINEAR -> "slope"; EXPONENTIAL -> "c0, p0" (CalculiX
+  // orders the exponential card as c0=pressure-at-zero-clearance, then the clearance);
+  // HARD -> no data. (spec: contact — surface behavior parameters.)
+  void surface_behavior_data(const std::vector<std::string>& f, int line) {
+    if (cur_interaction_.empty()) return;
+    SurfaceInteraction& si = model_.surface_interactions[cur_interaction_];
+    if (si.behavior.law == SurfaceBehavior::Law::Linear) {
+      if (f.empty()) throw ParseError(line, "*SURFACE BEHAVIOR LINEAR needs a slope");
+      si.behavior.k = to_double(f[0], line);
+    } else if (si.behavior.law == SurfaceBehavior::Law::Exponential) {
+      if (f.size() < 2)
+        throw ParseError(line, "*SURFACE BEHAVIOR EXPONENTIAL needs 'c0, p0'");
+      // CalculiX EXPONENTIAL card: field 1 = c0 (pressure at zero clearance p0 in our
+      // struct), field 2 = the clearance at which pressure vanishes (c0 in our struct).
+      si.behavior.p0 = to_double(f[0], line);
+      si.behavior.c0 = to_double(f[1], line);
+    }
+    // HARD: no parameters.
+  }
+
+  // *FRICTION: open Coulomb friction on the most recent *SURFACE INTERACTION; mu and the
+  // optional stick stiffness come on the data line. (spec: contact — Coulomb friction.)
+  void begin_friction(int line) {
+    if (cur_interaction_.empty())
+      throw ParseError(line, "*FRICTION outside a *SURFACE INTERACTION");
+    model_.surface_interactions[cur_interaction_].friction.has = true;
+  }
+
+  // *FRICTION data line: "mu [, stick_stiffness]". mu is the Coulomb coefficient; the
+  // optional second field is the tangential stick (lambda) stiffness (0/absent -> the
+  // contact operator auto-sizes it from the normal penalty). Attaches to the most recent
+  // *SURFACE INTERACTION. (spec: contact — tangential contact / stick-slip.)
+  void friction_data(const std::vector<std::string>& f, int line) {
+    if (cur_interaction_.empty()) return;
+    Friction& fr = model_.surface_interactions[cur_interaction_].friction;
+    if (f.empty()) throw ParseError(line, "*FRICTION needs a friction coefficient mu");
+    fr.mu = to_double(f[0], line);
+    if (f.size() >= 2 && !f[1].empty()) fr.stick = to_double(f[1], line);
+    fr.has = true;
+  }
+
+  // *GAP CONDUCTANCE: open thermal contact conductance on the most recent *SURFACE
+  // INTERACTION; the coefficient comes on the data line. (spec: contact — thermal contact.)
+  void begin_gap_conductance(int line) {
+    if (cur_interaction_.empty())
+      throw ParseError(line, "*GAP CONDUCTANCE outside a *SURFACE INTERACTION");
+    model_.surface_interactions[cur_interaction_].conductance.has = true;
+  }
+
+  // *GAP CONDUCTANCE data line: "h [, ...]". The first field is the conductance
+  // coefficient (heat per unit area per unit temperature drop). CalculiX allows a
+  // pressure/temperature table; this slice consumes the constant first coefficient.
+  // (spec: contact — thermal contact conductance.)
+  void gap_conductance_data(const std::vector<std::string>& f, int line) {
+    if (cur_interaction_.empty()) return;
+    if (f.empty() || f[0].empty())
+      throw ParseError(line, "*GAP CONDUCTANCE needs a conductance coefficient");
+    GapConductance& gc = model_.surface_interactions[cur_interaction_].conductance;
+    gc.h = to_double(f[0], line);
+    gc.has = true;
+  }
+
+  // *GAP HEAT GENERATION: open interface heat generation on the most recent *SURFACE
+  // INTERACTION; the generated flux comes on the data line. (spec: contact — gap heat.)
+  void begin_gap_heat_generation(int line) {
+    if (cur_interaction_.empty())
+      throw ParseError(line, "*GAP HEAT GENERATION outside a *SURFACE INTERACTION");
+    model_.surface_interactions[cur_interaction_].heat_generation.has = true;
+  }
+
+  // *GAP HEAT GENERATION data line: "q [, ...]". The first field is the generated heat
+  // flux per unit contacting area (total; split evenly between the two surfaces).
+  // (spec: contact — gap heat generation.)
+  void gap_heat_generation_data(const std::vector<std::string>& f, int line) {
+    if (cur_interaction_.empty()) return;
+    if (f.empty() || f[0].empty())
+      throw ParseError(line, "*GAP HEAT GENERATION needs a generated-flux value");
+    GapHeatGeneration& gh = model_.surface_interactions[cur_interaction_].heat_generation;
+    gh.q = to_double(f[0], line);
+    gh.has = true;
+  }
+
+  // *CONTACT PAIR, INTERACTION=<name>, TYPE=NODE TO SURFACE|SURFACE TO SURFACE. The pair
+  // is opened here; slave/master surfaces come on the data line. (spec: contact — pairs.)
+  void begin_contact_pair(int line) {
+    ContactPair cp;
+    cp.interaction = param("INTERACTION");
+    if (cp.interaction.empty())
+      throw ParseError(line, "*CONTACT PAIR needs INTERACTION=");
+    std::string type = normalize(param("TYPE"));  // strip spaces: "NODE TO SURFACE"
+    if (type.empty() || type == "NODETOSURFACE")
+      cp.formulation = ContactPair::Formulation::NodeToSurface;
+    else if (type == "SURFACETOSURFACE")
+      cp.formulation = ContactPair::Formulation::SurfaceToSurface;
+    else
+      throw ParseError(line, "*CONTACT PAIR TYPE must be NODE TO SURFACE or SURFACE TO "
+                             "SURFACE, got '" + type + "'");
+    if (!param("ADJUST").empty()) cp.search = to_double(param("ADJUST"), line);
+    cur_contact_pair_ = static_cast<int>(model_.contact_pairs.size());
+    model_.contact_pairs.push_back(cp);
+  }
+
+  // *CONTACT PAIR data line: "slave_surface, master_surface". (spec: contact — pairs.)
+  void contact_pair_data(const std::vector<std::string>& f, int line) {
+    if (cur_contact_pair_ < 0)
+      throw ParseError(line, "*CONTACT PAIR data without a pair");
+    if (f.size() < 2)
+      throw ParseError(line, "*CONTACT PAIR needs 'slave_surface, master_surface'");
+    ContactPair& cp = model_.contact_pairs[static_cast<std::size_t>(cur_contact_pair_)];
+    // Surface names are stored uppercased (like *SURFACE NAME=); match that here so a
+    // mixed-case reference on the data line resolves. (Mesh surface keys are uppercase.)
+    cp.slave_surface = upper(f[0]);
+    cp.master_surface = upper(f[1]);
+  }
+
+  // *CLEARANCE, MASTER=<surf>, SLAVE=<surf>, VALUE=<v>: set a uniform initial clearance on
+  // the matching *CONTACT PAIR (spec: contact — contact modifiers). The clearance overrides
+  // the geometric gap so the interface starts at exactly `VALUE` regardless of the mesh.
+  // The card carries no data line. (spec: contact — *CLEARANCE initial gap.)
+  void begin_clearance(int line) {
+    const std::string master = upper(param("MASTER"));
+    const std::string slave = upper(param("SLAVE"));
+    if (master.empty() || slave.empty())
+      throw ParseError(line, "*CLEARANCE needs MASTER= and SLAVE= surface names");
+    if (param("VALUE").empty())
+      throw ParseError(line, "*CLEARANCE needs VALUE=");
+    const Real value = to_double(param("VALUE"), line);
+    bool matched = false;
+    for (ContactPair& cp : model_.contact_pairs) {
+      const bool same = (cp.master_surface == master && cp.slave_surface == slave) ||
+                        (cp.master_surface == slave && cp.slave_surface == master);
+      if (same) {
+        cp.clearance = value;
+        cp.has_clearance = true;
+        matched = true;
+      }
+    }
+    if (!matched)
+      throw ParseError(line, "*CLEARANCE MASTER=/SLAVE= match no *CONTACT PAIR");
   }
 
   void flush_sets() { flush_sets_into(model_); }

@@ -17,6 +17,8 @@ add_library(calculixpp_core
   fem/loads.cpp
   fem/thermal.cpp
   fem/cavity_radiation.cpp
+  fem/contact_search.cpp
+  fem/contact.cpp
   io/inp_parser.cpp
   io/results_writer.cpp
   geometry/cad_mesher.cpp)

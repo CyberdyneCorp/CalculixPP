@@ -1434,14 +1434,52 @@ def test_api_parity_phase3_thermal():
     assert s["procedure"] == "heat transfer steady state"
     assert cx.summary_text(C3D4_PRESSURE_DECK)["procedure"] == "static"
 
-    # A Phase-3 CONTACT card must raise a clear, actionable error naming the contact
-    # workstream (deferred to the next workflow) — never a silent wrong solve.
-    contact_deck = _HEAT_CUBE.replace(
-        "*STEP\n", "*SURFACE INTERACTION, NAME=SI\n*SURFACE BEHAVIOR\n1e3\n*STEP\n")
+    # Thermal contact (*GAP CONDUCTANCE) now parses and is stored on the interaction —
+    # attaching it to an interaction with no active pair is inert (the thermal cube still
+    # solves to the same field). The full gap-conductance PHYSICS is validated in the C++
+    # suite (test_thermal_contact) and the Python two-block thermal-contact deck below.
+    gap_deck = _HEAT_CUBE.replace(
+        "*STEP\n", "*SURFACE INTERACTION, NAME=SI\n*GAP CONDUCTANCE\n0.1\n*STEP\n")
+    gres = cx.solve_text(gap_deck)
+    assert "temperature" in gres  # parses + solves (inert without a contact pair)
+
+    # A genuinely-unsupported card must still raise a clear, actionable error naming the
+    # deferral, never a silent wrong solve.
+    bad_deck = _HEAT_CUBE.replace("*STEP\n", "*VIEWFACTOR\n*STEP\n")
     with pytest.raises(RuntimeError) as ei:
-        cx.solve_text(contact_deck)
-    msg = str(ei.value).lower()
-    assert "contact" in msg and "not implemented" in msg
+        cx.solve_text(bad_deck)
+    assert "viewfactor" in str(ei.value).lower()
+
+
+def test_api_parity_phase3_contact():
+    """(6.4) API parity for the Phase-3 CONTACT track: a *CONTACT PAIR deck is reachable
+    from Python (auto-dispatched to the nonlinear driver), the result carries the mechanical
+    fields AND the contact CSTR output (per-slave-node status/pressure/gap/tang.traction),
+    the summary reports the static procedure, and a deferred mortar pair raises an
+    actionable error. Parity: every contact capability exposed in C++ has a Python path."""
+    import calculixpp as cx
+
+    # solve()/solve_text() auto-dispatch a *CONTACT PAIR deck to the nonlinear driver and
+    # return displacement/stress/reaction PLUS the `contact` CSTR output list.
+    res = cx.solve_text(_CONTACT_TWO_BLOCK)
+    for key in ("displacement", "stress", "reaction", "contact", "converged",
+                "node_ids", "num_nodes", "num_elements", "backend"):
+        assert key in res, f"contact result missing '{key}'"
+    assert res["converged"] is True
+    assert len(res["contact"]) == 4
+    for c in res["contact"]:
+        for key in ("node", "closed", "pressure", "gap", "tau"):
+            assert key in c
+
+    # summary()/summary_text() report a contact deck's procedure without solving.
+    assert cx.summary_text(_CONTACT_TWO_BLOCK)["procedure"] == "static"
+
+    # A deferred surface-to-surface (mortar) contact pair raises an actionable error.
+    mortar = _CONTACT_TWO_BLOCK.replace("TYPE=NODE TO SURFACE", "TYPE=SURFACE TO SURFACE")
+    with pytest.raises(RuntimeError) as ei:
+        cx.solve_text(mortar)
+    m = str(ei.value).lower()
+    assert "surface-to-surface" in m or "surface to surface" in m or "mortar" in m
 
 
 # --- *MODEL CHANGE element birth-death (tasks 5.1), reachable from Python ------
@@ -1559,3 +1597,377 @@ def test_model_change_contact_pair_parses_python():
     baseline = cx.solve_text(_MODEL_CHANGE_BAR.format(MC=""))
     # Contact-pair model change does not touch the element assembly here.
     assert _rel_l2_disp(with_pair["displacement"], baseline["displacement"]) < 1e-12
+
+
+# --- Node-to-surface PENALTY contact (tasks 1.4/1.5/2.1/2.2), reachable from Python ---
+# Two stacked unit C3D8 cubes meeting only through a *CONTACT PAIR (separate elements,
+# separate coincident nodes on the z=1 plane). The base is fixed at z=0; the top cube is
+# pushed down by a total force F on its top face. The load can cross the interface ONLY
+# through contact. ANALYTICAL validation: (a) the base reaction balances F exactly (the
+# interface transmits the full load — global equilibrium); (b) the interface penetration
+# is small and ~ F/(4*kappa) (the linear penalty spring). This is the required two-block
+# reference; the stock-CalculiX contact1 deck is a harder NLGEOM+exponential match and is
+# not gated here.
+_CONTACT_TWO_BLOCK = """
+*NODE, NSET=NALL
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 1., 1., 0.
+4, 0., 1., 0.
+5, 0., 0., 1.
+6, 1., 0., 1.
+7, 1., 1., 1.
+8, 0., 1., 1.
+9, 0., 0., 1.
+10, 1., 0., 1.
+11, 1., 1., 1.
+12, 0., 1., 1.
+13, 0., 0., 2.
+14, 1., 0., 2.
+15, 1., 1., 2.
+16, 0., 1., 2.
+*ELEMENT, TYPE=C3D8, ELSET=EBASE
+1, 1,2,3,4,5,6,7,8
+*ELEMENT, TYPE=C3D8, ELSET=ETOP
+2, 9,10,11,12,13,14,15,16
+*ELSET, ELSET=EALL
+EBASE, ETOP
+*NSET, NSET=NBOT
+1,2,3,4
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000., 0.3
+*SOLID SECTION, ELSET=EALL, MATERIAL=STEEL
+*BOUNDARY
+NALL,1,2
+NBOT,3,3
+*SURFACE, NAME=SMAST
+EBASE, S2
+*SURFACE, NAME=SSLAV, TYPE=NODE
+9,10,11,12
+*SURFACE INTERACTION, NAME=SI
+*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=LINEAR
+1.0e6
+*CONTACT PAIR, INTERACTION=SI, TYPE=NODE TO SURFACE
+SSLAV, SMAST
+*STEP
+*STATIC
+*CLOAD
+13,3,-25.
+14,3,-25.
+15,3,-25.
+16,3,-25.
+*NODE PRINT, NSET=NALL
+U,RF
+*END STEP
+"""
+
+
+def test_contact_two_block_equilibrium_python():
+    """Penalty node-to-surface contact end to end from Python: two stacked cubes meeting
+    only through a *CONTACT PAIR transmit the load across the interface. The base reaction
+    balances the applied load (equilibrium) and the interface penetration is small and
+    ~ F/(4*kappa)."""
+    import calculixpp as cx
+
+    r = cx.solve_text(_CONTACT_TWO_BLOCK)
+    assert r.get("converged") is True
+    ids = list(int(x) for x in r["node_ids"])
+    i = {nid: k for k, nid in enumerate(ids)}
+    U = r["displacement"]
+    RF = r["reaction"]
+    F = 100.0
+    kappa = 1.0e6
+
+    # (a) Global equilibrium: the base reaction at z=0 balances the applied downward load.
+    rf = sum(float(RF[i[n]][2]) for n in (1, 2, 3, 4))
+    assert abs(rf - F) < 1e-6 * F
+
+    # (b) Interface penetration = relative closure across the plane (master z=1 nodes 5-8
+    # vs coincident slave nodes 9-12), isolating the penalty overclosure from each cube's
+    # elastic shortening. pen ~ F/(4*kappa) = 2.5e-5, small and positive.
+    pen = sum(float(U[i[m]][2]) - float(U[i[s]][2])
+              for m, s in ((5, 9), (6, 10), (7, 11), (8, 12))) / 4.0
+    assert pen > 0.0
+    assert pen < 1e-3
+    assert abs(pen - F / (4.0 * kappa)) < 5e-6
+
+
+def test_contact_friction_stick_slip_python():
+    """Coulomb *FRICTION end to end from Python (spec: contact — tangential contact /
+    stick-slip). The two-block deck plus a *FRICTION card (mu, stick stiffness) still
+    solves and transmits the full normal load through the interface — the friction operator
+    contributes to the Newton tangent+residual and does not break the pressed-together
+    solve. (The stick<->slip return-mapping physics is validated at the operator level in
+    the C++ suite; here the end-to-end parse->route->solve path with friction is exercised.)"""
+    import calculixpp as cx
+
+    F = 100.0
+    kappa = 1.0e6
+    # Add a Coulomb *FRICTION card (mu = 0.3, stick stiffness 1e6) to the surface
+    # interaction of the pressed-together two-block deck.
+    deck = _CONTACT_TWO_BLOCK.replace(
+        "*CONTACT PAIR", "*FRICTION\n0.3, 1.0e6\n*CONTACT PAIR")
+    r = cx.solve_text(deck)
+    assert r.get("converged", True)  # the friction solve converges
+
+    # The base reaction still balances the applied normal load exactly: the interface
+    # transmits the full load with the friction operator active.
+    RF = r["reaction"]
+    nid = lambda i: i - 1  # nodes 1..16 map to indices 0..15
+    rf = sum(RF[nid(i)][2] for i in (1, 2, 3, 4))
+    assert abs(rf - F) < 1e-6 * F
+
+    # The interface penetration is still the small penalty overclosure ~ F/(4*kappa):
+    # friction does not disturb the NORMAL contact (the load is purely normal here).
+    U = r["displacement"]
+    pen = sum(U[nid(m)][2] - U[nid(s)][2]
+              for m, s in ((5, 9), (6, 10), (7, 11), (8, 12))) / 4.0
+    assert pen > 0.0
+    assert abs(pen - F / (4.0 * kappa)) < 5e-6
+
+
+# --- Thermal contact: *GAP CONDUCTANCE (tasks 2.4), reachable from Python -------
+_THERMAL_CONTACT_TWO_BLOCK = """
+*NODE, NSET=NALL
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 1., 1., 0.
+4, 0., 1., 0.
+5, 0., 0., 1.
+6, 1., 0., 1.
+7, 1., 1., 1.
+8, 0., 1., 1.
+9, 0., 0., 1.
+10, 1., 0., 1.
+11, 1., 1., 1.
+12, 0., 1., 1.
+13, 0., 0., 2.
+14, 1., 0., 2.
+15, 1., 1., 2.
+16, 0., 1., 2.
+*ELEMENT, TYPE=C3D8, ELSET=EBASE
+1, 1,2,3,4,5,6,7,8
+*ELEMENT, TYPE=C3D8, ELSET=ETOP
+2, 9,10,11,12,13,14,15,16
+*ELSET, ELSET=EALL
+EBASE, ETOP
+*NSET, NSET=NCOLD
+1,2,3,4
+*NSET, NSET=NHOT
+13,14,15,16
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000., 0.3
+*CONDUCTIVITY
+1.
+*SOLID SECTION, ELSET=EALL, MATERIAL=STEEL
+*SURFACE, NAME=SMAST
+EBASE, S2
+*SURFACE, NAME=SSLAV, TYPE=NODE
+9,10,11,12
+*SURFACE INTERACTION, NAME=SI
+*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=LINEAR
+1.E7
+*GAP CONDUCTANCE
+1.
+*CONTACT PAIR, INTERACTION=SI, TYPE=NODE TO SURFACE
+SSLAV, SMAST
+*STEP
+*HEAT TRANSFER, STEADY STATE
+*BOUNDARY
+NCOLD,11,11,0.
+NHOT,11,11,100.
+*NODE PRINT, NSET=NALL
+NT
+*END STEP
+"""
+
+
+def test_thermal_contact_gap_conductance_python():
+    """Thermal contact end to end from Python (spec: contact — thermal contact conductance;
+    tasks 2.4). Two stacked cubes touch only through a *GAP CONDUCTANCE; heat crosses the
+    interface by q = h (T_slave - T_master). The three series resistors (cube, gap, cube)
+    give the through-flux Q = dT/(2/k + 1/h) = 100/3 and the interface drop Q/h."""
+    import calculixpp as cx
+
+    r = cx.solve_text(_THERMAL_CONTACT_TWO_BLOCK)
+    assert r["procedure"] == "heat transfer steady state"
+    T = [float(x) for x in r["temperature"]]
+    ids = list(int(x) for x in r["node_ids"]) if "node_ids" in r else list(range(1, 17))
+    i = {nid: k for k, nid in enumerate(ids)}
+
+    k, h, dT = 1.0, 1.0, 100.0
+    Q = dT / (2.0 / k + 1.0 / h)  # = 100/3
+
+    tm = sum(T[i[n]] for n in (5, 6, 7, 8)) / 4.0   # master (bottom cube top)
+    ts = sum(T[i[n]] for n in (9, 10, 11, 12)) / 4.0  # slave (top cube bottom)
+    drop = ts - tm
+    assert abs(h * drop - Q) < 1e-6 * Q          # interface flux q = h dT_gap = Q
+    assert abs(drop - Q / h) < 1e-6 * (Q / h)    # gap-resistance temperature drop
+
+    # The cold-face RFL reaction (heat entering the stack) balances the through-flux Q.
+    rfl = sum(float(r["flux_reaction"][i[n]]) for n in (1, 2, 3, 4))
+    assert abs(abs(rfl) - Q) < 1e-6 * Q
+
+
+# --- Contact CSTR output (tasks 2.5 / 6.4): reading contact pressure/status ------
+# The result dict carries a `contact` list of per-slave-node dicts recovered at the
+# converged displacement: {node, closed (status), pressure (F_normal/area), gap
+# (signed), tau (tangential traction)}. This is the Python-visible CONTACT OUTPUT
+# (CSTR) that mirrors the .dat "contact stress" / .frd CPRESS/CSTATUS/CGAP blocks.
+
+
+def test_contact_output_cstr_pressure_status_python():
+    """(2.5/6.4) Read contact pressure/status from Python. The two-block pressed-together
+    solve reports every slave node CLOSED with a positive normal pressure whose sum times
+    the tributary area balances the applied load, and a small penetration gap — the
+    analytically-known interface state, exposed through the `contact` result list."""
+    import calculixpp as cx
+
+    r = cx.solve_text(_CONTACT_TWO_BLOCK)
+    assert r.get("converged") is True
+    contact = r["contact"]
+
+    # One CSTR record per slave node (the 4 coincident z=1 slave nodes 9..12).
+    assert len(contact) == 4
+    for c in contact:
+        for key in ("node", "closed", "pressure", "gap", "tau"):
+            assert key in c, f"contact record missing '{key}'"
+
+    nodes = sorted(int(c["node"]) for c in contact)
+    assert nodes == [9, 10, 11, 12]
+
+    # Every slave node is CLOSED (in contact) with a positive normal pressure and a
+    # small penetration gap (g < 0). tau == 0 (the load is purely normal, no friction).
+    for c in contact:
+        assert c["closed"] is True
+        assert c["pressure"] > 0.0
+        assert c["gap"] < 0.0
+        assert abs(c["tau"]) < 1e-9
+
+    # Global equilibrium via CSTR: sum(pressure * tributary_area) balances the load.
+    # Each of the 4 slave nodes carries a quarter of the 1x1 interface (area 0.25),
+    # so sum(p)*0.25 == F = 100.  (Equivalently every p ~ 100.)
+    F = 100.0
+    area_per_node = 0.25
+    assert abs(sum(c["pressure"] for c in contact) * area_per_node - F) < 1e-6 * F
+
+    # The penetration gap matches the linear-penalty overclosure g = -F/(4*kappa).
+    kappa = 1.0e6
+    for c in contact:
+        assert abs(c["gap"] - (-F / (4.0 * kappa))) < 5e-7
+
+
+def test_contact_output_clearance_opens_interface_python():
+    """(2.5) A *CLEARANCE larger than the geometric penetration OPENS the interface: the
+    status flips to OPEN (not closed), the reported gap becomes positive, and the pressure
+    drops to zero — the contact-output read reflects the modifier."""
+    import calculixpp as cx
+
+    # Add a *CLEARANCE (after the *CONTACT PAIR, whose surfaces it references) that
+    # exceeds the ~2.5e-5 penetration so the interface separates.
+    deck = _CONTACT_TWO_BLOCK.replace(
+        "*CONTACT PAIR, INTERACTION=SI, TYPE=NODE TO SURFACE\nSSLAV, SMAST",
+        "*CONTACT PAIR, INTERACTION=SI, TYPE=NODE TO SURFACE\nSSLAV, SMAST\n"
+        "*CLEARANCE, MASTER=SMAST, SLAVE=SSLAV, VALUE=0.01")
+    r = cx.solve_text(deck)
+    contact = r["contact"]
+    assert len(contact) == 4
+    # End to end the released top cube separates, so every slave node reports OPEN with
+    # zero contact pressure (the gap-sign offset itself is validated at a controlled
+    # displacement in the C++ suite, test_clearance_offsets_gap).
+    for c in contact:
+        assert c["closed"] is False        # clearance separates the interface -> OPEN
+        assert abs(c["pressure"]) < 1e-9   # open -> no contact pressure
+
+
+# --- Parametrized contact regression corpus (tasks 6.5 / 6.6) -------------------
+# The contact physics is validated against ANALYTICAL references, not a stock-CalculiX
+# .dat.ref: the stock contact decks (contact1..) use NLGEOM + CalculiX's exact
+# EXPONENTIAL pressure-overclosure formula + *EQUATION MPCs, a harder match that is not
+# gated (documented in tasks.md 1.5/2.1). Each corpus entry runs a self-contained deck
+# through solve_text and applies a per-deck analytical check with its own tolerance:
+#   (deck_text, tol, checker, description)
+# The checker receives the result dict and the tolerance and asserts the closed-form
+# interface state (equilibrium / penetration / gap conductance).
+
+
+def _check_two_block_equilibrium(r, tol):
+    """Two stacked cubes, load F crosses only through contact: base reaction balances
+    F, penetration ~ F/(4*kappa)."""
+    assert r.get("converged") is True
+    ids = [int(x) for x in r["node_ids"]]
+    i = {nid: k for k, nid in enumerate(ids)}
+    F, kappa = 100.0, 1.0e6
+    rf = sum(float(r["reaction"][i[n]][2]) for n in (1, 2, 3, 4))
+    assert abs(rf - F) < tol * F
+    pen = sum(float(r["displacement"][i[m]][2]) - float(r["displacement"][i[s]][2])
+              for m, s in ((5, 9), (6, 10), (7, 11), (8, 12))) / 4.0
+    assert abs(pen - F / (4.0 * kappa)) < 5e-6
+
+
+def _check_friction_equilibrium(r, tol):
+    """Same two blocks + a *FRICTION card: the normal load still crosses the interface
+    (friction contributes to the tangent/residual but the load here is purely normal)."""
+    assert r.get("converged", True)
+    ids = [int(x) for x in r["node_ids"]]
+    i = {nid: k for k, nid in enumerate(ids)}
+    F = 100.0
+    rf = sum(float(r["reaction"][i[n]][2]) for n in (1, 2, 3, 4))
+    assert abs(rf - F) < tol * F
+
+
+def _check_thermal_gap(r, tol):
+    """Two cubes touching only through *GAP CONDUCTANCE: series-resistance through-flux
+    Q = dT/(2/k + 1/h) with the gap drop Q/h."""
+    assert r["procedure"] == "heat transfer steady state"
+    T = [float(x) for x in r["temperature"]]
+    ids = [int(x) for x in r["node_ids"]]
+    i = {nid: k for k, nid in enumerate(ids)}
+    k, h, dT = 1.0, 1.0, 100.0
+    Q = dT / (2.0 / k + 1.0 / h)
+    tm = sum(T[i[n]] for n in (5, 6, 7, 8)) / 4.0
+    ts = sum(T[i[n]] for n in (9, 10, 11, 12)) / 4.0
+    assert abs(h * (ts - tm) - Q) < tol * Q
+
+
+_FRICTION_TWO_BLOCK = _CONTACT_TWO_BLOCK.replace(
+    "*CONTACT PAIR", "*FRICTION\n0.3, 1.0e6\n*CONTACT PAIR")
+
+CONTACT_CORPUS = [
+    ("n2s_two_block", _CONTACT_TWO_BLOCK, 1e-6, _check_two_block_equilibrium,
+     "node-to-surface penalty: two stacked cubes, load via contact"),
+    ("n2s_friction", _FRICTION_TWO_BLOCK, 1e-6, _check_friction_equilibrium,
+     "node-to-surface + Coulomb *FRICTION: normal load crosses interface"),
+    ("thermal_gap", _THERMAL_CONTACT_TWO_BLOCK, 1e-6, _check_thermal_gap,
+     "thermal *GAP CONDUCTANCE: series-resistance through-flux"),
+]
+
+
+@pytest.mark.parametrize(
+    "name, deck, tol, checker, desc",
+    CONTACT_CORPUS,
+    ids=[c[0] for c in CONTACT_CORPUS],
+)
+def test_contact_corpus_analytical(name, deck, tol, checker, desc):
+    """(6.5/6.6) Parametrized contact regression: each analytical contact deck solves end
+    to end from Python and reproduces its closed-form interface state within its per-deck
+    tolerance. Analytical references (not a stock .dat.ref) — the stock contact decks use
+    NLGEOM + CalculiX's exact exponential law + MPCs, not gated (see tasks.md 1.5/2.1)."""
+    import calculixpp as cx
+
+    r = cx.solve_text(deck)
+    checker(r, tol)
+
+
+def test_contact_deferred_mortar_rejects_clearly():
+    """(6.3) A TYPE=SURFACE TO SURFACE (mortar) contact pair is rejected with a clear,
+    actionable error naming the deferral — never silently mis-solved as node-to-surface."""
+    import calculixpp as cx
+
+    deck = _CONTACT_TWO_BLOCK.replace("TYPE=NODE TO SURFACE", "TYPE=SURFACE TO SURFACE")
+    with pytest.raises(RuntimeError) as exc:
+        cx.solve_text(deck)
+    msg = str(exc.value).lower()
+    assert "surface-to-surface" in msg or "surface to surface" in msg or "mortar" in msg

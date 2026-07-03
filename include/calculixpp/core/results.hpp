@@ -8,12 +8,30 @@ namespace cxpp {
 
 using Voigt6 = std::array<Real, 6>;  // stress/strain: xx, yy, zz, xy, xz, yz
 
+// Contact result at one slave node (spec: contact — contact output CSTR). CalculiX writes
+// contact stress/status per slave node; this carries the node id, the OPEN/CLOSED status
+// (closed when the node is in contact / penetrating), the normal contact pressure `p`
+// (>= 0; 0 when open), the signed normal gap/clearance `gap` (>0 open, <0 penetrating),
+// and the tangential friction traction magnitude `tau`. Emitted to .dat (CSTR block) and
+// .frd (CONTACT dataset). Empty on a deck with no *CONTACT PAIR.
+struct ContactPoint {
+  Index node_id{};
+  bool closed{false};  // true = in contact (CLOSED); false = open
+  Real p{0.0};         // normal contact pressure (>= 0)
+  Real gap{0.0};       // signed normal gap: >0 clearance, <0 penetration
+  Real tau{0.0};       // tangential (friction) traction magnitude
+};
+
 // Nodal result fields for a static step, aligned with mesh node indices.
 struct StaticFields {
   std::vector<Vec3> displacement;  // U
   std::vector<Voigt6> stress;      // S (averaged nodal stress)
   std::vector<Voigt6> strain;      // E (averaged nodal strain, engineering shear)
   std::vector<Vec3> reaction;      // RF (f_int - f_ext)
+  // Contact results per slave node (CSTR), populated by the contact driver; empty for a
+  // contact-free deck, so the result writers are unchanged without contact. (spec:
+  // contact — contact modifiers and output.)
+  std::vector<ContactPoint> contact;
 };
 
 // Integration-point heat flux q = -k grad(T) at one Gauss point of one element

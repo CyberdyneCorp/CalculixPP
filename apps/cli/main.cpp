@@ -146,7 +146,10 @@ int main(int argc, char** argv) {
     // --nonlinear routes through the Newton-Raphson driver (identical results on a
     // linear model); the default path stays the linear solve.
     StaticFields f;
-    if (nonlinear) {
+    // A *CONTACT PAIR deck is a nonlinear constraint problem: route it to the
+    // Newton driver, which assembles the penalty contact contribution into the
+    // tangent + residual. --nonlinear or a nonlinear material also route here.
+    if (nonlinear || model.has_nonlinear_material() || model.has_contact()) {
       numerics::NonlinearOptions opts;
       opts.line_search = line_search;
       opts.forced = forced;

@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "calculixpp/fem/cavity_radiation.hpp"
+#include "calculixpp/fem/contact.hpp"
 #include "calculixpp/fem/element.hpp"
 #include "calculixpp/fem/loads.hpp"
 #include "calculixpp/fem/thermal.hpp"
@@ -207,6 +208,25 @@ void seed_conduction(const fem::FullThermalSystem& fts, FullOperator& op) {
     op.b[static_cast<std::size_t>(ni)] += fts.flux[static_cast<std::size_t>(ni)];
 }
 
+// Add the thermal-contact conductance + gap-heat-generation contributions to `op`
+// (spec: contact — thermal contact conductance and gap heat generation). For each slave
+// node found in contact in the geometry given by `u` (all-zero for a pure thermal deck,
+// the coupled displacement field otherwise) the conductance couples the slave and its
+// master-face temperatures and the gap heat is deposited as a source. `tpairs` is built
+// once by the caller; inert (no COO/source) when the model has no thermal-contact card.
+void seed_thermal_contact(const Model& model,
+                          const std::vector<fem::ResolvedThermalContactPair>& tpairs,
+                          const std::vector<Vec3>& u, FullOperator& op) {
+  if (tpairs.empty()) return;
+  std::vector<Index> kr, kc;
+  std::vector<Real> kv;
+  std::vector<Real> src(static_cast<std::size_t>(op.N), 0.0);
+  fem::add_thermal_contact(model, tpairs, u, kr, kc, kv, src);
+  for (std::size_t i = 0; i < kv.size(); ++i) op.add(kr[i], kc[i], kv[i]);
+  for (Index ni = 0; ni < op.N; ++ni)
+    op.b[static_cast<std::size_t>(ni)] += src[static_cast<std::size_t>(ni)];
+}
+
 // Heat-flux reaction RFL = Kt_conduction * T at every node (CalculiX "heat
 // generation"). This is the pure-conduction internal flux: film, radiation, and the
 // capacitance term are NOT included, matching the CalculiX RFL convention validated
@@ -301,10 +321,13 @@ std::vector<Real> initial_field(const Model& model, const LinearSystem& sys) {
 // iterate); the capacitance rhs (C/h) T_n uses the previous-step field `temp_prev`.
 FullOperator step_operator(const Model& model, Index N, Real lambda, Real h,
                            const std::vector<Real>& temp_prev,
-                           const std::vector<Real>& temp_cond) {
+                           const std::vector<Real>& temp_cond,
+                           const std::vector<fem::ResolvedThermalContactPair>& tpairs,
+                           const std::vector<Vec3>& u) {
   const fem::FullThermalSystem fts = fem::assemble_full_thermal(model, lambda, temp_cond);
   FullOperator base = make_full_operator(N);
   seed_conduction(fts, base);
+  seed_thermal_contact(model, tpairs, u, base);
   for (std::size_t i = 0; i < fts.c_vals.size(); ++i) {
     const Real cij = fts.c_vals[i] / h;
     base.add(fts.c_rows[i], fts.c_cols[i], cij);
@@ -318,7 +341,9 @@ FullOperator step_operator(const Model& model, Index N, Real lambda, Real h,
 // stepped from the initial field over the step period (increment.total) with the
 // step's initial increment. Radiation is re-linearized inside each step.
 ThermalFields solve_transient(const Model& model, const fem::Cavity& cav,
-                              LinearSystem& sys, SolverKind kind) {
+                              const std::vector<fem::ResolvedThermalContactPair>& tpairs,
+                              const std::vector<Vec3>& u, LinearSystem& sys,
+                              SolverKind kind) {
   const Index N = static_cast<Index>(model.mesh.num_nodes());
   const Real period = model.increment.total > 0.0 ? model.increment.total : 1.0;
   Real dt = model.increment.initial > 0.0 ? model.increment.initial : period;
@@ -334,7 +359,7 @@ ThermalFields solve_transient(const Model& model, const fem::Cavity& cav,
     nonlinear_solve(
         model, cav, sys,
         [&](const std::vector<Real>& cur) {
-          return step_operator(model, N, lambda, h, temp_prev, cur);
+          return step_operator(model, N, lambda, h, temp_prev, cur, tpairs, u);
         },
         kind, lambda, temp);
     t += h;
@@ -356,8 +381,16 @@ ThermalFields solve_heat_transfer(const Model& model,
   // ...,CR face is present, in which case the cavity path is inert.
   const fem::Cavity cav = fem::build_cavity(model);
 
+  // Thermal contact (gap conductance / gap heat generation) built once — the interface
+  // geometry is fixed for a pure thermal step (no mechanical displacement), so the
+  // node-to-surface search runs against the reference config (u = 0). Empty (and inert)
+  // when no *CONTACT PAIR carries a thermal-contact card. (spec: contact — thermal.)
+  const std::vector<fem::ResolvedThermalContactPair> tpairs =
+      fem::build_thermal_contact_pairs(model);
+  const std::vector<Vec3> u_zero(model.mesh.num_nodes(), Vec3{0, 0, 0});
+
   if (model.procedure == Procedure::HeatTransferTransient)
-    return solve_transient(model, cav, sys, kind);
+    return solve_transient(model, cav, tpairs, u_zero, sys, kind);
 
   // Steady state: conduction + film at full magnitude (lambda = 1), radiation and
   // temperature-dependent k(T) iterated. The base is rebuilt from the current field
@@ -371,6 +404,7 @@ ThermalFields solve_heat_transfer(const Model& model,
         const fem::FullThermalSystem fts = fem::assemble_full_thermal(model, 1.0, cur);
         FullOperator base = make_full_operator(N);
         seed_conduction(fts, base);
+        seed_thermal_contact(model, tpairs, u_zero, base);
         return base;
       },
       kind, 1.0, temp);

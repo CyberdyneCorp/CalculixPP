@@ -5,9 +5,22 @@
 #include "calculixpp/fem/assembly.hpp"
 #include "calculixpp/fem/loads.hpp"
 #include "calculixpp/fem/stress.hpp"
+#include "calculixpp/numerics/nonlinear_static.hpp"
 
 namespace cxpp::numerics {
 namespace {
+
+// True when ANY step of the deck carries a *CONTACT PAIR — the deck is a multi-step
+// contact analysis (spec: model-change — contact-pair activation between steps). Such a
+// deck cannot use the linear-superposition incremental path (contact is a nonlinear
+// constraint that does not superpose); it is solved per step through the nonlinear driver
+// with each step's ACTIVE contact-pair set (with_active_contact_pairs), so a pair added or
+// removed between steps changes that step's response.
+bool any_contact(const std::vector<Model>& steps) {
+  for (const Model& m : steps)
+    if (m.has_contact()) return true;
+  return false;
+}
 
 // Reject a step that this linear multi-step slice cannot yet handle. Multi-step
 // thermal/coupled and nonlinear-material combinations are out of scope here — they
@@ -23,6 +36,40 @@ void require_linear_static(const Model& m) {
         "multi-step analysis currently supports only linear-elastic steps; a "
         "nonlinear-material (*PLASTIC/*HYPERELASTIC/*USER MATERIAL) multi-step deck "
         "is not implemented yet");
+}
+
+// Solve a multi-step CONTACT deck (spec: model-change — activate/deactivate a contact pair
+// between steps). Each step is solved INDEPENDENTLY at its full applied load through the
+// nonlinear contact driver, with its ACTIVE contact-pair set resolved from the accumulated
+// *MODEL CHANGE, TYPE=CONTACT PAIR records (with_active_contact_pairs). Contact is a
+// nonlinear constraint that does not superpose, so the incremental linear accumulation used
+// for pure-elastic multi-step is not applicable here; solving each step's full model is the
+// honest per-step model-change semantics (CalculiX re-solves the changed model each step).
+// A step with no active contact pair falls back to the linear/nonlinear-material driver, so
+// a pair inactive in one step and active in the next produces a different response — the
+// required validation.
+std::vector<StaticFields> solve_multistep_contact(const std::vector<Model>& steps,
+                                                  std::optional<SolverKind> forced,
+                                                  MultiStepReport* report) {
+  std::vector<StaticFields> out;
+  out.reserve(steps.size());
+  for (std::size_t k = 0; k < steps.size(); ++k) {
+    const Model step = steps[k].with_active_contact_pairs();
+    if (step.procedure != Procedure::Static)
+      throw std::runtime_error(
+          "multi-step contact analysis supports only mechanical *STATIC steps");
+    StaticFields f;
+    if (step.has_contact() || step.has_nonlinear_material()) {
+      NonlinearOptions opts;
+      opts.forced = forced;
+      f = solve_nonlinear_static(step, opts);
+    } else {
+      f = solve_linear_static(step, forced);
+    }
+    out.push_back(std::move(f));
+    if (report) report->steps.push_back({static_cast<int>(k + 1), 0, step.procedure});
+  }
+  return out;
 }
 
 // Gather the free-DOF components of a full nodal displacement field into the reduced
@@ -169,6 +216,12 @@ std::vector<StaticFields> solve_multistep_static_all(const std::vector<Model>& s
                                                      std::optional<SolverKind> forced,
                                                      MultiStepReport* report) {
   if (steps.empty()) return {};
+
+  // A multi-step (or single-step) deck carrying any *CONTACT PAIR is a nonlinear-constraint
+  // analysis: solve each step's model independently at full load with its active contact
+  // pairs (contact does not superpose, so the linear incremental path is inapplicable).
+  // (spec: model-change — activate/deactivate a contact pair between steps.)
+  if (any_contact(steps)) return solve_multistep_contact(steps, forced, report);
 
   // Single-step fast path: EXACTLY the historical solve, so a one-*STEP deck is
   // byte-for-byte unchanged (the critical gate). No incremental machinery runs.

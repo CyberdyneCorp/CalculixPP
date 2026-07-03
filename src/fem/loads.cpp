@@ -451,6 +451,49 @@ std::vector<FacePoint> face_gauss_points(const Mesh& mesh, Index elem_index, int
   return pts;
 }
 
+FaceFrame face_frame_at(const Mesh& mesh, Index elem_index, int face, Real xi,
+                        Real eta) {
+  const Element& elem = mesh.elements()[static_cast<std::size_t>(elem_index)];
+  const FaceGeom fg = gather_face(mesh, elem, face);
+  std::array<Real, 8> N{};
+  Vec3 txi{}, teta{};
+  face_point(fg, FaceGP{xi, eta, 1.0}, N, txi, teta);
+  Vec3 x{0, 0, 0};
+  for (int i = 0; i < fg.kind.nf; ++i)
+    for (int d = 0; d < 3; ++d)
+      x[static_cast<std::size_t>(d)] += N[static_cast<std::size_t>(i)] *
+                                        fg.x[static_cast<std::size_t>(i)][static_cast<std::size_t>(d)];
+  return FaceFrame{x, txi, teta};
+}
+
+FaceEval face_eval_deformed(const Mesh& mesh, Index elem_index, int face, Real xi,
+                            Real eta, const std::vector<Vec3>& u) {
+  const Element& elem = mesh.elements()[static_cast<std::size_t>(elem_index)];
+  FaceGeom fg = gather_face(mesh, elem, face);
+  // Add the nodal displacement to each face node's reference coordinate.
+  for (int i = 0; i < fg.kind.nf; ++i) {
+    const std::size_t gi = static_cast<std::size_t>(fg.gnode[static_cast<std::size_t>(i)]);
+    for (int d = 0; d < 3; ++d)
+      fg.x[static_cast<std::size_t>(i)][static_cast<std::size_t>(d)] +=
+          u[gi][static_cast<std::size_t>(d)];
+  }
+  std::array<Real, 8> N{};
+  Vec3 txi{}, teta{};
+  face_point(fg, FaceGP{xi, eta, 1.0}, N, txi, teta);
+  FaceEval ev;
+  ev.gnode = fg.gnode;
+  ev.N.assign(static_cast<std::size_t>(fg.kind.nf), 0.0);
+  for (int i = 0; i < fg.kind.nf; ++i) {
+    ev.N[static_cast<std::size_t>(i)] = N[static_cast<std::size_t>(i)];
+    for (int d = 0; d < 3; ++d)
+      ev.x[static_cast<std::size_t>(d)] += N[static_cast<std::size_t>(i)] *
+                                           fg.x[static_cast<std::size_t>(i)][static_cast<std::size_t>(d)];
+  }
+  ev.t_xi = txi;
+  ev.t_eta = teta;
+  return ev;
+}
+
 std::vector<Real> thermal_load_vector(const Model& model, Real lambda) {
   const Mesh& mesh = model.mesh;
   std::vector<Real> q(mesh.num_nodes(), 0.0);

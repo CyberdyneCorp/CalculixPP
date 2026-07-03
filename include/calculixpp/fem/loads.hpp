@@ -44,6 +44,42 @@ struct FacePoint {
 std::vector<FacePoint> face_gauss_points(const Mesh& mesh, Index elem_index, int face,
                                          int sub = 1);
 
+// One element face sampled at its natural (parametric) coordinates: the physical
+// position and the two covariant surface tangents t_xi = dx/dxi, t_eta = dx/deta at
+// that parametric point, using the SAME face topology/shape machinery as the surface
+// loads. Triangular faces (tet faces, wedge end faces) use barycentric (xi,eta) on the
+// unit reference triangle (l1 = 1-xi-eta); quad faces (hex faces, wedge side faces) use
+// (xi,eta) on [-1,1]^2. The outward normal is t_xi x t_eta (same sense as the *DLOAD
+// pressure / *DFLUX face normal). This is the reusable geometric primitive the contact
+// node-to-surface projection iterates on: it drives the residual dx·t_a of the
+// closest-point problem and, at the solution, yields the projection point and the
+// local normal/tangent frame. (spec: contact-search — node-to-surface projection.)
+struct FaceFrame {
+  Vec3 x{0, 0, 0};     // physical position of the parametric point
+  Vec3 t_xi{0, 0, 0};  // dx/dxi
+  Vec3 t_eta{0, 0, 0}; // dx/deta
+};
+FaceFrame face_frame_at(const Mesh& mesh, Index elem_index, int face, Real xi,
+                        Real eta);
+
+// One element face evaluated at parametric (xi,eta) in the DEFORMED configuration
+// (reference node coords + the nodal displacement `u`, size mesh.num_nodes()). Returns
+// the face node global indices, the shape values N_i at (xi,eta), and the deformed
+// frame (position + covariant tangents). This is the primitive the node-to-surface
+// contact operator uses each Newton iteration: it projects the deformed slave node onto
+// the deformed master face and distributes the contact reaction to the master face nodes
+// via N_i. With u all-zero it reduces to face_frame_at on the reference mesh. (spec:
+// contact-search — node-to-surface projection in the current configuration.)
+struct FaceEval {
+  std::vector<Index> gnode;  // face node global (mesh) indices, size nf
+  std::vector<Real> N;       // shape values N_i at (xi,eta), size nf
+  Vec3 x{0, 0, 0};           // deformed physical position
+  Vec3 t_xi{0, 0, 0};        // dx/dxi (deformed)
+  Vec3 t_eta{0, 0, 0};       // dx/deta (deformed)
+};
+FaceEval face_eval_deformed(const Mesh& mesh, Index elem_index, int face, Real xi,
+                            Real eta, const std::vector<Vec3>& u);
+
 // Global thermal load vector (size num_nodes) at step fraction `lambda` in [0,1]:
 // concentrated nodal heat flux (*CFLUX) plus consistent nodal fluxes from
 // distributed surface flux (*DFLUX S<face>), each scaled by amplitude_factor.

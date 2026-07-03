@@ -8,6 +8,7 @@
 #include "calculixpp/core/connector.hpp"
 #include "calculixpp/core/constraint.hpp"
 #include "calculixpp/core/constraint_cards.hpp"
+#include "calculixpp/core/contact.hpp"
 #include "calculixpp/core/material.hpp"
 #include "calculixpp/core/mesh.hpp"
 #include "calculixpp/core/section.hpp"
@@ -283,6 +284,56 @@ class Model {
   // *MODEL CHANGE, TYPE=CONTACT PAIR records, parsed and stored only here (consumed by
   // the contact workflow). (spec: model-change — contact pair activation.)
   std::vector<ContactPairChange> contact_pair_changes;
+
+  // Contact modeling (spec: contact — *CONTACT PAIR / *SURFACE INTERACTION / *SURFACE
+  // BEHAVIOR). `contact_pairs` are the parsed pairs; `surface_interactions` maps an
+  // interaction name to its normal pressure-overclosure behavior. A deck with any
+  // *CONTACT PAIR routes to the nonlinear (Newton) driver, where the penalty
+  // node-to-surface operator (fem/contact.{hpp,cpp}) contributes to the tangent +
+  // residual each iteration. Empty -> no contact (pre-contact path unchanged).
+  std::vector<ContactPair> contact_pairs;
+  std::unordered_map<std::string, SurfaceInteraction> surface_interactions;
+
+  // True when the model carries at least one *CONTACT PAIR. Routes the analysis to
+  // solve_nonlinear_static with the contact contribution; a contact-free deck keeps its
+  // existing (linear or nonlinear-material) path unchanged. (spec: contact — a contact
+  // deck is a nonlinear constraint problem.)
+  bool has_contact() const { return !contact_pairs.empty(); }
+
+  // Return a COPY of this model whose `contact_pairs` are filtered to the pairs currently
+  // ACTIVE given the accumulated `*MODEL CHANGE, TYPE=CONTACT PAIR` records
+  // (`contact_pair_changes`) — a pair is active unless a REMOVE (not later re-ADDed) names
+  // its surface pair. A pair matches a change when its slave/master surfaces equal the
+  // change's two surfaces in EITHER order (the *CONTACT PAIR data line and the *MODEL
+  // CHANGE data line may list them in either order). With no contact-pair change every
+  // pair stays active, so a deck without *MODEL CHANGE, TYPE=CONTACT PAIR is unchanged.
+  // The multi-step engine calls this per step so an inactive pair adds no contact
+  // search/force/constraint that step. (spec: model-change — activate/deactivate a
+  // contact pair between steps.)
+  Model with_active_contact_pairs() const;
+
+  // The resolved pressure-overclosure behavior of a *CONTACT PAIR: the behavior of its
+  // named *SURFACE INTERACTION, or a default hard behavior when the interaction carries
+  // no *SURFACE BEHAVIOR (CalculiX defaults contact to hard). (spec: contact — surface
+  // behavior normal.)
+  SurfaceBehavior contact_behavior(const ContactPair& pair) const;
+
+  // The resolved Coulomb friction of a *CONTACT PAIR: the friction of its named *SURFACE
+  // INTERACTION, or a default frictionless Friction{} when the interaction carries no
+  // *FRICTION card. (spec: contact — tangential contact / Coulomb friction.)
+  Friction contact_friction(const ContactPair& pair) const;
+
+  // The resolved thermal gap conductance / gap heat generation of a *CONTACT PAIR: the
+  // corresponding card on its named *SURFACE INTERACTION, or a defaulted (has == false)
+  // record when the interaction carries no such card. (spec: contact — thermal contact.)
+  GapConductance contact_conductance(const ContactPair& pair) const;
+  GapHeatGeneration contact_heat_generation(const ContactPair& pair) const;
+
+  // True when the model has at least one *CONTACT PAIR whose interaction carries a
+  // *GAP CONDUCTANCE or *GAP HEAT GENERATION card, so a thermal step must add the
+  // cross-interface conductance/heat operator. A deck with no thermal-contact card keeps
+  // its existing thermal path unchanged. (spec: contact — thermal contact.)
+  bool has_thermal_contact() const;
 
   // Per-element active flag aligned with mesh.elements(): false for an id in
   // `deactivated_elements`, true otherwise. All-true when no element was removed, so

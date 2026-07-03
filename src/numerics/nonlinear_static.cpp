@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "calculixpp/fem/assembly.hpp"
+#include "calculixpp/fem/contact.hpp"
 #include "calculixpp/fem/loads.hpp"
 #include "calculixpp/fem/stress.hpp"
 
@@ -73,6 +74,10 @@ struct NewtonState {
   fem::MaterialPoints mp;         // per-element material models + Gauss-point state
   std::vector<Real> uf;           // current free-DOF solution
   Real f_ext_norm{0.0};           // ||f_ext,f|| at full magnitude
+  // Resolved *CONTACT PAIR data (slave nodes + master grids + behavior), built once per
+  // solve and evaluated each Newton iteration; empty on a contact-free deck. (spec:
+  // contact — contact contributes to the Newton tangent + residual.)
+  std::vector<fem::ResolvedContactPair> contact;
 };
 
 // Assemble the material-point tangent + internal force at free state uf and step
@@ -87,6 +92,12 @@ fem::LinearSystem assemble_at(const Model& model, NewtonState& state,
   std::vector<Real> f_int;
   fem::LinearSystem tangent =
       fem::assemble_material_tangent(model, u, state.mp, f_int);
+  // Contact contribution: penalty node-to-surface force into f_int and its consistent
+  // penalty tangent into the (already-flattened) COO system, both through the constraint
+  // transform. Inert (no active pairs) on a contact-free deck. (spec: contact —
+  // contributes to the Newton tangent + residual.)
+  if (!state.contact.empty())
+    fem::add_contact(model, state.contact, u, tangent, f_int);
   const std::vector<Real> f_int_free = reduce_free(tangent, f_int);
   const std::vector<Real> f_ext_free = external_free_at(model, tangent, lambda);
   r_out.assign(static_cast<std::size_t>(tangent.n_free), 0.0);
@@ -254,6 +265,7 @@ StaticFields solve_nonlinear_static(const Model& model,
   NewtonState state;
   state.sys = fem::assemble_linear_static(model);  // DOF map + prescribed data
   state.mp = fem::make_material_points(model);      // per-element material + state
+  if (model.has_contact()) state.contact = fem::build_contact_pairs(model);
   state.f_ext_norm =
       norm2(reduce_free(state.sys, fem::external_load_vector(model)));
   state.uf.assign(static_cast<std::size_t>(state.sys.n_free), 0.0);
@@ -275,6 +287,11 @@ StaticFields solve_nonlinear_static(const Model& model,
   else
     fem::recover_fields(model, res);
   if (eqplastic_by_elem) *eqplastic_by_elem = element_mean_eqplastic(model, state.mp);
+  // Contact output (CSTR): recover per-slave-node status/pressure/gap at the converged
+  // displacement, so the writers can emit the contact stresses. Empty for a contact-free
+  // deck. (spec: contact — contact output.)
+  if (!state.contact.empty())
+    res.contact = fem::recover_contact(model, state.contact, u);
   return res;
 }
 

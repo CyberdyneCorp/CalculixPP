@@ -1,5 +1,6 @@
 #include "calculixpp/core/model.hpp"
 
+#include <cctype>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -203,6 +204,64 @@ std::vector<bool> Model::element_active_mask() const {
     if (ei >= 0) active[static_cast<std::size_t>(ei)] = false;
   }
   return active;
+}
+
+SurfaceBehavior Model::contact_behavior(const ContactPair& pair) const {
+  const auto it = surface_interactions.find(pair.interaction);
+  if (it != surface_interactions.end() && it->second.has_behavior)
+    return it->second.behavior;
+  return SurfaceBehavior{};  // CalculiX default: hard pressure-overclosure
+}
+
+Friction Model::contact_friction(const ContactPair& pair) const {
+  const auto it = surface_interactions.find(pair.interaction);
+  if (it != surface_interactions.end() && it->second.friction.has)
+    return it->second.friction;
+  return Friction{};  // no *FRICTION -> frictionless normal contact
+}
+
+GapConductance Model::contact_conductance(const ContactPair& pair) const {
+  const auto it = surface_interactions.find(pair.interaction);
+  if (it != surface_interactions.end() && it->second.conductance.has)
+    return it->second.conductance;
+  return GapConductance{};  // no *GAP CONDUCTANCE -> thermally open interface
+}
+
+GapHeatGeneration Model::contact_heat_generation(const ContactPair& pair) const {
+  const auto it = surface_interactions.find(pair.interaction);
+  if (it != surface_interactions.end() && it->second.heat_generation.has)
+    return it->second.heat_generation;
+  return GapHeatGeneration{};  // no *GAP HEAT GENERATION -> no gap source
+}
+
+bool Model::has_thermal_contact() const {
+  for (const ContactPair& pair : contact_pairs)
+    if (contact_conductance(pair).has || contact_heat_generation(pair).has) return true;
+  return false;
+}
+
+Model Model::with_active_contact_pairs() const {
+  if (contact_pair_changes.empty()) return *this;  // no toggling -> every pair active
+  // Case-insensitive surface-pair match, order-independent (the two data lines may list
+  // the surfaces in either order).
+  auto matches = [](const ContactPair& p, const ContactPairChange& c) {
+    auto up = [](std::string s) {
+      for (char& ch : s) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+      return s;
+    };
+    const std::string ps = up(p.slave_surface), pm = up(p.master_surface);
+    const std::string ca = up(c.surface_a), cb = up(c.surface_b);
+    return (ps == ca && pm == cb) || (ps == cb && pm == ca);
+  };
+  Model m = *this;
+  m.contact_pairs.clear();
+  for (const ContactPair& pair : contact_pairs) {
+    bool active = true;  // active unless the LAST matching change is a REMOVE
+    for (const ContactPairChange& c : contact_pair_changes)
+      if (matches(pair, c)) active = c.add;
+    if (active) m.contact_pairs.push_back(pair);
+  }
+  return m;
 }
 
 std::vector<Real> Model::element_density() const {

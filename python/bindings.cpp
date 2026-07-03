@@ -160,6 +160,19 @@ py::dict result_dict(const Model& m, const StaticFields& f) {
   d["reaction"] = vec3_to_array(f.reaction);
   d["num_nodes"] = n;
   d["num_elements"] = m.mesh.num_elements();
+  // Contact results (CSTR) per slave node — a list of dicts (node, closed, pressure,
+  // gap, tau). Empty for a contact-free deck. (spec: contact — contact output.)
+  py::list contact;
+  for (const ContactPoint& c : f.contact) {
+    py::dict cd;
+    cd["node"] = c.node_id;
+    cd["closed"] = c.closed;
+    cd["pressure"] = c.p;
+    cd["gap"] = c.gap;
+    cd["tau"] = c.tau;
+    contact.append(cd);
+  }
+  d["contact"] = contact;
   return d;
 }
 
@@ -249,7 +262,9 @@ py::dict solve_model(const Model& m, const std::string& solver,
   // routes to the Newton-Raphson driver (load applied incrementally); a purely
   // linear-elastic model keeps the direct linear path unchanged.
   py::dict d;
-  if (m.has_nonlinear_material()) {
+  // A *CONTACT PAIR deck (nonlinear constraint) or a nonlinear material routes to the
+  // Newton driver; a purely linear-elastic contact-free model keeps the linear path.
+  if (m.has_nonlinear_material() || m.has_contact()) {
     numerics::NonlinearOptions opts;
     opts.forced = kind_of(solver);
     numerics::NonlinearReport rep;
