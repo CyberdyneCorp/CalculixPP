@@ -22,6 +22,13 @@ struct Spc {
   int comp{};      // 1..3 (x,y,z)
   Real value{0.0};
   std::string amplitude;  // empty -> default linear ramp
+  // *BOUNDARY, FIXED: hold the DOF at its currently-attained (deformed) value going
+  // into the step, rather than at `value`. Only meaningful in multi-step analysis —
+  // the step-loop driver (numerics::solve_multistep_static) substitutes the carried
+  // displacement of the DOF for `value` at solve time. In a single-step solve there is
+  // no prior deformation so FIXED reduces to value 0 (the DOF's start state), i.e. the
+  // single-step path is unchanged. (spec: multi-step analysis — FIXED boundary.)
+  bool fixed{false};
 };
 
 // Concentrated load on a nodal DOF (*CLOAD). `amplitude` scales the value over
@@ -101,18 +108,23 @@ struct Film {
   std::string amplitude;
 };
 
-// Surface-to-ambient radiation on an element face (*RADIATE elem,R<face>,T_amb,eps).
-// The face radiates q = eps sigma (T^4 - T_amb^4) per unit area (absolute
-// temperatures), linearized within the thermal Newton iteration. `emissivity` is
-// eps in [0,1]; the Stefan-Boltzmann constant and absolute-zero offset come from
-// the model's PhysicalConstants. `amplitude` scales the ambient temperature over
-// step time. Cavity view-factor radiation is deferred (surface-to-ambient only).
-// (spec: heat-transfer-analysis — radiation.)
+// Radiation on an element face (*RADIATE). Two modes, distinguished by `cavity`:
+//   surface-to-ambient (R<face>): the face radiates q = eps sigma (T^4 - T_amb^4)
+//     per unit area against a fixed ambient/environment temperature;
+//   cavity (R<face>CR): the face is a patch of a gray-body enclosure — the net
+//     radiative flux depends on the temperatures AND emissivities of every other
+//     cavity patch through the geometric view factors F_ij (see cavity_radiation).
+// Both are in absolute temperature T_abs = T - absolute_zero, linearized within the
+// thermal Newton iteration. `emissivity` is eps in [0,1]; the Stefan-Boltzmann
+// constant and absolute-zero offset come from the model's PhysicalConstants.
+// `amplitude` scales the ambient temperature over step time (unused for cavity).
+// (spec: heat-transfer-analysis — radiation with view factors.)
 struct Radiate {
   Index elem_id{};
   int face{};          // 1..6 (tet 1..4)
   Real ambient_temp{0.0};
   Real emissivity{0.0};
+  bool cavity{false};  // true -> R<face>CR gray-body cavity patch (view factors)
   std::string amplitude;
 };
 
@@ -141,6 +153,23 @@ enum class Procedure {
   // applies its thermal strain to a mechanical solve. (spec: heat-transfer — coupled.)
   Coupled,
 };
+
+// Solution scheme for a *COUPLED TEMPERATURE-DISPLACEMENT step (spec: heat-transfer
+// — coupled). The two schemes solve the SAME coupled residual and agree to solver
+// tolerance; they differ in how the thermal (T) and mechanical (u) blocks are
+// combined.
+//   - Monolithic: assemble and solve the 4-DOF/node (u,v,w,T) tangent in one Newton
+//     system. The thermal->mechanical coupling enters through the thermal-strain
+//     load; the mechanical->thermal block (K_Tu) is non-zero only when a genuine
+//     two-way heat source exists (plastic-dissipation heating). With no two-way term
+//     the system is block-triangular and the result equals the one-way solve exactly.
+//   - Staggered: Gauss-Seidel — alternate a thermal solve and a mechanical solve with
+//     an outer convergence check on the coupled fields. Converges in ONE pass when the
+//     coupling is one-way (no mechanical->thermal feedback); iterates otherwise.
+// The default is Staggered (its single-pass degeneracy is the historical one-way
+// path). CalculiX's *COUPLED TEMPERATURE-DISPLACEMENT selects the monolithic tangent
+// unless SOLUTIONS=STAGGERED; the parser maps that keyword.
+enum class CoupledScheme { Staggered, Monolithic };
 
 // A *MODEL CHANGE, TYPE=CONTACT PAIR record (spec: model-change — activate/deactivate
 // a named contact pair between steps). Parsed and stored only in this thermal track;
@@ -198,6 +227,30 @@ class Model {
   // thermal strain of an element with *EXPANSION(alpha,Tref) is
   // eps_th = alpha (T - Tref) on the normal components. Empty -> pure mechanics.
   std::unordered_map<Index, Real> applied_temperature;
+
+  // Solution scheme for a *COUPLED TEMPERATURE-DISPLACEMENT step (Monolithic vs.
+  // Gauss-Seidel Staggered). Inert unless procedure == Coupled. (spec: heat-transfer
+  // — coupled.)
+  CoupledScheme coupled_scheme{CoupledScheme::Staggered};
+
+  // Taylor-Quinney fraction beta in [0,1] for plastic-dissipation heating (the
+  // mechanical->thermal two-way coupling term). A fraction beta of the incremental
+  // plastic work density is deposited as a volumetric heat source in the coupled
+  // thermal solve, so plastic straining warms the body, which changes the thermal
+  // strain, which the coupled scheme iterates to convergence. Zero (the default)
+  // makes the coupling one-way, so the coupled result equals the sequential solve
+  // for pure thermal-stress problems. (spec: heat-transfer — coupled two-way.)
+  Real taylor_quinney{0.0};
+
+  // Per-element plastic-dissipation heat source Q_e (total watts deposited in element
+  // e) for the coupled thermal solve, given the per-element accumulated equivalent
+  // plastic strain `eqplastic_by_elem` (aligned with mesh.elements()) recovered from
+  // a mechanical solve. Q_e = beta * sigma_y(ep_e) * ep_e * V_e, the Taylor-Quinney
+  // fraction of the plastic work density integrated over the element volume. Returns
+  // an all-zero vector when taylor_quinney == 0 or the model has no plasticity, so a
+  // pure thermal-stress deck stays one-way. (spec: heat-transfer — coupled two-way.)
+  std::vector<Real> plastic_dissipation_heat(
+      const std::vector<Real>& eqplastic_by_elem) const;
 
   // Discrete/connector elements (spec: element-sections — *SPRING/*MASS/*DASHPOT).
   // Springs contribute to the static stiffness; masses and dashpots are stored for
@@ -282,8 +335,26 @@ class Model {
   // resolved from the solid sections' materials. Throws on a missing elset/material
   // or an element left without a section (like element_elastic). An element whose
   // material carries no *CONDUCTIVITY throws — a heat-transfer solve needs it.
-  // (spec: heat-transfer-analysis — *CONDUCTIVITY consumed in the conduction kernel.)
+  // Uses the FIRST (constant) table value; the temperature-dependent evaluation is
+  // element_conductivity_at(). (spec: heat-transfer-analysis — *CONDUCTIVITY.)
   std::vector<Real> element_conductivity() const;
+
+  // True when any consumed thermal property (*CONDUCTIVITY / *SPECIFIC HEAT /
+  // *EXPANSION) is a multi-row temperature table, so the thermal solve must
+  // re-evaluate the property at the current temperature (Picard iteration). When
+  // false every table is constant and the solve is byte-for-byte the pre-table path.
+  bool has_temp_dependent_thermal() const;
+
+  // Per-element conductivity evaluated at each element's MEAN nodal temperature from
+  // `node_temp` (aligned with mesh node indices), for temperature-dependent
+  // *CONDUCTIVITY k(T). Elements with a constant (single-row) table return that
+  // constant regardless of `node_temp`, so a constant deck is unchanged.
+  std::vector<Real> element_conductivity_at(const std::vector<Real>& node_temp) const;
+
+  // Per-element volumetric heat capacity rho*c(T) evaluated at each element's mean
+  // nodal temperature (temperature-dependent *SPECIFIC HEAT); constant tables are
+  // unchanged. Aligned with mesh.elements().
+  std::vector<Real> element_heat_capacity_at(const std::vector<Real>& node_temp) const;
 
   // Thermal-expansion data per element (aligned with mesh.elements()), resolved from
   // the solid sections' materials. Elements whose material carries no *EXPANSION get

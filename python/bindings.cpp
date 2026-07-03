@@ -19,6 +19,7 @@
 #include "calculixpp/io/results_writer.hpp"
 #include "calculixpp/numerics/heat_transfer.hpp"
 #include "calculixpp/numerics/linear_static.hpp"
+#include "calculixpp/numerics/multistep.hpp"
 #include "calculixpp/numerics/nonlinear_static.hpp"
 
 namespace py = pybind11;
@@ -170,22 +171,45 @@ py::dict thermal_result_dict(const Model& m, const ThermalFields& t) {
   py::array_t<double> coords({static_cast<py::ssize_t>(n), py::ssize_t{3}});
   py::array_t<double> temp(static_cast<py::ssize_t>(n));
   py::array_t<double> rfl(static_cast<py::ssize_t>(n));
+  py::array_t<double> hfl({static_cast<py::ssize_t>(n), py::ssize_t{3}});  // nodal HFL
   auto ri = ids.mutable_unchecked<1>();
   auto rc = coords.mutable_unchecked<2>();
   auto rt = temp.mutable_unchecked<1>();
   auto rr = rfl.mutable_unchecked<1>();
+  auto rh = hfl.mutable_unchecked<2>();
   for (std::size_t i = 0; i < n; ++i) {
     ri(static_cast<py::ssize_t>(i)) = m.mesh.nodes()[i].id;
     for (py::ssize_t j = 0; j < 3; ++j)
       rc(static_cast<py::ssize_t>(i), j) = m.mesh.nodes()[i].x[static_cast<std::size_t>(j)];
     rt(static_cast<py::ssize_t>(i)) = t.temperature[i];
     rr(static_cast<py::ssize_t>(i)) = t.flux_reaction[i];
+    for (py::ssize_t j = 0; j < 3; ++j)
+      rh(static_cast<py::ssize_t>(i), j) =
+          t.heat_flux.empty() ? 0.0 : t.heat_flux[i][static_cast<std::size_t>(j)];
+  }
+  // Integration-point HFL (*EL PRINT HFL): elem ids, gp indices, and the flux rows.
+  const std::size_t np = t.hfl_points.size();
+  py::array_t<int> hp_elem(static_cast<py::ssize_t>(np));
+  py::array_t<int> hp_gp(static_cast<py::ssize_t>(np));
+  py::array_t<double> hp_flux({static_cast<py::ssize_t>(np), py::ssize_t{3}});
+  auto pe = hp_elem.mutable_unchecked<1>();
+  auto pg = hp_gp.mutable_unchecked<1>();
+  auto pf = hp_flux.mutable_unchecked<2>();
+  for (std::size_t i = 0; i < np; ++i) {
+    pe(static_cast<py::ssize_t>(i)) = t.hfl_points[i].elem_id;
+    pg(static_cast<py::ssize_t>(i)) = t.hfl_points[i].gp;
+    for (py::ssize_t j = 0; j < 3; ++j)
+      pf(static_cast<py::ssize_t>(i), j) = t.hfl_points[i].flux[static_cast<std::size_t>(j)];
   }
   py::dict d;
   d["node_ids"] = ids;
   d["node_coords"] = coords;
   d["temperature"] = temp;
   d["flux_reaction"] = rfl;
+  d["heat_flux"] = hfl;
+  d["hfl_elem"] = hp_elem;
+  d["hfl_gp"] = hp_gp;
+  d["hfl_flux"] = hp_flux;
   d["num_nodes"] = n;
   d["num_elements"] = m.mesh.num_elements();
   return d;
@@ -281,6 +305,39 @@ py::dict solve_nonlinear_text(const std::string& text, const std::string& solver
   return solve_nonlinear_model(io::parse_inp(text), solver, backend, line_search);
 }
 
+// Multi-step linear-static solve (spec: multi-step analysis). Parses the deck into its
+// per-*STEP models and runs the step-loop driver, returning a LIST of per-step result
+// dicts (one per *STEP, each carrying the accumulated total displacement/stress/strain/
+// reaction at the end of that step). A single-*STEP deck returns a one-element list
+// whose fields equal solve()'s (the single-step fast path). Enables validating a stock
+// two-step deck's per-step *NODE PRINT blocks. `solver`/`backend` as in solve().
+py::list solve_multistep_models(const std::vector<Model>& steps,
+                                const std::string& solver, const std::string& backend) {
+  const std::string used = resolve_backend(backend);
+  numerics::MultiStepReport rep;
+  const std::vector<StaticFields> all =
+      numerics::solve_multistep_static_all(steps, kind_of(solver), &rep);
+  py::list out;
+  for (std::size_t i = 0; i < all.size(); ++i) {
+    py::dict d = result_dict(steps[i], all[i]);
+    d["backend"] = used;
+    d["step"] = static_cast<int>(i + 1);
+    d["num_steps"] = static_cast<int>(all.size());
+    out.append(d);
+  }
+  return out;
+}
+
+py::list solve_multistep_file(const std::string& path, const std::string& solver,
+                              const std::string& backend) {
+  return solve_multistep_models(io::parse_inp_steps_file(path), solver, backend);
+}
+
+py::list solve_multistep_text(const std::string& text, const std::string& solver,
+                              const std::string& backend) {
+  return solve_multistep_models(io::parse_inp_steps(text), solver, backend);
+}
+
 py::dict summary_file(const std::string& path) {
   return summary_dict(io::parse_inp_file(path));
 }
@@ -308,6 +365,21 @@ PYBIND11_MODULE(calculixpp, mod) {
   mod.def("solve_text", &solve_text, py::arg("text"), py::arg("solver") = "",
           py::arg("backend") = "",
           "Like solve() but takes the deck contents as a string.");
+
+  mod.def("solve_multistep", &solve_multistep_file, py::arg("path"),
+          py::arg("solver") = "", py::arg("backend") = "",
+          "Parse a multi-*STEP .inp deck and solve every step in order with the "
+          "step-loop driver (spec: multi-step analysis), carrying the converged state "
+          "forward. Returns a LIST of per-step result dicts (same fields as solve(), "
+          "plus 'step' 1-based and 'num_steps'); entry i is the accumulated total at "
+          "the end of step i+1. Two linear load steps sum to the single-step result "
+          "(superposition); *MODEL CHANGE removes/re-adds elements across steps "
+          "(strain-free reactivation); *BOUNDARY,FIXED holds a DOF at its deformed "
+          "value; OP=NEW/MOD accumulate loads and *CHANGE SOLID SECTION rebinds at the "
+          "boundary. A single-*STEP deck returns a one-element list equal to solve().");
+  mod.def("solve_multistep_text", &solve_multistep_text, py::arg("text"),
+          py::arg("solver") = "", py::arg("backend") = "",
+          "Like solve_multistep() but takes the deck contents as a string.");
 
   mod.def("solve_nonlinear", &solve_nonlinear_file, py::arg("path"),
           py::arg("solver") = "", py::arg("backend") = "",

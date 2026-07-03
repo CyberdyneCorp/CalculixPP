@@ -1,7 +1,10 @@
 #include "calculixpp/core/model.hpp"
 
+#include <span>
 #include <stdexcept>
 #include <string>
+
+#include "calculixpp/fem/element.hpp"
 
 namespace cxpp {
 
@@ -80,6 +83,50 @@ std::vector<std::optional<Plastic>> Model::element_plastic() const {
     }
   }
   return out;
+}
+
+namespace {
+// Yield stress at accumulated equivalent plastic strain `ep`, linearly interpolated
+// on the *PLASTIC hardening table (flat extrapolation past the ends). Mirrors the
+// J2 material's `hardening()` so the deposited plastic work is consistent with the
+// stress the mechanical solve return-mapped to.
+Real yield_at(const Plastic& p, Real ep) {
+  const std::size_t n = p.yield.size();
+  if (n == 0) return 0.0;
+  if (n == 1 || ep <= p.eqplastic[0]) return p.yield[0];
+  if (ep >= p.eqplastic[n - 1]) return p.yield[n - 1];
+  for (std::size_t i = 1; i < n; ++i)
+    if (ep <= p.eqplastic[i]) {
+      const Real t = (ep - p.eqplastic[i - 1]) /
+                     (p.eqplastic[i] - p.eqplastic[i - 1]);
+      return p.yield[i - 1] + t * (p.yield[i] - p.yield[i - 1]);
+    }
+  return p.yield[n - 1];
+}
+}  // namespace
+
+std::vector<Real> Model::plastic_dissipation_heat(
+    const std::vector<Real>& eqplastic_by_elem) const {
+  std::vector<Real> heat(mesh.num_elements(), 0.0);
+  if (taylor_quinney <= 0.0 || !has_plasticity()) return heat;
+  const std::vector<std::optional<Plastic>> plas = element_plastic();
+  for (std::size_t e = 0; e < mesh.num_elements(); ++e) {
+    if (!plas[e] || plas[e]->empty()) continue;
+    const Real ep = e < eqplastic_by_elem.size() ? eqplastic_by_elem[e] : 0.0;
+    if (ep <= 0.0) continue;
+    // Plastic work density w_p ~= sigma_y(ep) * ep (J2, associative flow). Deposit a
+    // fraction beta of it over the element volume as heat.
+    const Element& el = mesh.elements()[e];
+    const int nn = nodes_per_element(el.type);
+    std::vector<Vec3> coords(static_cast<std::size_t>(nn));
+    for (int i = 0; i < nn; ++i) {
+      const Index ni = mesh.node_index(el.nodes[static_cast<std::size_t>(i)]);
+      coords[static_cast<std::size_t>(i)] = mesh.nodes()[static_cast<std::size_t>(ni)].x;
+    }
+    const Real vol = fem::element_volume(el.type, std::span<const Vec3>(coords));
+    heat[e] = taylor_quinney * yield_at(*plas[e], ep) * ep * vol;
+  }
+  return heat;
 }
 
 std::vector<std::optional<Hyperelastic>> Model::element_hyperelastic() const {
@@ -188,7 +235,7 @@ std::vector<Real> Model::element_conductivity() const {
       throw std::runtime_error("solid section references unknown material '" +
                                section.material + "'");
     }
-    if (!mat->second.thermal || mat->second.thermal->conductivity == 0.0) {
+    if (!mat->second.thermal || mat->second.thermal->conductivity.empty()) {
       throw std::runtime_error("material '" + section.material +
                                "' has no *CONDUCTIVITY data (needed for heat transfer)");
     }
@@ -198,7 +245,7 @@ std::vector<Real> Model::element_conductivity() const {
         throw std::runtime_error("elset '" + section.elset +
                                  "' references unknown element");
       }
-      out[static_cast<std::size_t>(ei)] = mat->second.thermal->conductivity;
+      out[static_cast<std::size_t>(ei)] = mat->second.thermal->conductivity.first();
       assigned[static_cast<std::size_t>(ei)] = true;
     }
   }
@@ -221,12 +268,89 @@ std::vector<Real> Model::element_heat_capacity() const {
     const auto mat = materials.find(section.material);
     if (mat == materials.end() || !mat->second.thermal || !mat->second.density)
       continue;
-    const Real rho_c = *mat->second.density * mat->second.thermal->specific_heat;
+    const Real rho_c = *mat->second.density * mat->second.thermal->specific_heat.first();
     for (const Index elem_id : *ids) {
       const Index ei = mesh.element_index(elem_id);
       if (ei >= 0) out[static_cast<std::size_t>(ei)] = rho_c;
     }
   }
+  return out;
+}
+
+namespace {
+
+// Mean of an element's nodal temperatures (used to evaluate temperature-dependent
+// properties at a single per-element temperature — the conduction/capacitance
+// kernels take one scalar property per element). `node_temp` is aligned with mesh
+// node indices; missing entries fall back to 0.
+Real element_mean_temp(const Mesh& mesh, const Element& elem,
+                       const std::vector<Real>& node_temp) {
+  const int n = nodes_per_element(elem.type);
+  Real sum = 0.0;
+  for (int i = 0; i < n; ++i) {
+    const Index ni = mesh.node_index(elem.nodes[static_cast<std::size_t>(i)]);
+    if (ni >= 0 && static_cast<std::size_t>(ni) < node_temp.size())
+      sum += node_temp[static_cast<std::size_t>(ni)];
+  }
+  return n > 0 ? sum / static_cast<Real>(n) : 0.0;
+}
+
+// Resolve the (material) owning each element via the solid sections; invokes `fn`
+// with (element index, material) for every element covered by a section whose
+// material exists. Last section wins, matching element_elastic().
+template <typename Fn>
+void for_each_element_material(
+    const Mesh& mesh,
+    const std::unordered_map<std::string, Material>& materials,
+    const std::vector<SolidSection>& sections, Fn&& fn) {
+  for (const auto& section : sections) {
+    const std::vector<Index>* ids = mesh.elset(section.elset);
+    if (ids == nullptr) continue;
+    const auto mat = materials.find(section.material);
+    if (mat == materials.end()) continue;
+    for (const Index elem_id : *ids) {
+      const Index ei = mesh.element_index(elem_id);
+      if (ei >= 0) fn(static_cast<std::size_t>(ei), mat->second);
+    }
+  }
+}
+
+}  // namespace
+
+bool Model::has_temp_dependent_thermal() const {
+  for (const auto& [name, mat] : materials) {
+    if (mat.thermal &&
+        (mat.thermal->conductivity.value.size() > 1 ||
+         mat.thermal->specific_heat.value.size() > 1))
+      return true;
+    if (mat.expansion && mat.expansion->alpha.value.size() > 1) return true;
+  }
+  return false;
+}
+
+std::vector<Real> Model::element_conductivity_at(
+    const std::vector<Real>& node_temp) const {
+  std::vector<Real> out = element_conductivity();  // constant / first-value baseline
+  for_each_element_material(
+      mesh, materials, sections, [&](std::size_t ei, const Material& mat) {
+        if (mat.thermal && mat.thermal->conductivity.value.size() > 1)
+          out[ei] = mat.thermal->conductivity.at(
+              element_mean_temp(mesh, mesh.elements()[ei], node_temp));
+      });
+  return out;
+}
+
+std::vector<Real> Model::element_heat_capacity_at(
+    const std::vector<Real>& node_temp) const {
+  std::vector<Real> out = element_heat_capacity();  // constant / first-value baseline
+  for_each_element_material(
+      mesh, materials, sections, [&](std::size_t ei, const Material& mat) {
+        if (mat.thermal && mat.density &&
+            mat.thermal->specific_heat.value.size() > 1)
+          out[ei] = *mat.density *
+                    mat.thermal->specific_heat.at(
+                        element_mean_temp(mesh, mesh.elements()[ei], node_temp));
+      });
   return out;
 }
 

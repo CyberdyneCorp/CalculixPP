@@ -41,9 +41,12 @@ struct NonlinearReport {
 // Solve a static step with the Newton-Raphson driver, ramping the load factor from
 // 0 to 1 through the incrementation engine. Returns the same StaticFields as
 // solve_linear_static (displacement, stress, strain, reaction). Optionally reports
-// solver statistics via `report`.
+// solver statistics via `report`, and the per-element mean accumulated equivalent
+// plastic strain via `eqplastic_by_elem` (aligned with mesh.elements(); all-zero for
+// an elastic model) — used by the coupled driver to compute plastic-dissipation heat.
 StaticFields solve_nonlinear_static(const Model& model,
                                     const NonlinearOptions& opts = {},
-                                    NonlinearReport* report = nullptr);
+                                    NonlinearReport* report = nullptr,
+                                    std::vector<Real>* eqplastic_by_elem = nullptr);
 
 }  // namespace cxpp::numerics

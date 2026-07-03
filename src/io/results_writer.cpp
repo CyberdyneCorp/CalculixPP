@@ -174,6 +174,19 @@ void write_frd(const std::string& path, const Model& model, const ThermalFields&
   for (std::size_t i = 0; i < mesh.num_nodes(); ++i)
     out << " -1" << i10(mesh.nodes()[i].id) << e12_5(t.temperature[i]) << "\n";
   out << " -3\n";
+
+  // FLUX vector dataset (nodal, extrapolated heat flux HFL; CGX field FLUX / F1..F3).
+  if (!t.heat_flux.empty()) {
+    out << "  100CL  101" << e12_5(1.0) << i10(static_cast<long>(mesh.num_nodes()))
+        << "                     0    1           1\n";
+    out << " -4  FLUX        4    1\n";
+    for (const char* c : {"F1", "F2", "F3"})
+      out << " -5  " << c << "          1    2    " << (c[1]) << "    0\n";
+    for (std::size_t i = 0; i < mesh.num_nodes(); ++i)
+      out << " -1" << i10(mesh.nodes()[i].id) << e12_5(t.heat_flux[i][0])
+          << e12_5(t.heat_flux[i][1]) << e12_5(t.heat_flux[i][2]) << "\n";
+    out << " -3\n";
+  }
   out << " 9999\n";
 }
 
@@ -189,6 +202,15 @@ void write_dat(const std::string& path, const Model& model, const ThermalFields&
   out << "\n heat generation (rfl)\n\n";
   for (std::size_t i = 0; i < mesh.num_nodes(); ++i)
     out << i10(mesh.nodes()[i].id) << e12_5(t.flux_reaction[i]) << "\n";
+
+  // Integration-point heat flux HFL (*EL PRINT HFL), matching CalculiX's block layout
+  // "heat flux (elem, integ.pnt.,qx,qy,qz)": one row per element per Gauss point.
+  if (!t.hfl_points.empty()) {
+    out << "\n heat flux (elem, integ.pnt.,qx,qy,qz)\n\n";
+    for (const HeatFluxPoint& p : t.hfl_points)
+      out << i10(p.elem_id) << i10(p.gp).substr(6) << e12_5(p.flux[0])
+          << e12_5(p.flux[1]) << e12_5(p.flux[2]) << "\n";
+  }
 }
 
 }  // namespace cxpp::io

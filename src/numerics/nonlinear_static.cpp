@@ -228,9 +228,29 @@ bool run_increments(const Model& model, const NonlinearOptions& opts,
 
 }  // namespace
 
+namespace {
+// Per-element mean committed equivalent plastic strain from the material-point store
+// (aligned with mesh.elements()). Averages the committed eqplastic over the element's
+// Gauss points; elastic elements report 0. Used by the coupled driver for the
+// plastic-dissipation (Taylor-Quinney) heat source.
+std::vector<Real> element_mean_eqplastic(const Model& model,
+                                         const fem::MaterialPoints& mp) {
+  std::vector<Real> ep(model.mesh.num_elements(), 0.0);
+  for (std::size_t e = 0; e < mp.state.size() && e < ep.size(); ++e) {
+    const std::vector<fem::MaterialState>& gps = mp.state[e];
+    if (gps.empty()) continue;
+    Real acc = 0.0;
+    for (const fem::MaterialState& s : gps) acc += s.committed_eqplastic;
+    ep[e] = acc / static_cast<Real>(gps.size());
+  }
+  return ep;
+}
+}  // namespace
+
 StaticFields solve_nonlinear_static(const Model& model,
                                     const NonlinearOptions& opts,
-                                    NonlinearReport* report) {
+                                    NonlinearReport* report,
+                                    std::vector<Real>* eqplastic_by_elem) {
   NewtonState state;
   state.sys = fem::assemble_linear_static(model);  // DOF map + prescribed data
   state.mp = fem::make_material_points(model);      // per-element material + state
@@ -254,6 +274,7 @@ StaticFields solve_nonlinear_static(const Model& model,
     fem::recover_fields(model, res, state.mp);
   else
     fem::recover_fields(model, res);
+  if (eqplastic_by_elem) *eqplastic_by_elem = element_mean_eqplastic(model, state.mp);
   return res;
 }
 

@@ -10,6 +10,7 @@
 #include "calculixpp/io/results_writer.hpp"
 #include "calculixpp/numerics/heat_transfer.hpp"
 #include "calculixpp/numerics/linear_static.hpp"
+#include "calculixpp/numerics/multistep.hpp"
 #include "calculixpp/numerics/nonlinear_static.hpp"
 
 namespace {
@@ -63,6 +64,35 @@ int main(int argc, char** argv) {
   if (out.empty()) out = stem(input);
 
   try {
+    // Multi-step mechanical decks (>1 *STEP) run the step-loop driver and write the
+    // final step's fields. A single-*STEP deck falls through to the byte-identical
+    // single-step path below (parse_inp_steps returns one model there). Thermal/coupled
+    // multi-step is out of this slice; those decks are handled single-step as before.
+    {
+      const std::vector<Model> steps = cxpp::io::parse_inp_steps_file(input);
+      if (steps.size() > 1 && steps.front().procedure == Procedure::Static &&
+          !nonlinear && !steps.front().has_nonlinear_material()) {
+        const Model& last = steps.back();
+        const StaticFields f = numerics::solve_multistep_static(steps, forced);
+        Real umax = 0.0, svm_max = 0.0;
+        for (std::size_t i = 0; i < last.mesh.num_nodes(); ++i) {
+          const Vec3& u = f.displacement[i];
+          umax = std::max(umax, std::sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]));
+          svm_max = std::max(svm_max, von_mises(f.stress[i]));
+        }
+        cxpp::io::write_frd(out + ".frd", last, f);
+        cxpp::io::write_dat(out + ".dat", last, f);
+        std::printf("CalculiX++  %s  (multi-step: %zu steps)\n", input.c_str(),
+                    steps.size());
+        std::printf("  nodes=%zu  elements=%zu\n", last.mesh.num_nodes(),
+                    last.mesh.num_elements());
+        std::printf("  max |u|        = %.6g  (final step)\n", umax);
+        std::printf("  max von Mises  = %.6g  (final step)\n", svm_max);
+        std::printf("  wrote %s.frd, %s.dat\n", out.c_str(), out.c_str());
+        return 0;
+      }
+    }
+
     const Model model = cxpp::io::parse_inp_file(input);
 
     // A *COUPLED TEMPERATURE-DISPLACEMENT deck solves the thermal field, applies the

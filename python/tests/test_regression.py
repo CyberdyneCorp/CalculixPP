@@ -193,6 +193,237 @@ def test_reference_corpus_matches_calculix(deck, tol, desc):
     assert rel_l2 < tol, f"{deck} ({desc}): rel-L2 {rel_l2:.3e} >= tol {tol:.0e}"
 
 
+def parse_ref_step_displacements(path):
+    """Return a list (one per 'S T E P' block) of {node_id: (ux, uy, uz)} from a .dat.
+
+    A multi-step deck writes one displacement block per step; this splits them so each
+    step's *NODE PRINT can be compared against the driver's per-step total field."""
+    steps = []
+    cur = None
+    indisp = False
+    with open(path) as fh:
+        for line in fh:
+            if "S T E P" in line:
+                cur = {}
+                steps.append(cur)
+                indisp = False
+                continue
+            if "displacements" in line:
+                indisp = True
+                continue
+            if indisp:
+                parts = line.split()
+                if len(parts) == 4:
+                    try:
+                        cur[int(parts[0])] = [float(x) for x in parts[1:]]
+                    except ValueError:
+                        indisp = False
+                elif parts:
+                    indisp = False
+    return steps
+
+
+def test_multistep_beampfix_matches_calculix():
+    """(multi-step 5.1 / 2.4) The stock two-*STEP deck ``beampfix`` reproduces stock
+    CalculiX's per-step *NODE PRINT displacements. Step 1 is a *CLOAD; step 2 resets
+    the load (*CLOAD, OP=NEW), applies a new *CLOAD, and holds the LOAD set at its
+    step-1 (deformed) value via *BOUNDARY, FIXED. The step-loop driver carries the
+    converged displacement forward, so both steps match the reference within rel-L2.
+    This is the stock-CalculiX validation of multi-step analysis (the enabler for
+    cross-step birth-death 5.1 and OP=MOD/NEW load accumulation 2.4)."""
+    inp = os.path.join(CCX_TEST, "beampfix.inp")
+    ref_path = os.path.join(CCX_TEST, "beampfix.dat.ref")
+    if not (os.path.exists(inp) and os.path.exists(ref_path)):
+        pytest.skip("reference deck beampfix not available")
+    import calculixpp
+
+    ref_steps = parse_ref_step_displacements(ref_path)
+    res = calculixpp.solve_multistep(inp)
+    assert len(res) == 2, f"beampfix has 2 *STEP blocks, got {len(res)}"
+    assert len(ref_steps) == 2, "beampfix.dat.ref must have two S T E P blocks"
+
+    for si, r in enumerate(res):
+        ids = list(r["node_ids"])
+        U = r["displacement"]
+        rd = ref_steps[si]
+        assert rd, f"step {si + 1}: empty reference displacement block"
+        num = den = 0.0
+        compared = 0
+        for idx, nid in enumerate(ids):
+            if nid not in rd:
+                continue
+            compared += 1
+            for c in range(3):
+                d = float(U[idx][c]) - rd[nid][c]
+                num += d * d
+                den += rd[nid][c] ** 2
+        rel_l2 = math.sqrt(num / den) if den > 0 else math.sqrt(num)
+        assert compared > 0, f"step {si + 1}: no reference nodes matched"
+        assert rel_l2 < 1e-4, f"beampfix step {si + 1}: rel-L2 {rel_l2:.3e} >= 1e-4"
+
+
+def test_multistep_single_step_equals_solve():
+    """A single-*STEP deck solved via solve_multistep() returns a one-element list
+    whose displacement equals solve()'s — the multi-step path never perturbs the
+    single-step result (the critical gate, from Python)."""
+    import calculixpp
+
+    deck = """
+*NODE, NSET=NALL
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 1., 1., 0.
+4, 0., 1., 0.
+5, 0., 0., 1.
+6, 1., 0., 1.
+7, 1., 1., 1.
+8, 0., 1., 1.
+*ELEMENT, TYPE=C3D8, ELSET=EALL
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*MATERIAL, NAME=EL
+*ELASTIC
+210000., 0.3
+*SOLID SECTION, ELSET=EALL, MATERIAL=EL
+*NSET, NSET=FIX
+1, 4, 5, 8
+*NSET, NSET=LOAD
+2, 3, 6, 7
+*BOUNDARY
+FIX, 1, 3, 0.
+*STEP
+*STATIC
+*CLOAD
+LOAD, 1, 100.
+*END STEP
+"""
+    single = calculixpp.solve_text(deck)
+    multi = calculixpp.solve_multistep_text(deck)
+    assert len(multi) == 1
+    Us = single["displacement"]
+    Um = multi[0]["displacement"]
+    for i in range(len(Us)):
+        for c in range(3):
+            assert abs(float(Us[i][c]) - float(Um[i][c])) < 1e-12
+
+
+def test_multistep_two_load_steps_superpose():
+    """Two linear load steps of F each (OP=MOD accumulation) sum to the single-step 2F
+    result — the core multi-step superposition property, from Python."""
+    import calculixpp
+
+    header = """
+*NODE, NSET=NALL
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 1., 1., 0.
+4, 0., 1., 0.
+5, 0., 0., 1.
+6, 1., 0., 1.
+7, 1., 1., 1.
+8, 0., 1., 1.
+*ELEMENT, TYPE=C3D8, ELSET=EALL
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*MATERIAL, NAME=EL
+*ELASTIC
+210000., 0.3
+*SOLID SECTION, ELSET=EALL, MATERIAL=EL
+*NSET, NSET=FIX
+1, 4, 5, 8
+*NSET, NSET=LOAD
+2, 3, 6, 7
+*BOUNDARY
+FIX, 1, 3, 0.
+"""
+    two = header + (
+        "*STEP\n*STATIC\n*CLOAD\nLOAD, 1, 50.\n*END STEP\n"
+        "*STEP\n*STATIC\n*CLOAD\nLOAD, 1, 50.\n*END STEP\n"
+    )
+    one = header + "*STEP\n*STATIC\n*CLOAD\nLOAD, 1, 100.\n*END STEP\n"
+    res2 = calculixpp.solve_multistep_text(two)
+    res1 = calculixpp.solve_text(one)
+    assert len(res2) == 2
+    U2 = res2[-1]["displacement"]  # end of step 2 == total 2F state
+    U1 = res1["displacement"]
+    for i in range(len(U1)):
+        for c in range(3):
+            assert abs(float(U2[i][c]) - float(U1[i][c])) < 1e-9 * (
+                1.0 + abs(float(U1[i][c]))
+            )
+
+
+def test_multistep_element_birth_death_python():
+    """(5.1) Cross-step element birth-death: two stacked confined cubes, cube 2
+    removed in step 1 and re-added in step 2, is strain-free relative to the deformed
+    config — its step-2 stress is built only from the step-2 increment, so it is
+    non-zero yet smaller than the never-removed reference's step-2 total, and exactly
+    zero if it stays removed. Validates the *MODEL CHANGE active mask carried per step."""
+    import calculixpp
+
+    def deck(s1_mc, s2_mc, d1, d2):
+        header = """
+*NODE, NSET=NALL
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 1., 1., 0.
+4, 0., 1., 0.
+5, 0., 0., 1.
+6, 1., 0., 1.
+7, 1., 1., 1.
+8, 0., 1., 1.
+9,  0., 2., 0.
+10, 1., 2., 0.
+11, 0., 2., 1.
+12, 1., 2., 1.
+*ELEMENT, TYPE=C3D8, ELSET=CUBE1
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*ELEMENT, TYPE=C3D8, ELSET=CUBE2
+2, 4, 3, 10, 9, 8, 7, 12, 11
+*ELSET, ELSET=EALL
+1, 2
+*MATERIAL, NAME=EL
+*ELASTIC
+210000., 0.3
+*SOLID SECTION, ELSET=EALL, MATERIAL=EL
+*NSET, NSET=TOP
+9, 10, 11, 12
+*NSET, NSET=MID
+3, 4, 7, 8
+*NSET, NSET=BOT
+1, 2, 5, 6
+*NSET, NSET=ALLN
+1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12
+*BOUNDARY
+ALLN, 1, 1, 0.
+ALLN, 3, 3, 0.
+BOT, 2, 2, 0.
+MID, 2, 2, 0.
+"""
+        return header + (
+            f"*STEP\n*STATIC\n{s1_mc}*BOUNDARY\nTOP, 2, 2, {d1}\n*END STEP\n"
+            f"*STEP\n*STATIC\n{s2_mc}*BOUNDARY\nTOP, 2, 2, {d2}\n*END STEP\n"
+        )
+
+    bd = calculixpp.solve_multistep_text(
+        deck("*MODEL CHANGE, TYPE=ELEMENT, REMOVE\n2\n",
+             "*MODEL CHANGE, TYPE=ELEMENT, ADD\n2\n", 0.01, 0.02))
+    ref = calculixpp.solve_multistep_text(deck("", "", 0.01, 0.02))
+    dead = calculixpp.solve_multistep_text(
+        deck("*MODEL CHANGE, TYPE=ELEMENT, REMOVE\n2\n",
+             "*MODEL CHANGE, TYPE=ELEMENT, REMOVE\n2\n", 0.01, 0.02))
+
+    ids = list(bd[0]["node_ids"])
+    i10 = ids.index(10)  # cube-2-exclusive node
+    bd_syy_1 = float(bd[0]["stress"][i10][1])
+    bd_syy_2 = float(bd[1]["stress"][i10][1])
+    ref_syy_2 = float(ref[1]["stress"][i10][1])
+    dead_syy_2 = float(dead[1]["stress"][i10][1])
+
+    assert abs(bd_syy_1) < 1e-6            # dead in step 1 -> no stress
+    assert abs(bd_syy_2) > 1e-3            # live in step 2 -> stressed
+    assert abs(bd_syy_2) < abs(ref_syy_2)  # but less than the never-removed total
+    assert abs(dead_syy_2) < 1e-9         # removed throughout -> exactly zero
+
+
 def parse_ref_temperatures(path, last=False):
     """Return {node_id: temperature} from a 'temperatures' block of a .dat.
 
@@ -258,6 +489,57 @@ def test_thermal_reference_corpus_matches_calculix(deck, tol, mode, desc):
             max_abs = max(max_abs, abs(id2t[nid] - tref))
     assert compared > 0, f"{deck}: no reference nodes matched the model"
     assert max_abs < tol, f"{deck} ({desc}): max abs temp err {max_abs:.3e} >= {tol:.0e}"
+
+
+def parse_ref_heat_flux(path):
+    """Return {(elem_id, gp): (qx, qy, qz)} from a *EL PRINT HFL 'heat flux' block."""
+    hfl = {}
+    with open(path) as fh:
+        lines = fh.readlines()
+    headers = [k for k, l in enumerate(lines) if "heat flux" in l]
+    if not headers:
+        return hfl
+    for line in lines[headers[0] + 1:]:
+        parts = line.split()
+        if len(parts) == 5:
+            try:
+                hfl[(int(parts[0]), int(parts[1]))] = [float(x) for x in parts[2:]]
+            except ValueError:
+                if hfl:
+                    break
+        elif parts and hfl:
+            break
+    return hfl
+
+
+def test_heat_flux_hfl_matches_calculix():
+    """(6.2) Integration-point heat flux HFL reproduces stock-CalculiX oneel20cf.dat.ref
+    *EL PRINT HFL to machine precision. The C3D20R cube driven by a *CFLUX carries a
+    uniform qx = 120 (heat generation / area) and ~1e-14 transverse flux at every one
+    of its 8 integration points; we match the reference block per (elem, integ.pnt.)."""
+    import calculixpp as cx
+
+    inp = os.path.join(CCX_TEST, "oneel20cf.inp")
+    ref_path = os.path.join(CCX_TEST, "oneel20cf.dat.ref")
+    if not (os.path.exists(inp) and os.path.exists(ref_path)):
+        pytest.skip("reference deck oneel20cf not available")
+    ref = parse_ref_heat_flux(ref_path)
+    assert ref, "no reference HFL parsed"
+
+    res = cx.solve(inp)
+    elem = res["hfl_elem"]
+    gp = res["hfl_gp"]
+    flux = res["hfl_flux"]
+    compared = 0
+    max_abs = 0.0
+    for k in range(len(elem)):
+        key = (int(elem[k]), int(gp[k]))
+        if key in ref:
+            compared += 1
+            for c in range(3):
+                max_abs = max(max_abs, abs(float(flux[k][c]) - ref[key][c]))
+    assert compared == len(ref), f"matched {compared}/{len(ref)} HFL points"
+    assert max_abs < 1e-9, f"HFL max abs err {max_abs:.3e} >= 1e-9"
 
 
 _COUPLED_BAR = """
@@ -326,6 +608,170 @@ def test_coupled_temperature_displacement_thermal_stress():
         assert abs(float(row[0]) - sxx_expect) < 1e-2
         assert abs(float(row[1])) < 1e-2
         assert abs(float(row[2])) < 1e-2
+
+
+def test_coupled_monolithic_equals_staggered():
+    """(4.1 / 4.2) The MONOLITHIC 4-DOF/node coupled solve equals the STAGGERED
+    (one-way) solve for a pure thermal-stress problem — no mechanical->thermal feedback
+    means the coupled tangent is block-triangular, so the single 4-DOF solve reproduces
+    the sequential result. Both schemes are reachable from a deck via SOLUTIONS=."""
+    import calculixpp as cx
+
+    stag = cx.solve_text(
+        _COUPLED_BAR.replace(
+            "*COUPLED TEMPERATURE-DISPLACEMENT",
+            "*COUPLED TEMPERATURE-DISPLACEMENT, SOLUTIONS=STAGGERED",
+        )
+    )
+    mono = cx.solve_text(
+        _COUPLED_BAR.replace(
+            "*COUPLED TEMPERATURE-DISPLACEMENT",
+            "*COUPLED TEMPERATURE-DISPLACEMENT, SOLUTIONS=MONOLITHIC",
+        )
+    )
+    for ts, tm in zip(stag["temperature"], mono["temperature"]):
+        assert abs(float(ts) - float(tm)) < 1e-9
+    for rs, rm in zip(stag["stress"], mono["stress"]):
+        for cs, cm in zip(rs, rm):
+            assert abs(float(cs) - float(cm)) < 1e-6
+
+
+_KT_BAR = """
+*NODE
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 1., 1., 0.
+4, 0., 1., 0.
+5, 0., 0., 1.
+6, 1., 0., 1.
+7, 1., 1., 1.
+8, 0., 1., 1.
+9, 2., 0., 0.
+10, 2., 1., 0.
+11, 2., 0., 1.
+12, 2., 1., 1.
+*ELEMENT, TYPE=C3D8, ELSET=EALL
+1, 1, 2, 3, 4, 5, 6, 7, 8
+2, 2, 9, 10, 3, 6, 11, 12, 7
+*MATERIAL, NAME=EL
+*CONDUCTIVITY
+50., 0.
+100., 100.
+*SOLID SECTION, ELSET=EALL, MATERIAL=EL
+*STEP
+*HEAT TRANSFER, STEADY STATE
+*BOUNDARY
+1, 11, 11, 0.
+4, 11, 11, 0.
+5, 11, 11, 0.
+8, 11, 11, 0.
+9, 11, 11, 100.
+10, 11, 11, 100.
+11, 11, 11, 100.
+12, 11, 11, 100.
+*END STEP
+"""
+
+
+def test_temperature_dependent_conductivity_python():
+    """(6.1) Temperature-dependent *CONDUCTIVITY k(T)=50+0.5T through the Python solve:
+    a 1-D bar (0..2) with fixed end temperatures 0 and 100 has a CONSTANT flux, so the
+    Kirchhoff transform q L = int_0^100 (50+0.5T) dT = 7500 fixes the nonlinear profile.
+    The mid-plane node (x=1) sits at Tm = -100 + sqrt(25000) ~ 58.11 (NOT 50 as a
+    constant k would give), and the hot-face heat-flux reaction sums to q A = 3750."""
+    import calculixpp as cx
+    import math
+
+    res = cx.solve_text(_KT_BAR)
+    assert res.get("procedure") == "heat transfer steady state"
+    ids = list(res["node_ids"])
+    temp = res["temperature"]
+    rfl = res["flux_reaction"]
+    coords = res["node_coords"]
+    id2i = {int(ids[i]): i for i in range(len(ids))}
+
+    Tm = -100.0 + math.sqrt(25000.0)  # ~58.113883
+    assert abs(float(temp[id2i[2]]) - Tm) < 1e-2, float(temp[id2i[2]])
+    assert float(temp[id2i[2]]) > 55.0  # meaningfully above the constant-k value 50
+
+    hot = sum(float(rfl[i]) for i in range(len(ids)) if abs(coords[i][0] - 2.0) < 1e-9)
+    assert abs(hot - 3750.0) < 1e-1, hot
+
+
+_CAVITY_PLATES = """
+*NODE
+1, -0.01, 0., 0.
+2, 0., 0., 0.
+3, 0., 1., 0.
+4, -0.01, 1., 0.
+5, -0.01, 0., 1.
+6, 0., 0., 1.
+7, 0., 1., 1.
+8, -0.01, 1., 1.
+9, 0.5, 0., 0.
+10, 0.51, 0., 0.
+11, 0.51, 1., 0.
+12, 0.5, 1., 0.
+13, 0.5, 0., 1.
+14, 0.51, 0., 1.
+15, 0.51, 1., 1.
+16, 0.5, 1., 1.
+*ELEMENT, TYPE=C3D8, ELSET=EALL
+1, 1, 2, 3, 4, 5, 6, 7, 8
+2, 9, 10, 11, 12, 13, 14, 15, 16
+*MATERIAL, NAME=EL
+*CONDUCTIVITY
+1e6
+*SOLID SECTION, ELSET=EALL, MATERIAL=EL
+*PHYSICAL CONSTANTS, ABSOLUTE ZERO=0., STEFAN BOLTZMANN=5.67E-8
+*STEP
+*HEAT TRANSFER, STEADY STATE
+*BOUNDARY
+1, 11, 11, 800.
+4, 11, 11, 800.
+5, 11, 11, 800.
+8, 11, 11, 800.
+10, 11, 11, 500.
+11, 11, 11, 500.
+14, 11, 11, 500.
+15, 11, 11, 500.
+*RADIATE
+1, R4CR, , 0.8
+2, R6CR, , 0.8
+*END STEP
+"""
+
+
+def test_cavity_radiation_parallel_plates_python():
+    """(3.4) Gray-body cavity radiation (*RADIATE ...,CR) end to end through the Python
+    binding. Two thin, high-conductivity unit-square plates face each other across a
+    gap; the plate outer faces are held at 800 K and 500 K, so each plate is essentially
+    isothermal and the cavity faces sit at the boundary temperatures. The two facing
+    patches form a 2-body enclosure (F12 = F21 = 1), so in steady state the heat that
+    conducts through the hot plate (its flux reaction) equals the classic parallel-plate
+    radiative exchange q = sigma (T1^4 - T2^4)/(1/e1 + 1/e2 - 1) over the unit area."""
+    import calculixpp as cx
+
+    res = cx.solve_text(_CAVITY_PLATES)
+    assert res.get("procedure") == "heat transfer steady state"
+    ids = list(res["node_ids"])
+    coords = res["node_coords"]
+    rfl = res["flux_reaction"]
+
+    sig, Th, Tc, e = 5.67e-8, 800.0, 500.0, 0.8
+    q_expect = sig * (Th ** 4 - Tc ** 4) / (1.0 / e + 1.0 / e - 1.0)  # ~13120.4 W
+
+    # Sum the flux reaction over the hot-plate outer face (x = -0.01): in steady state it
+    # carries the full radiative heat flow Q across the cavity.
+    hot = sum(
+        float(rfl[i]) for i in range(len(ids)) if abs(coords[i][0] + 0.01) < 1e-9
+    )
+    assert abs(hot - q_expect) < 1e-1, (hot, q_expect)
+    # Energy is conserved: the cold-plate outer face absorbs the same flow (opposite sign).
+    cold = sum(
+        float(rfl[i]) for i in range(len(ids)) if abs(coords[i][0] - 0.51) < 1e-9
+    )
+    assert abs(cold + q_expect) < 1e-1, (cold, q_expect)
 
 
 def test_equation_constraint_matches_calculix():

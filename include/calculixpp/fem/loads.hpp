@@ -25,6 +25,25 @@ struct FaceSurface {
 };
 FaceSurface face_surface_integrals(const Mesh& mesh, Index elem_index, int face);
 
+// One face quadrature point in PHYSICAL space, for geometry that needs the surface
+// sampled (cavity-radiation view factors): `x` is the point, `n` the UNIT outward
+// normal (element -> outside, same sense as the *DLOAD pressure/*DFLUX face normal),
+// and `w` the area weight so Σ w = face area and Σ w*x / area = the area centroid.
+struct FacePoint {
+  Vec3 x{0, 0, 0};
+  Vec3 n{0, 0, 0};
+  Real w{0.0};
+};
+
+// The face quadrature points of one element face in physical space (position, unit
+// outward normal, area weight). Reuses the same face topology/shape/Gauss machinery
+// as the surface-integral loads. `sub` (>=1) tiles the face into sub x sub subcells and
+// applies the base rule in each, refining the sampling (Σ w stays the face area); the
+// cavity-radiation view-factor double-area quadrature uses sub>1 for accuracy on far/
+// opposed patches, where a single 2x2 rule underestimates the 1/r^2 kernel.
+std::vector<FacePoint> face_gauss_points(const Mesh& mesh, Index elem_index, int face,
+                                         int sub = 1);
+
 // Global thermal load vector (size num_nodes) at step fraction `lambda` in [0,1]:
 // concentrated nodal heat flux (*CFLUX) plus consistent nodal fluxes from
 // distributed surface flux (*DFLUX S<face>), each scaled by amplitude_factor.

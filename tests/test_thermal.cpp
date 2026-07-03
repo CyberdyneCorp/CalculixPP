@@ -219,6 +219,160 @@ Nall, 25.
   CX_NEAR(m.increment.initial, 1.0, 1e-12);
 }
 
+// Integration-point heat flux HFL (task 6.2). The linear bar (T = 100 x, k = 50) has
+// a UNIFORM temperature gradient dT/dx = 100, so q = -k grad(T) gives qx = -5000 at
+// EVERY Gauss point (transverse components zero), exactly the Fourier flux q = k dT/L
+// (here L = 1). We check both the raw integration-point HFL and the extrapolated
+// nodal HFL against that exact value.
+void test_heat_flux_bar() {
+  Model m = unit_cube_hex(50.0);
+  for (Index nd : {1, 4, 5, 8}) m.temp_bcs.push_back(TempBc{nd, 0.0, ""});    // x=0
+  for (Index nd : {2, 3, 6, 7}) m.temp_bcs.push_back(TempBc{nd, 100.0, ""});  // x=1
+
+  const ThermalFields t = numerics::solve_heat_transfer(m);
+  CX_CHECK(!t.hfl_points.empty());
+  for (const HeatFluxPoint& p : t.hfl_points) {
+    CX_CHECK(p.elem_id == 1);
+    CX_NEAR(p.flux[0], -5000.0, 1e-6);  // qx = -k dT/dx = -50*100
+    CX_NEAR(p.flux[1], 0.0, 1e-6);
+    CX_NEAR(p.flux[2], 0.0, 1e-6);
+  }
+  // Nodal (extrapolated) HFL is the same uniform vector at every node.
+  for (std::size_t i = 0; i < m.mesh.num_nodes(); ++i) {
+    CX_NEAR(t.heat_flux[i][0], -5000.0, 1e-6);
+    CX_NEAR(t.heat_flux[i][1], 0.0, 1e-6);
+    CX_NEAR(t.heat_flux[i][2], 0.0, 1e-6);
+  }
+}
+
+// PropertyTable interpolation: piecewise-linear with clamping outside the range, and
+// a single-row table is a constant.
+void test_property_table_interpolation() {
+  PropertyTable single{7.5};
+  CX_NEAR(single.at(-100.0), 7.5, 1e-12);
+  CX_NEAR(single.at(1000.0), 7.5, 1e-12);
+
+  PropertyTable table;
+  table.value = {10.0, 20.0, 50.0};
+  table.temp = {0.0, 100.0, 200.0};
+  CX_NEAR(table.at(-50.0), 10.0, 1e-12);   // clamp below
+  CX_NEAR(table.at(0.0), 10.0, 1e-12);
+  CX_NEAR(table.at(50.0), 15.0, 1e-12);    // midway 10..20
+  CX_NEAR(table.at(100.0), 20.0, 1e-12);
+  CX_NEAR(table.at(150.0), 35.0, 1e-12);   // midway 20..50
+  CX_NEAR(table.at(200.0), 50.0, 1e-12);
+  CX_NEAR(table.at(500.0), 50.0, 1e-12);   // clamp above
+}
+
+// Temperature-dependent conductivity k(T) = k0 + s (T - Tref) on the 1-D bar. For a
+// 1-D steady bar with no source the flux q is CONSTANT along x, so the Kirchhoff
+// transform gives  q L = ∫_{T0}^{T1} k(T) dT = k0 (T1-T0) + (s/2)((T1-Tref)^2 -
+// (T0-Tref)^2).  With T0=0, T1=100, k0=50, s=0.5, Tref=0:
+//   ∫ = 50*100 + 0.25*(100^2 - 0) = 5000 + 2500 = 7500, so |q| = 7500 (L=1, A=1).
+// The temperature PROFILE is nonlinear (the mid node is NOT at 50). We check the FEM
+// (Picard-iterated) matches: the total heat rate through each face and the
+// Kirchhoff-implied mid-plane temperature.
+void test_temp_dependent_conductivity_bar() {
+  // A two-hex bar along x (0..2) so there is an interior mid-plane node to check the
+  // nonlinear profile; unit cross section. Nodes: plane x=0 {1,4,5,8}, x=1
+  // {2,3,6,7}, x=2 {9,10,11,12} — build explicitly.
+  Model m;
+  m.mesh.add_node(1, {0, 0, 0});
+  m.mesh.add_node(2, {1, 0, 0});
+  m.mesh.add_node(3, {1, 1, 0});
+  m.mesh.add_node(4, {0, 1, 0});
+  m.mesh.add_node(5, {0, 0, 1});
+  m.mesh.add_node(6, {1, 0, 1});
+  m.mesh.add_node(7, {1, 1, 1});
+  m.mesh.add_node(8, {0, 1, 1});
+  m.mesh.add_node(9, {2, 0, 0});
+  m.mesh.add_node(10, {2, 1, 0});
+  m.mesh.add_node(11, {2, 0, 1});
+  m.mesh.add_node(12, {2, 1, 1});
+  m.mesh.add_element(1, ElementType::C3D8, {1, 2, 3, 4, 5, 6, 7, 8});
+  m.mesh.add_element(2, ElementType::C3D8, {2, 9, 10, 3, 6, 11, 12, 7});
+  m.mesh.add_elset("EALL", {1, 2});
+  Material mat;
+  mat.name = "EL";
+  Thermal th;
+  th.conductivity.value = {50.0, 100.0};  // k0=50 at T=0, 100 at T=100 -> s=0.5
+  th.conductivity.temp = {0.0, 100.0};
+  mat.thermal = th;
+  m.materials["EL"] = mat;
+  m.sections.push_back(SolidSection{"EALL", "EL"});
+  m.procedure = Procedure::HeatTransferSteady;
+  for (Index nd : {1, 4, 5, 8}) m.temp_bcs.push_back(TempBc{nd, 0.0, ""});      // x=0
+  for (Index nd : {9, 10, 11, 12}) m.temp_bcs.push_back(TempBc{nd, 100.0, ""}); // x=2
+
+  const ThermalFields t = numerics::solve_heat_transfer(m);
+
+  // Kirchhoff: q L = ∫_0^100 (50 + 0.5 T) dT = 5000 + 2500 = 7500 with L=2, A=1, so
+  // the constant flux is q = 7500 / L = 3750 and the heat rate Q = q A = 3750, the
+  // sum of the flux reactions on the hot (x=2) face.
+  Real hot = 0.0;
+  for (std::size_t i = 0; i < m.mesh.num_nodes(); ++i)
+    if (m.mesh.nodes()[i].x[0] == 2.0) hot += t.flux_reaction[i];
+  CX_NEAR(hot, 3750.0, 1e-2);
+
+  // Mid-plane (x=1) temperature Tm solves ∫_0^{Tm} k dT = (x/L) ∫_0^{T1} k dT with
+  // x/L = 1/2: 50 Tm + 0.25 Tm^2 = 3750 -> Tm^2 + 200 Tm - 15000 = 0 ->
+  // Tm = -100 + sqrt(10000 + 15000) = -100 + sqrt(25000) = 58.113883...
+  const Real Tm = -100.0 + std::sqrt(25000.0);
+  const Index n2 = m.mesh.node_index(2);
+  CX_NEAR(t.temperature[static_cast<std::size_t>(n2)], Tm, 1e-3);
+  // A CONSTANT conductivity would put the mid node at 50; confirm we are meaningfully
+  // above that (nonlinear k(T) really took effect).
+  CX_CHECK(t.temperature[static_cast<std::size_t>(n2)] > 55.0);
+}
+
+// A single-row *CONDUCTIVITY table is byte-for-byte the constant path: k(T) resolves
+// to the same conductivity regardless of temperature, so the linear-bar solve is
+// unchanged and has_temp_dependent_thermal() is false.
+void test_constant_table_unchanged() {
+  Model m = unit_cube_hex(50.0);  // single-row Thermal{50, 0}
+  CX_CHECK(!m.has_temp_dependent_thermal());
+  for (Index nd : {1, 4, 5, 8}) m.temp_bcs.push_back(TempBc{nd, 0.0, ""});
+  for (Index nd : {2, 3, 6, 7}) m.temp_bcs.push_back(TempBc{nd, 100.0, ""});
+  const ThermalFields t = numerics::solve_heat_transfer(m);
+  for (std::size_t i = 0; i < m.mesh.num_nodes(); ++i)
+    CX_NEAR(t.temperature[i], 100.0 * m.mesh.nodes()[i].x[0], 1e-9);
+}
+
+// Parser: a multi-row *CONDUCTIVITY / *SPECIFIC HEAT / *EXPANSION builds a table; a
+// non-increasing temperature column is rejected.
+void test_parser_temp_tables() {
+  const std::string deck = R"(
+*MATERIAL, NAME=EL
+*CONDUCTIVITY
+50., 0.
+100., 200.
+*SPECIFIC HEAT
+400., 0.
+600., 100.
+*EXPANSION, ZERO=20.
+1.0e-5, 0.
+1.4e-5, 500.
+)";
+  const Model m = io::parse_inp(deck);
+  const Material& mat = m.materials.at("EL");
+  CX_CHECK(mat.thermal->conductivity.value.size() == 2);
+  CX_NEAR(mat.thermal->conductivity.at(100.0), 75.0, 1e-9);   // midway 50..100
+  CX_CHECK(mat.thermal->specific_heat.value.size() == 2);
+  CX_NEAR(mat.thermal->specific_heat.at(50.0), 500.0, 1e-9);
+  CX_CHECK(mat.expansion->alpha.value.size() == 2);
+  CX_NEAR(mat.expansion->t_ref, 20.0, 1e-12);
+  CX_NEAR(mat.expansion->alpha.at(250.0), 1.2e-5, 1e-12);
+  CX_CHECK(m.has_temp_dependent_thermal());
+
+  bool threw = false;
+  try {
+    io::parse_inp("*MATERIAL, NAME=X\n*CONDUCTIVITY\n50., 100.\n60., 100.\n");
+  } catch (const io::ParseError&) {
+    threw = true;
+  }
+  CX_CHECK(threw);
+}
+
 }  // namespace
 
 int main() {
@@ -229,6 +383,11 @@ int main() {
   test_dflux_vector();
   test_parser_and_solve();
   test_parser_film_radiate_transient();
+  test_heat_flux_bar();
+  test_property_table_interpolation();
+  test_temp_dependent_conductivity_bar();
+  test_constant_table_unchanged();
+  test_parser_temp_tables();
   if (cxtest::g_failures == 0) std::printf("test_thermal: OK\n");
   CX_MAIN_RETURN();
 }

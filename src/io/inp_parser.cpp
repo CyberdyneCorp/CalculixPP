@@ -123,8 +123,41 @@ class Parser {
     return std::move(model_);
   }
 
+ public:
+  // Parse a deck into its list of *STEP models (spec: multi-step analysis). Each
+  // *STEP...*END STEP block is snapshotted at *END STEP as one fully-accumulated
+  // Model (loads/BCs/procedure/controls/active-element mask carried forward from the
+  // prior step, OP=NEW resetting per step; sections accumulate so *CHANGE SOLID
+  // SECTION rebinds at the boundary). Global (pre-step) data — mesh, nsets/elsets/
+  // surfaces, materials, amplitudes, physical constants, constraints — is shared, so
+  // the returned models differ only in their step-varying state. A single-*STEP deck
+  // returns exactly one model that is byte-for-byte the parse_inp() model.
+  std::vector<Model> run_steps(const std::string& text) {
+    const std::vector<Line> lines = preprocess(text);
+    for (const Line& ln : lines) {
+      const std::vector<std::string> fields = split_fields(ln.text);
+      if (fields.empty()) continue;
+      if (fields.front().rfind("*", 0) == 0)
+        begin_card(fields, ln.number);
+      else
+        data_line(fields, ln.number);
+    }
+    // A deck may omit *END STEP on its last step (or have a single implicit block);
+    // if the current step accumulated any step content beyond what was snapshotted,
+    // capture it. `in_step_` tracks whether we are inside an unterminated block.
+    if (in_step_) snapshot_step();
+    if (steps_.empty()) steps_.push_back(model_);  // no *STEP at all -> one model
+    // Flush the shared sets/surfaces into every step model's mesh.
+    for (Model& m : steps_) flush_sets_into(m);
+    return std::move(steps_);
+  }
+
  private:
   Model model_;
+  // Per-step snapshots captured at *END STEP (see run_steps). Each is a copy of the
+  // accumulated model_ at that boundary; sets are flushed into their meshes at the end.
+  std::vector<Model> steps_;
+  bool in_step_ = false;  // true between *STEP and *END STEP
   std::string card_;                                        // normalized keyword
   std::unordered_map<std::string, std::string> params_;     // normalized key -> value
   std::string cur_material_;
@@ -215,9 +248,13 @@ class Parser {
     // Cards that carry no data or need setup at declaration time.
     static const std::vector<std::string> ignored = {
         "*NODEPRINT",   "*ELPRINT",     "*NODEFILE",    "*ELFILE",
-        "*CONTACTFILE", "*OUTPUT",      "*RESTART",     "*STEP",
-        "*ENDSTEP",     "*HEADING",     "*SECTIONPRINT"};
-    if (card_ == "*STATIC") {
+        "*CONTACTFILE", "*OUTPUT",      "*RESTART",
+        "*HEADING",     "*SECTIONPRINT"};
+    if (card_ == "*STEP") {
+      begin_step();
+    } else if (card_ == "*ENDSTEP") {
+      end_step();
+    } else if (card_ == "*STATIC") {
       select_solver(line);
       begin_static();
     } else if (card_ == "*HEATTRANSFER") {
@@ -359,8 +396,9 @@ class Parser {
         {"*MEMBRANESECTION",
          "membrane sections — deferred, needs shell kinematics (tasks 3.4)"},
         {"*VIEWFACTOR",
-         "cavity radiation view factors — deferred, needs the O(n^2) view-factor "
-         "engine (same task as *RADIATE ...,CR; tasks 3.4)"},
+         "the *VIEWFACTOR read/write-to-file control is not implemented; cavity "
+         "radiation itself (*RADIATE ...,CR) IS supported — the view factors are "
+         "computed internally, so drop *VIEWFACTOR (tasks 3.4)"},
     };
     const auto it = deferred.find(card_);
     if (it != deferred.end())
@@ -412,6 +450,29 @@ class Parser {
       throw ParseError(line, "solver not available: SOLVER=" + param("SOLVER"));
     }
   }
+
+  // *STEP: open a new analysis step (spec: multi-step analysis). Reset the per-step
+  // OP=NEW guards so an OP=NEW load/BC card resets once per step (CalculiX's
+  // once-per-type-per-step rule), and clear the heat-step flag so each step's
+  // procedure card re-selects the routing. All accumulated loads/BCs/state persist
+  // (they carry forward from the prior step); OP=NEW inside the step clears them.
+  void begin_step() {
+    in_step_ = true;
+    op_seen_cload_ = op_seen_dload_ = op_seen_boundary_ = false;
+    op_seen_cflux_ = op_seen_dflux_ = false;
+    heat_step_ = false;
+  }
+
+  // *END STEP: snapshot the fully-accumulated model as this step's Model.
+  void end_step() {
+    snapshot_step();
+    in_step_ = false;
+  }
+
+  // Capture the current accumulated model_ as one step. Called at *END STEP (and, for
+  // an unterminated final block, at end of parse). The snapshot is a plain copy — the
+  // shared sets are flushed into its mesh later by flush_sets_into.
+  void snapshot_step() { steps_.push_back(model_); }
 
   // *STATIC card: DIRECT parameter fixes the increment (no auto resizing).
   void begin_static() {
@@ -471,36 +532,53 @@ class Parser {
   void expansion_data(const std::vector<std::string>& f, int line) {
     if (cur_material_.empty())
       throw ParseError(line, "*EXPANSION without *MATERIAL");
-    if (f.empty() || f[0].empty())
-      throw ParseError(line, "*EXPANSION needs a coefficient");
-    ensure_expansion().alpha = to_double(f[0], line);
+    append_property_row(ensure_expansion().alpha, f, line, "*EXPANSION");
   }
 
-  // *COUPLED TEMPERATURE-DISPLACEMENT: select the coupled thermomechanical procedure.
-  // A heat step for the thermal cards (temperature BCs, fluxes, film) but its solve
-  // also computes the displacement/thermal-stress field. The one-way (sequential)
-  // scheme solves the steady thermal field, applies the thermal strain, then solves
-  // the mechanical field. (spec: heat-transfer — coupled.) `line` keeps the handler
-  // signature uniform.
+  // *COUPLED TEMPERATURE-DISPLACEMENT[, SOLUTIONS=MONOLITHIC|STAGGERED]: select the
+  // coupled thermomechanical procedure. A heat step for the thermal cards (temperature
+  // BCs, fluxes, film) whose solve also computes the displacement/thermal-stress field.
+  // SOLUTIONS= picks the scheme (default STAGGERED — its single-pass degeneracy is the
+  // historical one-way solve; MONOLITHIC assembles the 4-DOF/node system). Both agree
+  // for a pure thermal-stress problem. (spec: heat-transfer — coupled.) `line` keeps the
+  // handler signature uniform.
   void begin_coupled(int /*line*/) {
     heat_step_ = true;  // thermal cards (temperature BCs, flux, film) route to thermal
     model_.procedure = Procedure::Coupled;
+    const std::string sol = param("SOLUTIONS");
+    if (sol == "MONOLITHIC")
+      model_.coupled_scheme = CoupledScheme::Monolithic;
+    else if (sol == "STAGGERED")
+      model_.coupled_scheme = CoupledScheme::Staggered;
+  }
+
+  // Append one (value[, temperature]) row to a temperature-dependent property table.
+  // A row with only a value (or a bare 0 temperature on the first row) is the constant
+  // case; multiple rows form a piecewise-linear k(T)/c(T)/alpha(T). Temperatures must
+  // be strictly increasing (CalculiX requirement); an omitted temperature defaults 0.
+  void append_property_row(PropertyTable& table, const std::vector<std::string>& f,
+                           int line, const char* card) {
+    if (f.empty() || f[0].empty())
+      throw ParseError(line, std::string(card) + " needs a value");
+    const Real value = to_double(f[0], line);
+    const Real temperature = (f.size() > 1 && !f[1].empty()) ? to_double(f[1], line) : 0.0;
+    if (!table.temp.empty() && temperature <= table.temp.back())
+      throw ParseError(line, std::string(card) +
+                                 " temperatures must strictly increase");
+    table.value.push_back(value);
+    table.temp.push_back(temperature);
   }
 
   void conductivity_data(const std::vector<std::string>& f, int line) {
     if (cur_material_.empty())
       throw ParseError(line, "*CONDUCTIVITY without *MATERIAL");
-    if (f.empty() || f[0].empty())
-      throw ParseError(line, "*CONDUCTIVITY needs a value");
-    ensure_thermal().conductivity = to_double(f[0], line);
+    append_property_row(ensure_thermal().conductivity, f, line, "*CONDUCTIVITY");
   }
 
   void specific_heat_data(const std::vector<std::string>& f, int line) {
     if (cur_material_.empty())
       throw ParseError(line, "*SPECIFIC HEAT without *MATERIAL");
-    if (f.empty() || f[0].empty())
-      throw ParseError(line, "*SPECIFIC HEAT needs a value");
-    ensure_thermal().specific_heat = to_double(f[0], line);
+    append_property_row(ensure_thermal().specific_heat, f, line, "*SPECIFIC HEAT");
   }
 
   // *PHYSICAL CONSTANTS: ABSOLUTE ZERO / STEFAN BOLTZMANN carried as card
@@ -547,21 +625,24 @@ class Parser {
       model_.films.push_back(Film{eid, face, sink, h, amp});
   }
 
-  // *RADIATE data: "elem_or_elset, R<face>, ambient_temp, emissivity". Applies
-  // surface-to-ambient radiation q = eps sigma (T^4 - T_amb^4) on the face. Cavity
-  // radiation (label CR / view factors) is deferred.
+  // *RADIATE data: "elem_or_elset, R<face>[CR], ambient_temp, emissivity". Two forms:
+  //   R<face>       surface-to-ambient q = eps sigma (T^4 - T_amb^4) against a fixed
+  //                 ambient temperature (field 3);
+  //   R<face>CR     gray-body cavity patch — the face joins the radiating enclosure
+  //                 whose net flux is computed from the view factors between all CR
+  //                 faces (field 3, the environment temperature, is optional/ignored
+  //                 in this closed-enclosure slice; field 4 is the emissivity).
   void radiate_data(const std::vector<std::string>& f, int line) {
     if (f.size() < 4) throw ParseError(line, "*RADIATE needs elem,R<face>,ambient,eps");
-    if (upper(f[1]).rfind("CR", 0) == 0)
-      throw ParseError(line,
-                       "*RADIATE cavity radiation (CR / view factors) is not "
-                       "implemented yet; only surface-to-ambient R<face> is supported");
-    const int face = face_label(f[1], 'R', "*RADIATE", line);
-    const Real amb = to_double(f[2], line);
+    std::string label = upper(f[1]);
+    const bool cavity = label.size() >= 2 && label.compare(label.size() - 2, 2, "CR") == 0;
+    if (cavity) label.erase(label.size() - 2);  // strip the CR suffix -> R<face>
+    const int face = face_label(label, 'R', "*RADIATE", line);
+    const Real amb = f[2].empty() ? 0.0 : to_double(f[2], line);
     const Real eps = to_double(f[3], line);
     const std::string amp = param("AMPLITUDE");
     for (const Index eid : elem_refs(f[0], line))
-      model_.radiates.push_back(Radiate{eid, face, amb, eps, amp});
+      model_.radiates.push_back(Radiate{eid, face, amb, eps, cavity, amp});
   }
 
   // *CFLUX data: "node_or_nset, dof, value". The dof (0 or 11) selects the
@@ -1352,6 +1433,9 @@ class Parser {
     const int d2 = f.size() > 2 && !f[2].empty() ? static_cast<int>(to_index(f[2], line)) : d1;
     const Real val = f.size() > 3 ? to_double(f[3], line) : 0.0;
     const std::string amp = param("AMPLITUDE");
+    // *BOUNDARY, FIXED holds each listed DOF at its currently-attained (deformed)
+    // value; the multi-step driver resolves that at solve time (see Spc::fixed).
+    const bool fixed = params_.count("FIXED") != 0;
     // Temperature DOF: CalculiX numbers the nodal temperature as DOF 11 (and accepts
     // 0 as the temperature DOF in *CFLUX). In a heat step, *BOUNDARY on DOF 11 (or 0)
     // prescribes a temperature; mechanical DOFs 1..3 still prescribe displacements.
@@ -1362,7 +1446,7 @@ class Parser {
         continue;
       }
       for (int c = d1; c <= d2 && c <= kDofsPerNode; ++c)
-        model_.spcs.push_back(Spc{nd, c, val, amp});
+        model_.spcs.push_back(Spc{nd, c, val, amp, fixed});
     }
   }
 
@@ -1503,10 +1587,15 @@ class Parser {
       s.faces.emplace_back(eid, face);
   }
 
-  void flush_sets() {
-    for (auto& [name, ids] : nsets_) model_.mesh.add_nset(name, ids);
-    for (auto& [name, ids] : elsets_) model_.mesh.add_elset(name, ids);
-    for (auto& s : surfaces_) model_.mesh.add_surface(std::move(s));
+  void flush_sets() { flush_sets_into(model_); }
+
+  // Add the parsed nsets/elsets/surfaces into `m`'s mesh. Used for the single-model
+  // path (into model_) and for each step model in run_steps. Surfaces are copied (not
+  // moved) so several step meshes can each receive them.
+  void flush_sets_into(Model& m) {
+    for (auto& [name, ids] : nsets_) m.mesh.add_nset(name, ids);
+    for (auto& [name, ids] : elsets_) m.mesh.add_elset(name, ids);
+    for (const auto& s : surfaces_) m.mesh.add_surface(s);
   }
 };
 
@@ -1514,12 +1603,24 @@ class Parser {
 
 Model parse_inp(const std::string& text) { return Parser{}.run(text); }
 
+std::vector<Model> parse_inp_steps(const std::string& text) {
+  return Parser{}.run_steps(text);
+}
+
 Model parse_inp_file(const std::string& path) {
   std::ifstream in(path);
   if (!in) throw ParseError(0, "cannot open file '" + path + "'");
   std::stringstream ss;
   ss << in.rdbuf();
   return parse_inp(ss.str());
+}
+
+std::vector<Model> parse_inp_steps_file(const std::string& path) {
+  std::ifstream in(path);
+  if (!in) throw ParseError(0, "cannot open file '" + path + "'");
+  std::stringstream ss;
+  ss << in.rdbuf();
+  return parse_inp_steps(ss.str());
 }
 
 }  // namespace cxpp::io

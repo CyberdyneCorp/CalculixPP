@@ -631,6 +631,47 @@ std::vector<Real> element_thermal_load(ElementType type,
   return fe;
 }
 
+std::vector<Real> element_thermal_coupling(ElementType type,
+                                           std::span<const Vec3> coords, const D6& D,
+                                           Real alpha) {
+  const int n = nodes_per_element(type);
+  const int ndof = n * kDofsPerNode;
+  std::vector<Real> C(static_cast<std::size_t>(ndof) * static_cast<std::size_t>(n), 0.0);
+  std::array<std::array<Real, 3>, kMaxNodes> g{};
+
+  // D applied to the unit isotropic thermal strain {alpha,alpha,alpha,0,0,0} — the
+  // per-unit-temperature thermal stress, constant over the element for constant alpha.
+  const Voigt6 eps_unit{alpha, alpha, alpha, 0.0, 0.0, 0.0};
+  Voigt6 sig_unit{};
+  for (int i = 0; i < kVoigt; ++i) {
+    Real v = 0.0;
+    for (int j = 0; j < kVoigt; ++j)
+      v += D[static_cast<std::size_t>(i)][static_cast<std::size_t>(j)] *
+           eps_unit[static_cast<std::size_t>(j)];
+    sig_unit[static_cast<std::size_t>(i)] = v;
+  }
+
+  for (const GaussPoint& gp : gauss_rule(type)) {
+    const Shape s = shape(type, gp.xi, gp.et, gp.ze);
+    const Real det = physical_gradients(s, coords, g);
+    const Real scale = det * gp.w;
+    // fbar[a] = B_a^T (D eps_unit) at this Gauss point (force per unit temperature).
+    for (int a = 0; a < ndof; ++a) {
+      const int ka = a / kDofsPerNode, da = a % kDofsPerNode;
+      Real fbar = 0.0;
+      for (int row = 0; row < kVoigt; ++row)
+        fbar += b_entry(row, g[static_cast<std::size_t>(ka)], da) *
+                sig_unit[static_cast<std::size_t>(row)];
+      fbar *= scale;
+      // Spread over the nodal temperature shape: C[a][j] += fbar * N_j.
+      for (int jn = 0; jn < n; ++jn)
+        C[static_cast<std::size_t>(a) * static_cast<std::size_t>(n) +
+          static_cast<std::size_t>(jn)] += fbar * s.N[static_cast<std::size_t>(jn)];
+    }
+  }
+  return C;
+}
+
 ElementResponse element_tangent_force(ElementType type, std::span<const Vec3> coords,
                                       std::span<const Vec3> ue,
                                       const MaterialModel& material,

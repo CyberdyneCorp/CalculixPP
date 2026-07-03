@@ -388,6 +388,69 @@ FaceSurface face_surface_integrals(const Mesh& mesh, Index elem_index, int face)
   return fs;
 }
 
+// Emit one physical face point from a (xi,eta) sample with a natural-domain weight w.
+FacePoint face_point_phys(const FaceGeom& fg, Real xi, Real eta, Real w) {
+  std::array<Real, 8> N{};
+  Vec3 txi{}, teta{};
+  face_point(fg, FaceGP{xi, eta, 1.0}, N, txi, teta);
+  const Vec3 nrm{txi[1] * teta[2] - txi[2] * teta[1],
+                 txi[2] * teta[0] - txi[0] * teta[2],
+                 txi[0] * teta[1] - txi[1] * teta[0]};
+  const Real jac = std::sqrt(nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]);
+  Vec3 x{0, 0, 0};
+  for (int i = 0; i < fg.kind.nf; ++i)
+    for (int d = 0; d < 3; ++d)
+      x[static_cast<std::size_t>(d)] += N[static_cast<std::size_t>(i)] *
+                                        fg.x[static_cast<std::size_t>(i)][static_cast<std::size_t>(d)];
+  return FacePoint{x, normalize(nrm), jac * w};
+}
+
+std::vector<FacePoint> face_gauss_points(const Mesh& mesh, Index elem_index, int face,
+                                         int sub) {
+  const Element& elem = mesh.elements()[static_cast<std::size_t>(elem_index)];
+  const FaceGeom fg = gather_face(mesh, elem, face);
+  if (sub < 1) sub = 1;
+
+  std::vector<FacePoint> pts;
+  // Tile the face natural domain into sub x sub subcells and apply the base Gauss rule
+  // in each; the weights scale by the subcell size so Σ w still equals the face area.
+  // Quads live on [-1,1]^2 (subcell side 2/sub, weight factor 1/sub^2); triangles use
+  // barycentric (xi,eta) on the unit triangle (uniform 1/sub^2 area split by an affine
+  // map of the base rule into each of the sub^2 small triangles).
+  const Real inv = 1.0 / static_cast<Real>(sub);
+  if (fg.kind.quad) {
+    for (int iu = 0; iu < sub; ++iu)
+      for (int iv = 0; iv < sub; ++iv) {
+        const Real u0 = -1.0 + 2.0 * iu * inv, v0 = -1.0 + 2.0 * iv * inv;
+        for (const FaceGP& gp : face_gauss(fg.kind)) {
+          const Real xi = u0 + (gp.xi + 1.0) * inv;   // map [-1,1] -> subcell
+          const Real eta = v0 + (gp.eta + 1.0) * inv;
+          pts.push_back(face_point_phys(fg, xi, eta, gp.w * inv * inv));
+        }
+      }
+    return pts;
+  }
+  // Triangle: split the unit reference triangle into sub^2 small triangles (the usual
+  // upright + inverted tiling) and map the base 3-point rule into each with weight/sub^2.
+  for (int row = 0; row < sub; ++row)
+    for (int col = 0; col < sub - row; ++col) {
+      // Upright small triangle with corners (a0,b0),(a0+inv,b0),(a0,b0+inv).
+      const Real a0 = col * inv, b0 = row * inv;
+      for (const FaceGP& gp : face_gauss(fg.kind)) {
+        const Real xi = a0 + gp.xi * inv, eta = b0 + gp.eta * inv;
+        pts.push_back(face_point_phys(fg, xi, eta, gp.w * inv * inv));
+      }
+      if (col < sub - row - 1) {  // inverted small triangle fills the gap
+        const Real ai = a0 + inv, bi = b0 + inv;
+        for (const FaceGP& gp : face_gauss(fg.kind)) {
+          const Real xi = ai - gp.xi * inv, eta = bi - gp.eta * inv;
+          pts.push_back(face_point_phys(fg, xi, eta, gp.w * inv * inv));
+        }
+      }
+    }
+  return pts;
+}
+
 std::vector<Real> thermal_load_vector(const Model& model, Real lambda) {
   const Mesh& mesh = model.mesh;
   std::vector<Real> q(mesh.num_nodes(), 0.0);
@@ -434,6 +497,7 @@ std::vector<Real> thermal_strain_load_vector(const Model& model, Real lambda) {
     coords.resize(static_cast<std::size_t>(n));
     te.resize(static_cast<std::size_t>(n));
     bool any_temp = false;
+    Real tsum = 0.0;  // sum of nodal applied temperatures (for alpha(T) evaluation)
     std::vector<Index> nidx(static_cast<std::size_t>(n));
     for (int i = 0; i < n; ++i) {
       const Index ni = mesh.node_index(elem.nodes[static_cast<std::size_t>(i)]);
@@ -441,16 +505,18 @@ std::vector<Real> thermal_strain_load_vector(const Model& model, Real lambda) {
       nidx[static_cast<std::size_t>(i)] = ni;
       coords[static_cast<std::size_t>(i)] = mesh.nodes()[static_cast<std::size_t>(ni)].x;
       const auto it = model.applied_temperature.find(elem.nodes[static_cast<std::size_t>(i)]);
-      const Real dT = (it == model.applied_temperature.end())
-                          ? 0.0
-                          : (it->second - exp->t_ref);
-      te[static_cast<std::size_t>(i)] = lambda * dT;
-      if (dT != 0.0) any_temp = true;
+      const Real T = (it == model.applied_temperature.end()) ? exp->t_ref : it->second;
+      te[static_cast<std::size_t>(i)] = lambda * (T - exp->t_ref);
+      tsum += T;
+      if (T != exp->t_ref) any_temp = true;
     }
     if (!any_temp) continue;
+    // Temperature-dependent alpha(T) is evaluated at the element mean temperature
+    // (constant tables return their single value, so a constant deck is unchanged).
+    const Real alpha = exp->alpha.at(tsum / static_cast<Real>(n));
     const D6 D = elastic_iso_D(elastic[e]);
     const std::vector<Real> fe =
-        element_thermal_load(elem.type, coords, D, exp->alpha, te);
+        element_thermal_load(elem.type, coords, D, alpha, te);
     for (int a = 0; a < n * kDofsPerNode; ++a)
       f[static_cast<std::size_t>(nidx[static_cast<std::size_t>(a / kDofsPerNode)]) *
             kDofsPerNode +

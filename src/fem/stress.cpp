@@ -6,16 +6,11 @@
 #include <vector>
 
 #include "calculixpp/fem/element.hpp"
+#include "calculixpp/fem/extrapolation.hpp"
 #include "calculixpp/fem/loads.hpp"
 
 namespace cxpp::fem {
 namespace {
-
-// C3D10 corner extrapolation matrix a4 (inverse of the linear-tet shape functions
-// at the 4 Gauss points) and midside adjacency (nonei10), from extrapolate.f.
-constexpr Real kA4diag = 1.927050983124842;
-constexpr Real kA4off = -0.309016994374947;
-constexpr int kMid[6][2] = {{0, 1}, {1, 2}, {2, 0}, {0, 3}, {1, 3}, {2, 3}};
 
 // Integration-point strain (engineering shear) and stress from displacements. The
 // reported `strain` is the total mechanical strain B u; the stress uses the
@@ -45,39 +40,10 @@ void strain_stress_at(const std::array<std::array<Real, 3>, kMaxNodes>& g, int n
   }
 }
 
-// Extrapolate integration-point Voigt6 values to element nodes (C3D4 constant;
-// C3D10 a4 corners + nonei10 midside averaging). Hex/wedge families use the
-// mean of their Gauss-point values at every node (a valid, order-0 recovery; the
-// per-topology extrapolation matrices are a later refinement — nodal stress is not
-// part of the displacement-accuracy gate).
-void extrapolate_to_nodes(ElementType type, int n,
-                          const std::vector<Voigt6>& gp,
+// Extrapolate integration-point Voigt6 values to element nodes via the shared scheme.
+void extrapolate_to_nodes(ElementType type, int n, const std::vector<Voigt6>& gp,
                           std::vector<Voigt6>& nodal) {
-  if (type == ElementType::C3D4) {
-    for (int i = 0; i < n; ++i) nodal[static_cast<std::size_t>(i)] = gp[0];
-    return;
-  }
-  if (type != ElementType::C3D10) {
-    Voigt6 mean{};
-    for (const Voigt6& v : gp)
-      for (int c = 0; c < 6; ++c) mean[static_cast<std::size_t>(c)] += v[static_cast<std::size_t>(c)];
-    const Real inv = gp.empty() ? 0.0 : 1.0 / static_cast<Real>(gp.size());
-    for (int c = 0; c < 6; ++c) mean[static_cast<std::size_t>(c)] *= inv;
-    for (int i = 0; i < n; ++i) nodal[static_cast<std::size_t>(i)] = mean;
-    return;
-  }
-  for (int c = 0; c < 4; ++c)
-    for (int comp = 0; comp < 6; ++comp) {
-      Real v = 0.0;
-      for (int l = 0; l < 4; ++l)
-        v += (c == l ? kA4diag : kA4off) * gp[static_cast<std::size_t>(l)][static_cast<std::size_t>(comp)];
-      nodal[static_cast<std::size_t>(c)][static_cast<std::size_t>(comp)] = v;
-    }
-  for (int mnode = 0; mnode < 6; ++mnode)
-    for (int comp = 0; comp < 6; ++comp)
-      nodal[static_cast<std::size_t>(4 + mnode)][static_cast<std::size_t>(comp)] =
-          0.5 * (nodal[static_cast<std::size_t>(kMid[mnode][0])][static_cast<std::size_t>(comp)] +
-                 nodal[static_cast<std::size_t>(kMid[mnode][1])][static_cast<std::size_t>(comp)]);
+  extrapolate_gp_to_nodes<6>(type, n, gp, nodal);
 }
 
 // Scatter one element's internal force f_int_e = Ke_e u_e - f_th_e into the global
@@ -124,6 +90,20 @@ std::vector<Real> element_temp_change(const Model& model, const Element& elem,
   return any ? te : std::vector<Real>{};
 }
 
+// Isotropic expansion coefficient of element `elem`, evaluated at its mean applied
+// temperature for a temperature-dependent alpha(T) table (a constant table returns
+// its single value regardless, so a constant deck is byte-for-byte unchanged). Nodes
+// without an applied temperature contribute t_ref (their thermal strain is zero).
+Real element_alpha(const Model& model, const Element& elem, const Expansion& exp) {
+  const int n = nodes_per_element(elem.type);
+  Real tsum = 0.0;
+  for (int i = 0; i < n; ++i) {
+    const auto it = model.applied_temperature.find(elem.nodes[static_cast<std::size_t>(i)]);
+    tsum += (it == model.applied_temperature.end()) ? exp.t_ref : it->second;
+  }
+  return exp.alpha.at(n > 0 ? tsum / static_cast<Real>(n) : exp.t_ref);
+}
+
 // Gather an element's node indices, coordinates, and current displacements.
 void gather_element(const Mesh& mesh, const Element& elem,
                     const std::vector<Vec3>& u, std::vector<Vec3>& coords,
@@ -158,7 +138,7 @@ std::vector<Real> internal_force(const Model& model, const std::vector<Vec3>& u)
     std::vector<Real> f_th_e;
     if (!te.empty())
       f_th_e = element_thermal_load(elem.type, coords, elastic_iso_D(elastic[e]),
-                                    expansion[e]->alpha, te);
+                                    element_alpha(model, elem, *expansion[e]), te);
     accumulate_internal_force(elem.type, coords, nidx, ue, elastic[e], f_th_e, f_int);
   }
   return f_int;
@@ -195,7 +175,7 @@ void recover_fields(const Model& model, StaticFields& fields) {
 
     // Thermal strain: per-node temperature change (T - Tref) and its equivalent load.
     const std::vector<Real> te = element_temp_change(model, elem, expansion[e]);
-    const Real alpha = te.empty() ? 0.0 : expansion[e]->alpha;
+    const Real alpha = te.empty() ? 0.0 : element_alpha(model, elem, *expansion[e]);
     std::vector<Real> f_th_e;
     if (!te.empty())
       f_th_e = element_thermal_load(elem.type, coords, D, alpha, te);

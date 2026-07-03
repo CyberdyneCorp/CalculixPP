@@ -16,6 +16,8 @@
 //             *AMPLITUDE, OP=MOD|NEW.
 //   Step:     *STEP, *STATIC (incl. DIRECT + increment data line, NLGEOM accepted),
 //             *CONTROLS, *TIME POINTS, *CHANGE MATERIAL/PLASTIC/SOLID SECTION.
+//             MULTIPLE *STEP...*END STEP blocks parse into a per-step model list via
+//             parse_inp_steps (multi-step analysis); parse_inp collapses to one model.
 //   Constr.:  *EQUATION, *MPC, *RIGID BODY, *COUPLING (+*KINEMATIC/*DISTRIBUTING),
 //             *DISTRIBUTING COUPLING, *TIE.
 // Output-request cards (*NODE PRINT, *EL PRINT, *NODE FILE, *EL FILE, ...) are
@@ -34,5 +36,16 @@ struct ParseError : std::runtime_error {
 
 Model parse_inp(const std::string& text);
 Model parse_inp_file(const std::string& path);
+
+// Parse a deck into its per-*STEP models (spec: multi-step analysis). Each
+// *STEP...*END STEP block becomes one fully-accumulated Model, carrying the prior
+// step's loads/BCs/procedure/controls and *MODEL CHANGE active-element mask forward;
+// OP=NEW resets a load/BC type once per step and *CHANGE SOLID SECTION / *CHANGE
+// MATERIAL rebinds at the boundary. Global (pre-step) mesh/materials/constraints are
+// shared across the returned models. A single-*STEP deck returns exactly one model
+// equal to parse_inp()'s, so the single-step path is unchanged. The step-loop driver
+// (numerics::solve_multistep_static) solves each step from the previous converged state.
+std::vector<Model> parse_inp_steps(const std::string& text);
+std::vector<Model> parse_inp_steps_file(const std::string& path);
 
 }  // namespace cxpp::io

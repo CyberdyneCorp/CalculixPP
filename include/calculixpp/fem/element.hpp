@@ -93,6 +93,19 @@ std::vector<Real> element_thermal_load(ElementType type,
                                        std::span<const Vec3> coords, const D6& D,
                                        Real alpha, std::span<const Real> te);
 
+// Thermal->mechanical COUPLING block C_e (3n x n, row-major) for the MONOLITHIC
+// coupled tangent (spec: heat-transfer — coupled): C_e[a][j] maps the nodal
+// temperature CHANGE (T_j - Tref) to the mechanical force at DOF a, i.e.
+//   f_th_e[a] = Σ_j C_e[a][j] (T_j - Tref)   ==   element_thermal_load(..., te)
+// with te_j = T_j - Tref. Concretely C_e[a][j] = ∫ B_aᵀ D {alpha,alpha,alpha,0,0,0} N_j dV,
+// the derivative of the thermal-strain load w.r.t. the nodal temperature. In the 4-DOF
+// (u,v,w,T) monolithic system it is the off-diagonal K_uT block (moved to the LHS with
+// a minus sign, since f_th enters the residual). Reuses the same Gauss/B machinery as
+// element_thermal_load, so C_e . (T - Tref) reproduces that load exactly.
+std::vector<Real> element_thermal_coupling(ElementType type,
+                                           std::span<const Vec3> coords, const D6& D,
+                                           Real alpha);
+
 // Material-point element assembly. For each Gauss point it forms the small-strain
 // B ue, evaluates `material` (advancing per-point `state`), and accumulates the
 // consistent tangent and internal force:

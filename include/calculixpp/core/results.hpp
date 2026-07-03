@@ -16,13 +16,27 @@ struct StaticFields {
   std::vector<Vec3> reaction;      // RF (f_int - f_ext)
 };
 
+// Integration-point heat flux q = -k grad(T) at one Gauss point of one element
+// (spec: results-output — *EL PRINT HFL). CalculiX prints HFL per element per
+// integration point as (qx, qy, qz); `elem_id` is the element's user id and `gp` the
+// 1-based integration-point number.
+struct HeatFluxPoint {
+  Index elem_id{};
+  int gp{};        // 1-based integration point index
+  Vec3 flux{0, 0, 0};  // q = -k grad(T)
+};
+
 // Nodal result fields for a heat-transfer step, aligned with mesh node indices
 // (spec: heat-transfer-analysis / results-output). `temperature` is the NT field;
 // `flux_reaction` is the concentrated nodal heat-flux reaction RFL at prescribed-
 // temperature nodes (Kt*T at the constrained DOFs), analogous to mechanical RF.
+// `heat_flux` is the nodal (extrapolated + averaged) heat-flux vector HFL for the
+// .frd; `hfl_points` is the raw integration-point HFL for the *EL PRINT HFL .dat.
 struct ThermalFields {
   std::vector<Real> temperature;     // NT
   std::vector<Real> flux_reaction;   // RFL
+  std::vector<Vec3> heat_flux;       // HFL (nodal, extrapolated) — for .frd
+  std::vector<HeatFluxPoint> hfl_points;  // HFL at integration points — for .dat
 };
 
 // Combined result of a *COUPLED TEMPERATURE-DISPLACEMENT step (spec:
