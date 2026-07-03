@@ -76,6 +76,65 @@ struct UserMaterial {
   bool empty() const { return name.empty(); }
 };
 
+// A temperature-dependent scalar material property, stored as a piecewise-linear
+// table of (value, temperature) rows in strictly increasing temperature (spec:
+// material-models — temperature-dependent *CONDUCTIVITY / *SPECIFIC HEAT / *EXPANSION).
+// A CalculiX property card lists one row per data line, each ending in a temperature;
+// a single (constant) row is the common case. `at(T)` interpolates piecewise-linearly
+// and CLAMPS below the first / above the last tabulated temperature (CalculiX's
+// convention). A single-row table returns that constant for every T, so a constant
+// property is byte-for-byte the pre-table behavior.
+struct PropertyTable {
+  std::vector<Real> value;  // property ordinates (k, c, or alpha), one per row
+  std::vector<Real> temp;   // temperature abscissae, strictly increasing
+
+  PropertyTable() = default;
+  // Constant (single-row) table: the common case, and a convenient implicit
+  // conversion so `Thermal{k, c}` / `Expansion{alpha, tref}` keep working.
+  PropertyTable(Real constant) : value{constant}, temp{0.0} {}
+
+  bool empty() const { return value.empty(); }
+  Real first() const { return value.empty() ? 0.0 : value.front(); }
+
+  // Piecewise-linear interpolation at temperature T, clamped outside the table.
+  Real at(Real T) const {
+    if (value.empty()) return 0.0;
+    if (value.size() == 1 || T <= temp.front()) return value.front();
+    if (T >= temp.back()) return value.back();
+    std::size_t i = 1;
+    while (i < temp.size() && T > temp[i]) ++i;
+    const Real t0 = temp[i - 1], t1 = temp[i];
+    const Real w = (t1 == t0) ? 0.0 : (T - t0) / (t1 - t0);
+    return value[i - 1] + w * (value[i] - value[i - 1]);
+  }
+};
+
+// Thermal material properties for heat-transfer analysis (spec:
+// heat-transfer-analysis / material-models — *CONDUCTIVITY, *SPECIFIC HEAT).
+// Conductivity is stored isotropically as a temperature-dependent table used in the
+// conduction element matrix Kt_e = ∫ ∇N_a·(k(T) ∇N_b) dV. Specific heat and density
+// (via Material::density) feed the transient capacitance C_e = ∫ rho*c(T) N_a N_b dV.
+// A single-row table is a constant property (byte-for-byte the pre-table path).
+struct Thermal {
+  PropertyTable conductivity;   // *CONDUCTIVITY (isotropic scalar k(T))
+  PropertyTable specific_heat;  // *SPECIFIC HEAT (c(T)), used by transient capacitance
+  bool empty() const { return conductivity.empty() && specific_heat.empty(); }
+};
+
+// Thermal-expansion data (spec: heat-transfer-analysis — coupled; material-models —
+// *EXPANSION). Isotropic linear expansion: the thermal strain is
+// eps_th = alpha (T - Tref) applied to the three normal components (Voigt xx,yy,zz),
+// which the mechanical path subtracts from the total strain so
+// sigma = D (eps_mech - eps_th). `alpha` is the *EXPANSION coefficient (isotropic,
+// temperature-dependent table evaluated at the point temperature); `t_ref` is the
+// ZERO parameter on *EXPANSION (the reference / stress-free temperature, default 0).
+// A single-row table is a constant coefficient (byte-for-byte the pre-table path).
+struct Expansion {
+  PropertyTable alpha;  // *EXPANSION coefficient (isotropic alpha(T))
+  Real t_ref{0.0};      // reference (stress-free) temperature — *EXPANSION, ZERO=
+  bool empty() const { return alpha.empty(); }
+};
+
 struct Material {
   std::string name;
   std::optional<ElasticIso> elastic;
@@ -83,6 +142,8 @@ struct Material {
   std::optional<Plastic> plastic;  // *PLASTIC / *CYCLIC HARDENING (J2 plasticity)
   std::optional<Hyperelastic> hyperelastic;  // *HYPERELASTIC / *HYPERFOAM (4.3)
   std::optional<UserMaterial> user;          // *USER MATERIAL / *DEPVAR (4.6)
+  std::optional<Thermal> thermal;            // *CONDUCTIVITY / *SPECIFIC HEAT (Phase 3)
+  std::optional<Expansion> expansion;        // *EXPANSION (thermal-strain coupling)
 
   // Effective isotropic elastic properties for the linear DOF-map / initial-tangent
   // assembly. Returns the *ELASTIC block if present; otherwise derives an equivalent

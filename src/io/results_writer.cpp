@@ -44,13 +44,9 @@ Voigt6 to_frd_order(const Voigt6& s) {
   return {s[0], s[1], s[2], s[3], s[5], s[4]};
 }
 
-}  // namespace
-
-void write_frd(const std::string& path, const Model& model, const StaticFields& f) {
-  std::ofstream out(path);
-  if (!out) throw std::runtime_error("cannot open .frd for writing: " + path);
-  const Mesh& mesh = model.mesh;
-
+// Write the .frd header + node + element mesh blocks (shared by static and thermal
+// result writers). Leaves the stream positioned to append result datasets.
+void write_frd_mesh(std::ofstream& out, const Mesh& mesh) {
   out << "    1C\n";
   out << "    1UUSER   CalculiX++\n";
 
@@ -72,6 +68,15 @@ void write_frd(const std::string& path, const Model& model, const StaticFields& 
     out << "\n";
   }
   out << " -3\n";
+}
+
+}  // namespace
+
+void write_frd(const std::string& path, const Model& model, const StaticFields& f) {
+  std::ofstream out(path);
+  if (!out) throw std::runtime_error("cannot open .frd for writing: " + path);
+  const Mesh& mesh = model.mesh;
+  write_frd_mesh(out, mesh);
 
   auto dataset_header = [&](const char* name, int ncomp) {
     out << "  100CL  101" << e12_5(1.0) << i10(static_cast<long>(mesh.num_nodes()))
@@ -122,6 +127,19 @@ void write_frd(const std::string& path, const Model& model, const StaticFields& 
     out << " -1" << i10(mesh.nodes()[i].id) << e12_5(f.reaction[i][0])
         << e12_5(f.reaction[i][1]) << e12_5(f.reaction[i][2]) << "\n";
   out << " -3\n";
+
+  // CONTACT (CSTR): per-slave-node contact pressure / status / gap. Nodal dataset over
+  // the slave nodes only (a contact deck; omitted otherwise). (spec: contact — output.)
+  if (!f.contact.empty()) {
+    dataset_header("CONTACT", 3);
+    out << " -5  CPRESS      1    1    1    0\n";
+    out << " -5  CSTATUS     1    1    1    0\n";
+    out << " -5  CGAP        1    1    1    0\n";
+    for (const ContactPoint& c : f.contact)
+      out << " -1" << i10(c.node_id) << e12_5(c.p)
+          << e12_5(c.closed ? 1.0 : 0.0) << e12_5(c.gap) << "\n";
+    out << " -3\n";
+  }
   out << " 9999\n";
 }
 
@@ -153,6 +171,69 @@ void write_dat(const std::string& path, const Model& model, const StaticFields& 
   for (std::size_t i = 0; i < mesh.num_nodes(); ++i)
     out << i10(mesh.nodes()[i].id) << e12_5(f.reaction[i][0])
         << e12_5(f.reaction[i][1]) << e12_5(f.reaction[i][2]) << "\n";
+
+  // Contact stresses CSTR per slave node (*CONTACT PRINT/FILE CSTR): status (1=CLOSED /
+  // 0=OPEN), normal pressure, signed gap, and tangential traction. Emitted only for a
+  // contact deck (f.contact non-empty). (spec: contact — contact output.)
+  if (!f.contact.empty()) {
+    out << "\n contact stress (slave node, status, pressure, gap, tang.traction)\n\n";
+    for (const ContactPoint& c : f.contact)
+      out << i10(c.node_id) << i10(c.closed ? 1 : 0).substr(6) << e12_5(c.p)
+          << e12_5(c.gap) << e12_5(c.tau) << "\n";
+  }
+}
+
+void write_frd(const std::string& path, const Model& model, const ThermalFields& t) {
+  std::ofstream out(path);
+  if (!out) throw std::runtime_error("cannot open .frd for writing: " + path);
+  const Mesh& mesh = model.mesh;
+  write_frd_mesh(out, mesh);
+
+  // NDTEMP scalar temperature dataset (CGX field name NDTEMP / component T1).
+  out << "  100CL  101" << e12_5(1.0) << i10(static_cast<long>(mesh.num_nodes()))
+      << "                     0    1           1\n";
+  out << " -4  NDTEMP      1    1\n";
+  out << " -5  T           1    1    0    0\n";
+  for (std::size_t i = 0; i < mesh.num_nodes(); ++i)
+    out << " -1" << i10(mesh.nodes()[i].id) << e12_5(t.temperature[i]) << "\n";
+  out << " -3\n";
+
+  // FLUX vector dataset (nodal, extrapolated heat flux HFL; CGX field FLUX / F1..F3).
+  if (!t.heat_flux.empty()) {
+    out << "  100CL  101" << e12_5(1.0) << i10(static_cast<long>(mesh.num_nodes()))
+        << "                     0    1           1\n";
+    out << " -4  FLUX        4    1\n";
+    for (const char* c : {"F1", "F2", "F3"})
+      out << " -5  " << c << "          1    2    " << (c[1]) << "    0\n";
+    for (std::size_t i = 0; i < mesh.num_nodes(); ++i)
+      out << " -1" << i10(mesh.nodes()[i].id) << e12_5(t.heat_flux[i][0])
+          << e12_5(t.heat_flux[i][1]) << e12_5(t.heat_flux[i][2]) << "\n";
+    out << " -3\n";
+  }
+  out << " 9999\n";
+}
+
+void write_dat(const std::string& path, const Model& model, const ThermalFields& t) {
+  std::ofstream out(path);
+  if (!out) throw std::runtime_error("cannot open .dat for writing: " + path);
+  const Mesh& mesh = model.mesh;
+
+  out << "\n temperatures (t)\n\n";
+  for (std::size_t i = 0; i < mesh.num_nodes(); ++i)
+    out << i10(mesh.nodes()[i].id) << e12_5(t.temperature[i]) << "\n";
+
+  out << "\n heat generation (rfl)\n\n";
+  for (std::size_t i = 0; i < mesh.num_nodes(); ++i)
+    out << i10(mesh.nodes()[i].id) << e12_5(t.flux_reaction[i]) << "\n";
+
+  // Integration-point heat flux HFL (*EL PRINT HFL), matching CalculiX's block layout
+  // "heat flux (elem, integ.pnt.,qx,qy,qz)": one row per element per Gauss point.
+  if (!t.hfl_points.empty()) {
+    out << "\n heat flux (elem, integ.pnt.,qx,qy,qz)\n\n";
+    for (const HeatFluxPoint& p : t.hfl_points)
+      out << i10(p.elem_id) << i10(p.gp).substr(6) << e12_5(p.flux[0])
+          << e12_5(p.flux[1]) << e12_5(p.flux[2]) << "\n";
+  }
 }
 
 }  // namespace cxpp::io

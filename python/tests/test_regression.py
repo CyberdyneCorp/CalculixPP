@@ -46,6 +46,7 @@ CCX_TEST = "/home/leonardo/work/CalculiX/test"
 #   achtel2       1e-4      C3D20R + 2-term *EQUATION   (obs 1.27e-7)
 #   achtel9       1e-4      C3D20R + 9-term *EQUATION   (obs 1.45e-7)
 #   beam8p_mpc    1e-4      C3D8 + *EQUATION on a beam  (obs 1.15e-8, 1 node ref)
+#   beamt         1e-4      C3D20R + *EXPANSION thermal stress (obs 2.43e-6) — Phase 3
 REFERENCE_CORPUS = [
     ("beam10p", 1e-4, "C3D10 quadratic-tet cantilever"),
     ("beam8p", 1e-4, "C3D8 linear-hex cantilever"),
@@ -55,10 +56,37 @@ REFERENCE_CORPUS = [
     ("achtel2", 1e-4, "C3D20R cube, 2-term *EQUATION"),
     ("achtel9", 1e-4, "C3D20R cube, 9-term *EQUATION"),
     ("beam8p_mpc", 1e-4, "C3D8 beam with *EQUATION"),
+    # Phase-3 thermal expansion (task 4.3): stock "heated beam between two fixed
+    # walls" deck (*EXPANSION,ZERO=293 + *TEMPERATURE 500, C3D20R). One-way thermal
+    # strain eps_th = alpha (T - Tref) reproduces the reference displacements.
+    ("beamt", 1e-4, "C3D20R beam, *EXPANSION thermal stress"),
 ]
 
 # Back-compat alias kept for any external reference to the old name.
 REFERENCE_DECKS = [deck for deck, _tol, _desc in REFERENCE_CORPUS]
+
+# --- Thermal reference corpus (Phase 3, tasks 3.1 / 3.2 / 3.3 / 6.6) ----------
+# Heat-transfer decks with a nodal-temperature .dat.ref. All are single-C3D20R-cube
+# decks (conduction is element-agnostic, sharing the mechanical shape functions/
+# Gauss rules) that isolate one thermal load path each. Each entry is
+# (deck, tol, mode, desc) where mode is "steady" (one .dat block, compared
+# directly) or "transient" (backward-Euler march to the end-of-step steady field,
+# compared against the FINAL .dat increment):
+#   oneel20cf   steady     *CFLUX  concentrated nodal heat flux (obs abs err ~1.8e-15)
+#   oneel20df   steady     *DFLUX  distributed surface flux S1 (hex face, ~1.3e-15)
+#   oneel20fi   steady     *FILM   convective film q=h(T-T_sink) on F1 (~1e-14)
+#   oneel20fi2  transient  *FILM   transient convection (backward Euler) relaxing to
+#                                  the fixed-face/film steady field (obs ~2e-6)
+# Steady fields are nodal and exact, so their tolerance is machine-precision-tight;
+# the transient deck compares the relaxed end-of-step field (looser, ~1e-4, because
+# the reference uses adaptive sub-stepping while we march fixed sub-steps).
+THERMAL_CORPUS = [
+    ("oneel20cf", 1e-9, "steady", "C3D20R cube, *CFLUX concentrated heat flux"),
+    ("oneel20df", 1e-9, "steady", "C3D20R cube, *DFLUX surface heat flux"),
+    ("oneel20fi", 1e-9, "steady", "C3D20R cube, *FILM convective boundary"),
+    ("oneel20fi2", 1e-4, "transient",
+     "C3D20R cube, transient *FILM convection relaxing to steady"),
+]
 
 # Minimal C3D4 deck: base fixed, pressure 100 on face 3 (nodes 2,3,4). The outward
 # face normal is (1,1,1)/sqrt(3) and the area sqrt(3)/2, so the total applied force
@@ -163,6 +191,587 @@ def test_reference_corpus_matches_calculix(deck, tol, desc):
     # one node against the reference.
     assert compared > 0, f"{deck}: no reference nodes matched the model"
     assert rel_l2 < tol, f"{deck} ({desc}): rel-L2 {rel_l2:.3e} >= tol {tol:.0e}"
+
+
+def parse_ref_step_displacements(path):
+    """Return a list (one per 'S T E P' block) of {node_id: (ux, uy, uz)} from a .dat.
+
+    A multi-step deck writes one displacement block per step; this splits them so each
+    step's *NODE PRINT can be compared against the driver's per-step total field."""
+    steps = []
+    cur = None
+    indisp = False
+    with open(path) as fh:
+        for line in fh:
+            if "S T E P" in line:
+                cur = {}
+                steps.append(cur)
+                indisp = False
+                continue
+            if "displacements" in line:
+                indisp = True
+                continue
+            if indisp:
+                parts = line.split()
+                if len(parts) == 4:
+                    try:
+                        cur[int(parts[0])] = [float(x) for x in parts[1:]]
+                    except ValueError:
+                        indisp = False
+                elif parts:
+                    indisp = False
+    return steps
+
+
+def test_multistep_beampfix_matches_calculix():
+    """(multi-step 5.1 / 2.4) The stock two-*STEP deck ``beampfix`` reproduces stock
+    CalculiX's per-step *NODE PRINT displacements. Step 1 is a *CLOAD; step 2 resets
+    the load (*CLOAD, OP=NEW), applies a new *CLOAD, and holds the LOAD set at its
+    step-1 (deformed) value via *BOUNDARY, FIXED. The step-loop driver carries the
+    converged displacement forward, so both steps match the reference within rel-L2.
+    This is the stock-CalculiX validation of multi-step analysis (the enabler for
+    cross-step birth-death 5.1 and OP=MOD/NEW load accumulation 2.4)."""
+    inp = os.path.join(CCX_TEST, "beampfix.inp")
+    ref_path = os.path.join(CCX_TEST, "beampfix.dat.ref")
+    if not (os.path.exists(inp) and os.path.exists(ref_path)):
+        pytest.skip("reference deck beampfix not available")
+    import calculixpp
+
+    ref_steps = parse_ref_step_displacements(ref_path)
+    res = calculixpp.solve_multistep(inp)
+    assert len(res) == 2, f"beampfix has 2 *STEP blocks, got {len(res)}"
+    assert len(ref_steps) == 2, "beampfix.dat.ref must have two S T E P blocks"
+
+    for si, r in enumerate(res):
+        ids = list(r["node_ids"])
+        U = r["displacement"]
+        rd = ref_steps[si]
+        assert rd, f"step {si + 1}: empty reference displacement block"
+        num = den = 0.0
+        compared = 0
+        for idx, nid in enumerate(ids):
+            if nid not in rd:
+                continue
+            compared += 1
+            for c in range(3):
+                d = float(U[idx][c]) - rd[nid][c]
+                num += d * d
+                den += rd[nid][c] ** 2
+        rel_l2 = math.sqrt(num / den) if den > 0 else math.sqrt(num)
+        assert compared > 0, f"step {si + 1}: no reference nodes matched"
+        assert rel_l2 < 1e-4, f"beampfix step {si + 1}: rel-L2 {rel_l2:.3e} >= 1e-4"
+
+
+def test_multistep_single_step_equals_solve():
+    """A single-*STEP deck solved via solve_multistep() returns a one-element list
+    whose displacement equals solve()'s — the multi-step path never perturbs the
+    single-step result (the critical gate, from Python)."""
+    import calculixpp
+
+    deck = """
+*NODE, NSET=NALL
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 1., 1., 0.
+4, 0., 1., 0.
+5, 0., 0., 1.
+6, 1., 0., 1.
+7, 1., 1., 1.
+8, 0., 1., 1.
+*ELEMENT, TYPE=C3D8, ELSET=EALL
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*MATERIAL, NAME=EL
+*ELASTIC
+210000., 0.3
+*SOLID SECTION, ELSET=EALL, MATERIAL=EL
+*NSET, NSET=FIX
+1, 4, 5, 8
+*NSET, NSET=LOAD
+2, 3, 6, 7
+*BOUNDARY
+FIX, 1, 3, 0.
+*STEP
+*STATIC
+*CLOAD
+LOAD, 1, 100.
+*END STEP
+"""
+    single = calculixpp.solve_text(deck)
+    multi = calculixpp.solve_multistep_text(deck)
+    assert len(multi) == 1
+    Us = single["displacement"]
+    Um = multi[0]["displacement"]
+    for i in range(len(Us)):
+        for c in range(3):
+            assert abs(float(Us[i][c]) - float(Um[i][c])) < 1e-12
+
+
+def test_multistep_two_load_steps_superpose():
+    """Two linear load steps of F each (OP=MOD accumulation) sum to the single-step 2F
+    result — the core multi-step superposition property, from Python."""
+    import calculixpp
+
+    header = """
+*NODE, NSET=NALL
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 1., 1., 0.
+4, 0., 1., 0.
+5, 0., 0., 1.
+6, 1., 0., 1.
+7, 1., 1., 1.
+8, 0., 1., 1.
+*ELEMENT, TYPE=C3D8, ELSET=EALL
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*MATERIAL, NAME=EL
+*ELASTIC
+210000., 0.3
+*SOLID SECTION, ELSET=EALL, MATERIAL=EL
+*NSET, NSET=FIX
+1, 4, 5, 8
+*NSET, NSET=LOAD
+2, 3, 6, 7
+*BOUNDARY
+FIX, 1, 3, 0.
+"""
+    two = header + (
+        "*STEP\n*STATIC\n*CLOAD\nLOAD, 1, 50.\n*END STEP\n"
+        "*STEP\n*STATIC\n*CLOAD\nLOAD, 1, 50.\n*END STEP\n"
+    )
+    one = header + "*STEP\n*STATIC\n*CLOAD\nLOAD, 1, 100.\n*END STEP\n"
+    res2 = calculixpp.solve_multistep_text(two)
+    res1 = calculixpp.solve_text(one)
+    assert len(res2) == 2
+    U2 = res2[-1]["displacement"]  # end of step 2 == total 2F state
+    U1 = res1["displacement"]
+    for i in range(len(U1)):
+        for c in range(3):
+            assert abs(float(U2[i][c]) - float(U1[i][c])) < 1e-9 * (
+                1.0 + abs(float(U1[i][c]))
+            )
+
+
+def test_multistep_element_birth_death_python():
+    """(5.1) Cross-step element birth-death: two stacked confined cubes, cube 2
+    removed in step 1 and re-added in step 2, is strain-free relative to the deformed
+    config — its step-2 stress is built only from the step-2 increment, so it is
+    non-zero yet smaller than the never-removed reference's step-2 total, and exactly
+    zero if it stays removed. Validates the *MODEL CHANGE active mask carried per step."""
+    import calculixpp
+
+    def deck(s1_mc, s2_mc, d1, d2):
+        header = """
+*NODE, NSET=NALL
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 1., 1., 0.
+4, 0., 1., 0.
+5, 0., 0., 1.
+6, 1., 0., 1.
+7, 1., 1., 1.
+8, 0., 1., 1.
+9,  0., 2., 0.
+10, 1., 2., 0.
+11, 0., 2., 1.
+12, 1., 2., 1.
+*ELEMENT, TYPE=C3D8, ELSET=CUBE1
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*ELEMENT, TYPE=C3D8, ELSET=CUBE2
+2, 4, 3, 10, 9, 8, 7, 12, 11
+*ELSET, ELSET=EALL
+1, 2
+*MATERIAL, NAME=EL
+*ELASTIC
+210000., 0.3
+*SOLID SECTION, ELSET=EALL, MATERIAL=EL
+*NSET, NSET=TOP
+9, 10, 11, 12
+*NSET, NSET=MID
+3, 4, 7, 8
+*NSET, NSET=BOT
+1, 2, 5, 6
+*NSET, NSET=ALLN
+1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12
+*BOUNDARY
+ALLN, 1, 1, 0.
+ALLN, 3, 3, 0.
+BOT, 2, 2, 0.
+MID, 2, 2, 0.
+"""
+        return header + (
+            f"*STEP\n*STATIC\n{s1_mc}*BOUNDARY\nTOP, 2, 2, {d1}\n*END STEP\n"
+            f"*STEP\n*STATIC\n{s2_mc}*BOUNDARY\nTOP, 2, 2, {d2}\n*END STEP\n"
+        )
+
+    bd = calculixpp.solve_multistep_text(
+        deck("*MODEL CHANGE, TYPE=ELEMENT, REMOVE\n2\n",
+             "*MODEL CHANGE, TYPE=ELEMENT, ADD\n2\n", 0.01, 0.02))
+    ref = calculixpp.solve_multistep_text(deck("", "", 0.01, 0.02))
+    dead = calculixpp.solve_multistep_text(
+        deck("*MODEL CHANGE, TYPE=ELEMENT, REMOVE\n2\n",
+             "*MODEL CHANGE, TYPE=ELEMENT, REMOVE\n2\n", 0.01, 0.02))
+
+    ids = list(bd[0]["node_ids"])
+    i10 = ids.index(10)  # cube-2-exclusive node
+    bd_syy_1 = float(bd[0]["stress"][i10][1])
+    bd_syy_2 = float(bd[1]["stress"][i10][1])
+    ref_syy_2 = float(ref[1]["stress"][i10][1])
+    dead_syy_2 = float(dead[1]["stress"][i10][1])
+
+    assert abs(bd_syy_1) < 1e-6            # dead in step 1 -> no stress
+    assert abs(bd_syy_2) > 1e-3            # live in step 2 -> stressed
+    assert abs(bd_syy_2) < abs(ref_syy_2)  # but less than the never-removed total
+    assert abs(dead_syy_2) < 1e-9         # removed throughout -> exactly zero
+
+
+def parse_ref_temperatures(path, last=False):
+    """Return {node_id: temperature} from a 'temperatures' block of a .dat.
+
+    A steady deck writes one block (last=False, the default). A transient deck
+    writes one block per increment; pass last=True to read the final increment
+    (the relaxed steady field at the end of the step period)."""
+    temps = {}
+    with open(path) as fh:
+        lines = fh.readlines()
+    headers = [k for k, l in enumerate(lines) if "temperatures" in l]
+    if not headers:
+        return temps
+    i = headers[-1] if last else headers[0]
+    for line in lines[i + 1:]:
+        parts = line.split()
+        if len(parts) == 2:
+            try:
+                temps[int(parts[0])] = float(parts[1])
+            except ValueError:
+                if temps:
+                    break
+        elif parts and temps:
+            break
+    return temps
+
+
+@pytest.mark.parametrize(
+    "deck,tol,mode,desc",
+    THERMAL_CORPUS,
+    ids=[d for d, _t, _m, _s in THERMAL_CORPUS],
+)
+def test_thermal_reference_corpus_matches_calculix(deck, tol, mode, desc):
+    """(3.1 / 3.2 / 3.3 / 6.6) Each heat-transfer deck reproduces stock-CalculiX
+    .dat.ref nodal temperatures within tolerance (manifest: THERMAL_CORPUS).
+
+    A steady deck is compared against the single .dat block; a transient deck
+    marches backward-Euler over the step period and is compared against the FINAL
+    increment (the relaxed steady field)."""
+    import calculixpp as cx
+
+    inp = os.path.join(CCX_TEST, deck + ".inp")
+    ref_path = os.path.join(CCX_TEST, deck + ".dat.ref")
+    if not (os.path.exists(inp) and os.path.exists(ref_path)):
+        pytest.skip(f"reference deck {deck} not available")
+    transient = mode == "transient"
+    ref = parse_ref_temperatures(ref_path, last=transient)
+    assert ref, f"{deck}: no reference temperatures parsed"
+
+    res = cx.solve(inp)
+    expected_proc = ("heat transfer transient" if transient
+                     else "heat transfer steady state")
+    assert res.get("procedure") == expected_proc, (
+        f"{deck}: procedure {res.get('procedure')!r} != {expected_proc!r}")
+    ids = res["node_ids"]
+    temp = res["temperature"]
+    id2t = {int(ids[i]): float(temp[i]) for i in range(len(ids))}
+
+    compared = 0
+    max_abs = 0.0
+    for nid, tref in ref.items():
+        if nid in id2t:
+            compared += 1
+            max_abs = max(max_abs, abs(id2t[nid] - tref))
+    assert compared > 0, f"{deck}: no reference nodes matched the model"
+    assert max_abs < tol, f"{deck} ({desc}): max abs temp err {max_abs:.3e} >= {tol:.0e}"
+
+
+def parse_ref_heat_flux(path):
+    """Return {(elem_id, gp): (qx, qy, qz)} from a *EL PRINT HFL 'heat flux' block."""
+    hfl = {}
+    with open(path) as fh:
+        lines = fh.readlines()
+    headers = [k for k, l in enumerate(lines) if "heat flux" in l]
+    if not headers:
+        return hfl
+    for line in lines[headers[0] + 1:]:
+        parts = line.split()
+        if len(parts) == 5:
+            try:
+                hfl[(int(parts[0]), int(parts[1]))] = [float(x) for x in parts[2:]]
+            except ValueError:
+                if hfl:
+                    break
+        elif parts and hfl:
+            break
+    return hfl
+
+
+def test_heat_flux_hfl_matches_calculix():
+    """(6.2) Integration-point heat flux HFL reproduces stock-CalculiX oneel20cf.dat.ref
+    *EL PRINT HFL to machine precision. The C3D20R cube driven by a *CFLUX carries a
+    uniform qx = 120 (heat generation / area) and ~1e-14 transverse flux at every one
+    of its 8 integration points; we match the reference block per (elem, integ.pnt.)."""
+    import calculixpp as cx
+
+    inp = os.path.join(CCX_TEST, "oneel20cf.inp")
+    ref_path = os.path.join(CCX_TEST, "oneel20cf.dat.ref")
+    if not (os.path.exists(inp) and os.path.exists(ref_path)):
+        pytest.skip("reference deck oneel20cf not available")
+    ref = parse_ref_heat_flux(ref_path)
+    assert ref, "no reference HFL parsed"
+
+    res = cx.solve(inp)
+    elem = res["hfl_elem"]
+    gp = res["hfl_gp"]
+    flux = res["hfl_flux"]
+    compared = 0
+    max_abs = 0.0
+    for k in range(len(elem)):
+        key = (int(elem[k]), int(gp[k]))
+        if key in ref:
+            compared += 1
+            for c in range(3):
+                max_abs = max(max_abs, abs(float(flux[k][c]) - ref[key][c]))
+    assert compared == len(ref), f"matched {compared}/{len(ref)} HFL points"
+    assert max_abs < 1e-9, f"HFL max abs err {max_abs:.3e} >= 1e-9"
+
+
+_COUPLED_BAR = """
+*NODE
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 1., 1., 0.
+4, 0., 1., 0.
+5, 0., 0., 1.
+6, 1., 0., 1.
+7, 1., 1., 1.
+8, 0., 1., 1.
+*ELEMENT, TYPE=C3D8, ELSET=EALL
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000., 0.3
+*CONDUCTIVITY
+50.
+*EXPANSION
+1.2e-5
+*SOLID SECTION, ELSET=EALL, MATERIAL=STEEL
+*STEP
+*COUPLED TEMPERATURE-DISPLACEMENT
+*BOUNDARY
+1, 11, 11, 100.
+4, 11, 11, 100.
+5, 11, 11, 100.
+8, 11, 11, 100.
+2, 11, 11, 100.
+3, 11, 11, 100.
+6, 11, 11, 100.
+7, 11, 11, 100.
+*BOUNDARY
+1, 1
+4, 1
+5, 1
+8, 1
+2, 1
+3, 1
+6, 1
+7, 1
+1, 2
+1, 3
+2, 3
+*END STEP
+"""
+
+
+def test_coupled_temperature_displacement_thermal_stress():
+    """(4.1 / 4.3) *COUPLED TEMPERATURE-DISPLACEMENT one-way coupling through the
+    Python binding: a bar heated uniformly by dT=100 with u_x fixed on both end faces
+    develops the analytical uniaxial thermal stress sigma_xx = -E*alpha*dT = -252, and
+    the result dict carries both the temperature and mechanical fields."""
+    import calculixpp as cx
+
+    res = cx.solve_text(_COUPLED_BAR)
+    assert res.get("procedure") == "coupled temperature-displacement"
+    assert "temperature" in res and "stress" in res and "reaction" in res
+    # Uniform T=100 field (Tref=0) reproduced on every node.
+    for t in res["temperature"]:
+        assert abs(float(t) - 100.0) < 1e-6
+    # sigma_xx = -E*alpha*dT on every node; lateral components relax to zero.
+    sxx_expect = -210000.0 * 1.2e-5 * 100.0
+    for row in res["stress"]:
+        assert abs(float(row[0]) - sxx_expect) < 1e-2
+        assert abs(float(row[1])) < 1e-2
+        assert abs(float(row[2])) < 1e-2
+
+
+def test_coupled_monolithic_equals_staggered():
+    """(4.1 / 4.2) The MONOLITHIC 4-DOF/node coupled solve equals the STAGGERED
+    (one-way) solve for a pure thermal-stress problem — no mechanical->thermal feedback
+    means the coupled tangent is block-triangular, so the single 4-DOF solve reproduces
+    the sequential result. Both schemes are reachable from a deck via SOLUTIONS=."""
+    import calculixpp as cx
+
+    stag = cx.solve_text(
+        _COUPLED_BAR.replace(
+            "*COUPLED TEMPERATURE-DISPLACEMENT",
+            "*COUPLED TEMPERATURE-DISPLACEMENT, SOLUTIONS=STAGGERED",
+        )
+    )
+    mono = cx.solve_text(
+        _COUPLED_BAR.replace(
+            "*COUPLED TEMPERATURE-DISPLACEMENT",
+            "*COUPLED TEMPERATURE-DISPLACEMENT, SOLUTIONS=MONOLITHIC",
+        )
+    )
+    for ts, tm in zip(stag["temperature"], mono["temperature"]):
+        assert abs(float(ts) - float(tm)) < 1e-9
+    for rs, rm in zip(stag["stress"], mono["stress"]):
+        for cs, cm in zip(rs, rm):
+            assert abs(float(cs) - float(cm)) < 1e-6
+
+
+_KT_BAR = """
+*NODE
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 1., 1., 0.
+4, 0., 1., 0.
+5, 0., 0., 1.
+6, 1., 0., 1.
+7, 1., 1., 1.
+8, 0., 1., 1.
+9, 2., 0., 0.
+10, 2., 1., 0.
+11, 2., 0., 1.
+12, 2., 1., 1.
+*ELEMENT, TYPE=C3D8, ELSET=EALL
+1, 1, 2, 3, 4, 5, 6, 7, 8
+2, 2, 9, 10, 3, 6, 11, 12, 7
+*MATERIAL, NAME=EL
+*CONDUCTIVITY
+50., 0.
+100., 100.
+*SOLID SECTION, ELSET=EALL, MATERIAL=EL
+*STEP
+*HEAT TRANSFER, STEADY STATE
+*BOUNDARY
+1, 11, 11, 0.
+4, 11, 11, 0.
+5, 11, 11, 0.
+8, 11, 11, 0.
+9, 11, 11, 100.
+10, 11, 11, 100.
+11, 11, 11, 100.
+12, 11, 11, 100.
+*END STEP
+"""
+
+
+def test_temperature_dependent_conductivity_python():
+    """(6.1) Temperature-dependent *CONDUCTIVITY k(T)=50+0.5T through the Python solve:
+    a 1-D bar (0..2) with fixed end temperatures 0 and 100 has a CONSTANT flux, so the
+    Kirchhoff transform q L = int_0^100 (50+0.5T) dT = 7500 fixes the nonlinear profile.
+    The mid-plane node (x=1) sits at Tm = -100 + sqrt(25000) ~ 58.11 (NOT 50 as a
+    constant k would give), and the hot-face heat-flux reaction sums to q A = 3750."""
+    import calculixpp as cx
+    import math
+
+    res = cx.solve_text(_KT_BAR)
+    assert res.get("procedure") == "heat transfer steady state"
+    ids = list(res["node_ids"])
+    temp = res["temperature"]
+    rfl = res["flux_reaction"]
+    coords = res["node_coords"]
+    id2i = {int(ids[i]): i for i in range(len(ids))}
+
+    Tm = -100.0 + math.sqrt(25000.0)  # ~58.113883
+    assert abs(float(temp[id2i[2]]) - Tm) < 1e-2, float(temp[id2i[2]])
+    assert float(temp[id2i[2]]) > 55.0  # meaningfully above the constant-k value 50
+
+    hot = sum(float(rfl[i]) for i in range(len(ids)) if abs(coords[i][0] - 2.0) < 1e-9)
+    assert abs(hot - 3750.0) < 1e-1, hot
+
+
+_CAVITY_PLATES = """
+*NODE
+1, -0.01, 0., 0.
+2, 0., 0., 0.
+3, 0., 1., 0.
+4, -0.01, 1., 0.
+5, -0.01, 0., 1.
+6, 0., 0., 1.
+7, 0., 1., 1.
+8, -0.01, 1., 1.
+9, 0.5, 0., 0.
+10, 0.51, 0., 0.
+11, 0.51, 1., 0.
+12, 0.5, 1., 0.
+13, 0.5, 0., 1.
+14, 0.51, 0., 1.
+15, 0.51, 1., 1.
+16, 0.5, 1., 1.
+*ELEMENT, TYPE=C3D8, ELSET=EALL
+1, 1, 2, 3, 4, 5, 6, 7, 8
+2, 9, 10, 11, 12, 13, 14, 15, 16
+*MATERIAL, NAME=EL
+*CONDUCTIVITY
+1e6
+*SOLID SECTION, ELSET=EALL, MATERIAL=EL
+*PHYSICAL CONSTANTS, ABSOLUTE ZERO=0., STEFAN BOLTZMANN=5.67E-8
+*STEP
+*HEAT TRANSFER, STEADY STATE
+*BOUNDARY
+1, 11, 11, 800.
+4, 11, 11, 800.
+5, 11, 11, 800.
+8, 11, 11, 800.
+10, 11, 11, 500.
+11, 11, 11, 500.
+14, 11, 11, 500.
+15, 11, 11, 500.
+*RADIATE
+1, R4CR, , 0.8
+2, R6CR, , 0.8
+*END STEP
+"""
+
+
+def test_cavity_radiation_parallel_plates_python():
+    """(3.4) Gray-body cavity radiation (*RADIATE ...,CR) end to end through the Python
+    binding. Two thin, high-conductivity unit-square plates face each other across a
+    gap; the plate outer faces are held at 800 K and 500 K, so each plate is essentially
+    isothermal and the cavity faces sit at the boundary temperatures. The two facing
+    patches form a 2-body enclosure (F12 = F21 = 1), so in steady state the heat that
+    conducts through the hot plate (its flux reaction) equals the classic parallel-plate
+    radiative exchange q = sigma (T1^4 - T2^4)/(1/e1 + 1/e2 - 1) over the unit area."""
+    import calculixpp as cx
+
+    res = cx.solve_text(_CAVITY_PLATES)
+    assert res.get("procedure") == "heat transfer steady state"
+    ids = list(res["node_ids"])
+    coords = res["node_coords"]
+    rfl = res["flux_reaction"]
+
+    sig, Th, Tc, e = 5.67e-8, 800.0, 500.0, 0.8
+    q_expect = sig * (Th ** 4 - Tc ** 4) / (1.0 / e + 1.0 / e - 1.0)  # ~13120.4 W
+
+    # Sum the flux reaction over the hot-plate outer face (x = -0.01): in steady state it
+    # carries the full radiative heat flow Q across the cavity.
+    hot = sum(
+        float(rfl[i]) for i in range(len(ids)) if abs(coords[i][0] + 0.01) < 1e-9
+    )
+    assert abs(hot - q_expect) < 1e-1, (hot, q_expect)
+    # Energy is conserved: the cold-plate outer face absorbs the same flow (opposite sign).
+    cold = sum(
+        float(rfl[i]) for i in range(len(ids)) if abs(coords[i][0] - 0.51) < 1e-9
+    )
+    assert abs(cold + q_expect) < 1e-1, (cold, q_expect)
 
 
 def test_equation_constraint_matches_calculix():
@@ -757,3 +1366,608 @@ def test_api_parity_phase2():
     explicit = calculixpp.solve_nonlinear_text(_PLASTIC_CUBE)
     assert auto["converged"] is True and explicit["converged"] is True
     assert _rel_l2_disp(auto["displacement"], explicit["displacement"]) < 1e-12
+
+
+# --- Phase-3 thermal API parity (task 6.4) ------------------------------------
+# A minimal single-C3D8-cube steady conduction deck: face x=0 held at 0, face x=1
+# held at 100 (temperature BCs on DOF 11). The auto-dispatch routes *HEAT TRANSFER
+# to the scalar thermal solver; the result carries temperature/flux_reaction.
+_HEAT_CUBE = """
+*NODE
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 1., 1., 0.
+4, 0., 1., 0.
+5, 0., 0., 1.
+6, 1., 0., 1.
+7, 1., 1., 1.
+8, 0., 1., 1.
+*ELEMENT, TYPE=C3D8, ELSET=EALL
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*MATERIAL, NAME=COND
+*CONDUCTIVITY
+50.
+*SOLID SECTION, ELSET=EALL, MATERIAL=COND
+*STEP
+*HEAT TRANSFER, STEADY STATE
+*BOUNDARY
+1, 11, 11, 0.
+4, 11, 11, 0.
+5, 11, 11, 0.
+8, 11, 11, 0.
+2, 11, 11, 100.
+3, 11, 11, 100.
+6, 11, 11, 100.
+7, 11, 11, 100.
+*END STEP
+"""
+
+
+def test_api_parity_phase3_thermal():
+    """(6.4) API parity for the Phase-3 THERMAL track: the heat-transfer solve and
+    its nodal-temperature output are reachable from Python, the summary surface
+    reports the thermal procedure without solving, and a Phase-3 CONTACT card is
+    rejected with an actionable error (never silently mis-solved). Parity means the
+    thermal capabilities exposed in C++ each have a Python entry point."""
+    import calculixpp as cx
+
+    # solve()/solve_text() auto-dispatch a *HEAT TRANSFER deck to the thermal solver
+    # and return the scalar temperature field (NT) and heat-flux reaction (RFL).
+    res = cx.solve_text(_HEAT_CUBE)
+    assert res.get("procedure") == "heat transfer steady state"
+    for key in ("temperature", "flux_reaction", "node_ids", "node_coords",
+                "num_nodes", "num_elements", "backend"):
+        assert key in res, f"thermal result missing '{key}'"
+    ids = res["node_ids"]
+    id2t = {int(ids[i]): float(res["temperature"][i]) for i in range(len(ids))}
+    # x=0 face held at 0, x=1 face held at 100; interior obeys the linear profile.
+    for nid in (1, 4, 5, 8):
+        assert abs(id2t[nid] - 0.0) < 1e-9
+    for nid in (2, 3, 6, 7):
+        assert abs(id2t[nid] - 100.0) < 1e-9
+    # The flux reaction at the driven faces balances (sum ~ 0 for a closed system).
+    assert abs(sum(float(x) for x in res["flux_reaction"])) < 1e-6
+
+    # summary()/summary_text() report the thermal procedure without solving — the
+    # introspection surface distinguishes heat transfer from a mechanical static.
+    s = cx.summary_text(_HEAT_CUBE)
+    assert s["procedure"] == "heat transfer steady state"
+    assert cx.summary_text(C3D4_PRESSURE_DECK)["procedure"] == "static"
+
+    # Thermal contact (*GAP CONDUCTANCE) now parses and is stored on the interaction —
+    # attaching it to an interaction with no active pair is inert (the thermal cube still
+    # solves to the same field). The full gap-conductance PHYSICS is validated in the C++
+    # suite (test_thermal_contact) and the Python two-block thermal-contact deck below.
+    gap_deck = _HEAT_CUBE.replace(
+        "*STEP\n", "*SURFACE INTERACTION, NAME=SI\n*GAP CONDUCTANCE\n0.1\n*STEP\n")
+    gres = cx.solve_text(gap_deck)
+    assert "temperature" in gres  # parses + solves (inert without a contact pair)
+
+    # A genuinely-unsupported card must still raise a clear, actionable error naming the
+    # deferral, never a silent wrong solve.
+    bad_deck = _HEAT_CUBE.replace("*STEP\n", "*VIEWFACTOR\n*STEP\n")
+    with pytest.raises(RuntimeError) as ei:
+        cx.solve_text(bad_deck)
+    assert "viewfactor" in str(ei.value).lower()
+
+
+def test_api_parity_phase3_contact():
+    """(6.4) API parity for the Phase-3 CONTACT track: a *CONTACT PAIR deck is reachable
+    from Python (auto-dispatched to the nonlinear driver), the result carries the mechanical
+    fields AND the contact CSTR output (per-slave-node status/pressure/gap/tang.traction),
+    the summary reports the static procedure, and a deferred mortar pair raises an
+    actionable error. Parity: every contact capability exposed in C++ has a Python path."""
+    import calculixpp as cx
+
+    # solve()/solve_text() auto-dispatch a *CONTACT PAIR deck to the nonlinear driver and
+    # return displacement/stress/reaction PLUS the `contact` CSTR output list.
+    res = cx.solve_text(_CONTACT_TWO_BLOCK)
+    for key in ("displacement", "stress", "reaction", "contact", "converged",
+                "node_ids", "num_nodes", "num_elements", "backend"):
+        assert key in res, f"contact result missing '{key}'"
+    assert res["converged"] is True
+    assert len(res["contact"]) == 4
+    for c in res["contact"]:
+        for key in ("node", "closed", "pressure", "gap", "tau"):
+            assert key in c
+
+    # summary()/summary_text() report a contact deck's procedure without solving.
+    assert cx.summary_text(_CONTACT_TWO_BLOCK)["procedure"] == "static"
+
+    # A deferred surface-to-surface (mortar) contact pair raises an actionable error.
+    mortar = _CONTACT_TWO_BLOCK.replace("TYPE=NODE TO SURFACE", "TYPE=SURFACE TO SURFACE")
+    with pytest.raises(RuntimeError) as ei:
+        cx.solve_text(mortar)
+    m = str(ei.value).lower()
+    assert "surface-to-surface" in m or "surface to surface" in m or "mortar" in m
+
+
+# --- *MODEL CHANGE element birth-death (tasks 5.1), reachable from Python ------
+# Two confined unit C3D8 cubes stacked in y (share the y=1 face). Every node has
+# u_y=u_z=0 (so element removal never orphans a DOF) and u_x=0 on x=0 / u_x=delta
+# on x=1. Each active cube contributes -M*delta to the fixed-face x-reaction
+# (M = confined modulus), so removing a cube halves the reaction and re-adding it
+# restores the full model. `{MC}` is spliced into the single step.
+_MODEL_CHANGE_BAR = """
+*NODE, NSET=NALL
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 1., 1., 0.
+4, 0., 1., 0.
+5, 0., 0., 1.
+6, 1., 0., 1.
+7, 1., 1., 1.
+8, 0., 1., 1.
+9,  0., 2., 0.
+10, 1., 2., 0.
+11, 0., 2., 1.
+12, 1., 2., 1.
+*ELEMENT, TYPE=C3D8, ELSET=CUBE1
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*ELEMENT, TYPE=C3D8, ELSET=CUBE2
+2, 4, 3, 10, 9, 8, 7, 12, 11
+*ELSET, ELSET=EALL
+1, 2
+*MATERIAL, NAME=EL
+*ELASTIC
+210000., 0.3
+*SOLID SECTION, ELSET=EALL, MATERIAL=EL
+*BOUNDARY
+1, 2, 3
+2, 2, 3
+3, 2, 3
+4, 2, 3
+5, 2, 3
+6, 2, 3
+7, 2, 3
+8, 2, 3
+9, 2, 3
+10, 2, 3
+11, 2, 3
+12, 2, 3
+1, 1, 1
+4, 1, 1
+5, 1, 1
+8, 1, 1
+9, 1, 1
+11, 1, 1
+2, 1, 1, 0.01
+3, 1, 1, 0.01
+6, 1, 1, 0.01
+7, 1, 1, 0.01
+10, 1, 1, 0.01
+12, 1, 1, 0.01
+*STEP
+*STATIC
+{MC}*END STEP
+"""
+
+
+def _fixed_face_rx(res):
+    """Sum the x-reaction over the x=0 face nodes (ids 1,4,5,8,9,11)."""
+    node_ids = list(res["node_ids"])
+    rf = res["reaction"]
+    total = 0.0
+    for nid in (1, 4, 5, 8, 9, 11):
+        k = node_ids.index(nid)
+        total += float(rf[k][0])
+    return total
+
+
+def test_model_change_element_birth_death_python():
+    """ANALYTICAL (model change): a *MODEL CHANGE, TYPE=ELEMENT deck solves through
+    the Python solve_text() entry point, and removing an element halves the
+    fixed-face reaction while re-adding it (REMOVE then ADD) reproduces the full
+    model exactly (strain-free reactivation). Validates tasks 5.1 end to end from
+    Python (spec: model-change — removed elements carry no load / strain-free
+    reactivation, invocable from the Python bindings)."""
+    import calculixpp as cx
+
+    full = cx.solve_text(_MODEL_CHANGE_BAR.format(MC=""))
+    removed = cx.solve_text(
+        _MODEL_CHANGE_BAR.format(MC="*MODEL CHANGE, TYPE=ELEMENT, REMOVE\n2\n"))
+    readded = cx.solve_text(
+        _MODEL_CHANGE_BAR.format(
+            MC="*MODEL CHANGE, TYPE=ELEMENT, REMOVE\n2\n"
+               "*MODEL CHANGE, TYPE=ELEMENT, ADD\n2\n"))
+
+    rx_full = _fixed_face_rx(full)
+    rx_removed = _fixed_face_rx(removed)
+    rx_readded = _fixed_face_rx(readded)
+
+    # Removing one of two identical cubes halves the reaction.
+    assert abs(rx_removed - 0.5 * rx_full) < 1e-4 * abs(rx_full), (
+        f"removed {rx_removed} vs half-full {0.5 * rx_full}")
+    # REMOVE then ADD reproduces the full model to solver precision (strain-free).
+    assert abs(rx_readded - rx_full) < 1e-7 * abs(rx_full), (
+        f"re-added {rx_readded} vs full {rx_full}")
+    assert _rel_l2_disp(readded["displacement"], full["displacement"]) < 1e-10
+
+
+def test_model_change_contact_pair_parses_python():
+    """A *MODEL CHANGE, TYPE=CONTACT PAIR deck parses and solves (the contact-pair
+    record is stored for the contact workflow; it does not alter the mechanical
+    solve here). Confirms the card is accepted through the Python path (tasks 5.2,
+    parse-only)."""
+    import calculixpp as cx
+
+    with_pair = cx.solve_text(
+        _MODEL_CHANGE_BAR.format(
+            MC="*MODEL CHANGE, TYPE=CONTACT PAIR, REMOVE\nSURF_A, SURF_B\n"))
+    baseline = cx.solve_text(_MODEL_CHANGE_BAR.format(MC=""))
+    # Contact-pair model change does not touch the element assembly here.
+    assert _rel_l2_disp(with_pair["displacement"], baseline["displacement"]) < 1e-12
+
+
+# --- Node-to-surface PENALTY contact (tasks 1.4/1.5/2.1/2.2), reachable from Python ---
+# Two stacked unit C3D8 cubes meeting only through a *CONTACT PAIR (separate elements,
+# separate coincident nodes on the z=1 plane). The base is fixed at z=0; the top cube is
+# pushed down by a total force F on its top face. The load can cross the interface ONLY
+# through contact. ANALYTICAL validation: (a) the base reaction balances F exactly (the
+# interface transmits the full load — global equilibrium); (b) the interface penetration
+# is small and ~ F/(4*kappa) (the linear penalty spring). This is the required two-block
+# reference; the stock-CalculiX contact1 deck is a harder NLGEOM+exponential match and is
+# not gated here.
+_CONTACT_TWO_BLOCK = """
+*NODE, NSET=NALL
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 1., 1., 0.
+4, 0., 1., 0.
+5, 0., 0., 1.
+6, 1., 0., 1.
+7, 1., 1., 1.
+8, 0., 1., 1.
+9, 0., 0., 1.
+10, 1., 0., 1.
+11, 1., 1., 1.
+12, 0., 1., 1.
+13, 0., 0., 2.
+14, 1., 0., 2.
+15, 1., 1., 2.
+16, 0., 1., 2.
+*ELEMENT, TYPE=C3D8, ELSET=EBASE
+1, 1,2,3,4,5,6,7,8
+*ELEMENT, TYPE=C3D8, ELSET=ETOP
+2, 9,10,11,12,13,14,15,16
+*ELSET, ELSET=EALL
+EBASE, ETOP
+*NSET, NSET=NBOT
+1,2,3,4
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000., 0.3
+*SOLID SECTION, ELSET=EALL, MATERIAL=STEEL
+*BOUNDARY
+NALL,1,2
+NBOT,3,3
+*SURFACE, NAME=SMAST
+EBASE, S2
+*SURFACE, NAME=SSLAV, TYPE=NODE
+9,10,11,12
+*SURFACE INTERACTION, NAME=SI
+*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=LINEAR
+1.0e6
+*CONTACT PAIR, INTERACTION=SI, TYPE=NODE TO SURFACE
+SSLAV, SMAST
+*STEP
+*STATIC
+*CLOAD
+13,3,-25.
+14,3,-25.
+15,3,-25.
+16,3,-25.
+*NODE PRINT, NSET=NALL
+U,RF
+*END STEP
+"""
+
+
+def test_contact_two_block_equilibrium_python():
+    """Penalty node-to-surface contact end to end from Python: two stacked cubes meeting
+    only through a *CONTACT PAIR transmit the load across the interface. The base reaction
+    balances the applied load (equilibrium) and the interface penetration is small and
+    ~ F/(4*kappa)."""
+    import calculixpp as cx
+
+    r = cx.solve_text(_CONTACT_TWO_BLOCK)
+    assert r.get("converged") is True
+    ids = list(int(x) for x in r["node_ids"])
+    i = {nid: k for k, nid in enumerate(ids)}
+    U = r["displacement"]
+    RF = r["reaction"]
+    F = 100.0
+    kappa = 1.0e6
+
+    # (a) Global equilibrium: the base reaction at z=0 balances the applied downward load.
+    rf = sum(float(RF[i[n]][2]) for n in (1, 2, 3, 4))
+    assert abs(rf - F) < 1e-6 * F
+
+    # (b) Interface penetration = relative closure across the plane (master z=1 nodes 5-8
+    # vs coincident slave nodes 9-12), isolating the penalty overclosure from each cube's
+    # elastic shortening. pen ~ F/(4*kappa) = 2.5e-5, small and positive.
+    pen = sum(float(U[i[m]][2]) - float(U[i[s]][2])
+              for m, s in ((5, 9), (6, 10), (7, 11), (8, 12))) / 4.0
+    assert pen > 0.0
+    assert pen < 1e-3
+    assert abs(pen - F / (4.0 * kappa)) < 5e-6
+
+
+def test_contact_friction_stick_slip_python():
+    """Coulomb *FRICTION end to end from Python (spec: contact — tangential contact /
+    stick-slip). The two-block deck plus a *FRICTION card (mu, stick stiffness) still
+    solves and transmits the full normal load through the interface — the friction operator
+    contributes to the Newton tangent+residual and does not break the pressed-together
+    solve. (The stick<->slip return-mapping physics is validated at the operator level in
+    the C++ suite; here the end-to-end parse->route->solve path with friction is exercised.)"""
+    import calculixpp as cx
+
+    F = 100.0
+    kappa = 1.0e6
+    # Add a Coulomb *FRICTION card (mu = 0.3, stick stiffness 1e6) to the surface
+    # interaction of the pressed-together two-block deck.
+    deck = _CONTACT_TWO_BLOCK.replace(
+        "*CONTACT PAIR", "*FRICTION\n0.3, 1.0e6\n*CONTACT PAIR")
+    r = cx.solve_text(deck)
+    assert r.get("converged", True)  # the friction solve converges
+
+    # The base reaction still balances the applied normal load exactly: the interface
+    # transmits the full load with the friction operator active.
+    RF = r["reaction"]
+    nid = lambda i: i - 1  # nodes 1..16 map to indices 0..15
+    rf = sum(RF[nid(i)][2] for i in (1, 2, 3, 4))
+    assert abs(rf - F) < 1e-6 * F
+
+    # The interface penetration is still the small penalty overclosure ~ F/(4*kappa):
+    # friction does not disturb the NORMAL contact (the load is purely normal here).
+    U = r["displacement"]
+    pen = sum(U[nid(m)][2] - U[nid(s)][2]
+              for m, s in ((5, 9), (6, 10), (7, 11), (8, 12))) / 4.0
+    assert pen > 0.0
+    assert abs(pen - F / (4.0 * kappa)) < 5e-6
+
+
+# --- Thermal contact: *GAP CONDUCTANCE (tasks 2.4), reachable from Python -------
+_THERMAL_CONTACT_TWO_BLOCK = """
+*NODE, NSET=NALL
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 1., 1., 0.
+4, 0., 1., 0.
+5, 0., 0., 1.
+6, 1., 0., 1.
+7, 1., 1., 1.
+8, 0., 1., 1.
+9, 0., 0., 1.
+10, 1., 0., 1.
+11, 1., 1., 1.
+12, 0., 1., 1.
+13, 0., 0., 2.
+14, 1., 0., 2.
+15, 1., 1., 2.
+16, 0., 1., 2.
+*ELEMENT, TYPE=C3D8, ELSET=EBASE
+1, 1,2,3,4,5,6,7,8
+*ELEMENT, TYPE=C3D8, ELSET=ETOP
+2, 9,10,11,12,13,14,15,16
+*ELSET, ELSET=EALL
+EBASE, ETOP
+*NSET, NSET=NCOLD
+1,2,3,4
+*NSET, NSET=NHOT
+13,14,15,16
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000., 0.3
+*CONDUCTIVITY
+1.
+*SOLID SECTION, ELSET=EALL, MATERIAL=STEEL
+*SURFACE, NAME=SMAST
+EBASE, S2
+*SURFACE, NAME=SSLAV, TYPE=NODE
+9,10,11,12
+*SURFACE INTERACTION, NAME=SI
+*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=LINEAR
+1.E7
+*GAP CONDUCTANCE
+1.
+*CONTACT PAIR, INTERACTION=SI, TYPE=NODE TO SURFACE
+SSLAV, SMAST
+*STEP
+*HEAT TRANSFER, STEADY STATE
+*BOUNDARY
+NCOLD,11,11,0.
+NHOT,11,11,100.
+*NODE PRINT, NSET=NALL
+NT
+*END STEP
+"""
+
+
+def test_thermal_contact_gap_conductance_python():
+    """Thermal contact end to end from Python (spec: contact — thermal contact conductance;
+    tasks 2.4). Two stacked cubes touch only through a *GAP CONDUCTANCE; heat crosses the
+    interface by q = h (T_slave - T_master). The three series resistors (cube, gap, cube)
+    give the through-flux Q = dT/(2/k + 1/h) = 100/3 and the interface drop Q/h."""
+    import calculixpp as cx
+
+    r = cx.solve_text(_THERMAL_CONTACT_TWO_BLOCK)
+    assert r["procedure"] == "heat transfer steady state"
+    T = [float(x) for x in r["temperature"]]
+    ids = list(int(x) for x in r["node_ids"]) if "node_ids" in r else list(range(1, 17))
+    i = {nid: k for k, nid in enumerate(ids)}
+
+    k, h, dT = 1.0, 1.0, 100.0
+    Q = dT / (2.0 / k + 1.0 / h)  # = 100/3
+
+    tm = sum(T[i[n]] for n in (5, 6, 7, 8)) / 4.0   # master (bottom cube top)
+    ts = sum(T[i[n]] for n in (9, 10, 11, 12)) / 4.0  # slave (top cube bottom)
+    drop = ts - tm
+    assert abs(h * drop - Q) < 1e-6 * Q          # interface flux q = h dT_gap = Q
+    assert abs(drop - Q / h) < 1e-6 * (Q / h)    # gap-resistance temperature drop
+
+    # The cold-face RFL reaction (heat entering the stack) balances the through-flux Q.
+    rfl = sum(float(r["flux_reaction"][i[n]]) for n in (1, 2, 3, 4))
+    assert abs(abs(rfl) - Q) < 1e-6 * Q
+
+
+# --- Contact CSTR output (tasks 2.5 / 6.4): reading contact pressure/status ------
+# The result dict carries a `contact` list of per-slave-node dicts recovered at the
+# converged displacement: {node, closed (status), pressure (F_normal/area), gap
+# (signed), tau (tangential traction)}. This is the Python-visible CONTACT OUTPUT
+# (CSTR) that mirrors the .dat "contact stress" / .frd CPRESS/CSTATUS/CGAP blocks.
+
+
+def test_contact_output_cstr_pressure_status_python():
+    """(2.5/6.4) Read contact pressure/status from Python. The two-block pressed-together
+    solve reports every slave node CLOSED with a positive normal pressure whose sum times
+    the tributary area balances the applied load, and a small penetration gap — the
+    analytically-known interface state, exposed through the `contact` result list."""
+    import calculixpp as cx
+
+    r = cx.solve_text(_CONTACT_TWO_BLOCK)
+    assert r.get("converged") is True
+    contact = r["contact"]
+
+    # One CSTR record per slave node (the 4 coincident z=1 slave nodes 9..12).
+    assert len(contact) == 4
+    for c in contact:
+        for key in ("node", "closed", "pressure", "gap", "tau"):
+            assert key in c, f"contact record missing '{key}'"
+
+    nodes = sorted(int(c["node"]) for c in contact)
+    assert nodes == [9, 10, 11, 12]
+
+    # Every slave node is CLOSED (in contact) with a positive normal pressure and a
+    # small penetration gap (g < 0). tau == 0 (the load is purely normal, no friction).
+    for c in contact:
+        assert c["closed"] is True
+        assert c["pressure"] > 0.0
+        assert c["gap"] < 0.0
+        assert abs(c["tau"]) < 1e-9
+
+    # Global equilibrium via CSTR: sum(pressure * tributary_area) balances the load.
+    # Each of the 4 slave nodes carries a quarter of the 1x1 interface (area 0.25),
+    # so sum(p)*0.25 == F = 100.  (Equivalently every p ~ 100.)
+    F = 100.0
+    area_per_node = 0.25
+    assert abs(sum(c["pressure"] for c in contact) * area_per_node - F) < 1e-6 * F
+
+    # The penetration gap matches the linear-penalty overclosure g = -F/(4*kappa).
+    kappa = 1.0e6
+    for c in contact:
+        assert abs(c["gap"] - (-F / (4.0 * kappa))) < 5e-7
+
+
+def test_contact_output_clearance_opens_interface_python():
+    """(2.5) A *CLEARANCE larger than the geometric penetration OPENS the interface: the
+    status flips to OPEN (not closed), the reported gap becomes positive, and the pressure
+    drops to zero — the contact-output read reflects the modifier."""
+    import calculixpp as cx
+
+    # Add a *CLEARANCE (after the *CONTACT PAIR, whose surfaces it references) that
+    # exceeds the ~2.5e-5 penetration so the interface separates.
+    deck = _CONTACT_TWO_BLOCK.replace(
+        "*CONTACT PAIR, INTERACTION=SI, TYPE=NODE TO SURFACE\nSSLAV, SMAST",
+        "*CONTACT PAIR, INTERACTION=SI, TYPE=NODE TO SURFACE\nSSLAV, SMAST\n"
+        "*CLEARANCE, MASTER=SMAST, SLAVE=SSLAV, VALUE=0.01")
+    r = cx.solve_text(deck)
+    contact = r["contact"]
+    assert len(contact) == 4
+    # End to end the released top cube separates, so every slave node reports OPEN with
+    # zero contact pressure (the gap-sign offset itself is validated at a controlled
+    # displacement in the C++ suite, test_clearance_offsets_gap).
+    for c in contact:
+        assert c["closed"] is False        # clearance separates the interface -> OPEN
+        assert abs(c["pressure"]) < 1e-9   # open -> no contact pressure
+
+
+# --- Parametrized contact regression corpus (tasks 6.5 / 6.6) -------------------
+# The contact physics is validated against ANALYTICAL references, not a stock-CalculiX
+# .dat.ref: the stock contact decks (contact1..) use NLGEOM + CalculiX's exact
+# EXPONENTIAL pressure-overclosure formula + *EQUATION MPCs, a harder match that is not
+# gated (documented in tasks.md 1.5/2.1). Each corpus entry runs a self-contained deck
+# through solve_text and applies a per-deck analytical check with its own tolerance:
+#   (deck_text, tol, checker, description)
+# The checker receives the result dict and the tolerance and asserts the closed-form
+# interface state (equilibrium / penetration / gap conductance).
+
+
+def _check_two_block_equilibrium(r, tol):
+    """Two stacked cubes, load F crosses only through contact: base reaction balances
+    F, penetration ~ F/(4*kappa)."""
+    assert r.get("converged") is True
+    ids = [int(x) for x in r["node_ids"]]
+    i = {nid: k for k, nid in enumerate(ids)}
+    F, kappa = 100.0, 1.0e6
+    rf = sum(float(r["reaction"][i[n]][2]) for n in (1, 2, 3, 4))
+    assert abs(rf - F) < tol * F
+    pen = sum(float(r["displacement"][i[m]][2]) - float(r["displacement"][i[s]][2])
+              for m, s in ((5, 9), (6, 10), (7, 11), (8, 12))) / 4.0
+    assert abs(pen - F / (4.0 * kappa)) < 5e-6
+
+
+def _check_friction_equilibrium(r, tol):
+    """Same two blocks + a *FRICTION card: the normal load still crosses the interface
+    (friction contributes to the tangent/residual but the load here is purely normal)."""
+    assert r.get("converged", True)
+    ids = [int(x) for x in r["node_ids"]]
+    i = {nid: k for k, nid in enumerate(ids)}
+    F = 100.0
+    rf = sum(float(r["reaction"][i[n]][2]) for n in (1, 2, 3, 4))
+    assert abs(rf - F) < tol * F
+
+
+def _check_thermal_gap(r, tol):
+    """Two cubes touching only through *GAP CONDUCTANCE: series-resistance through-flux
+    Q = dT/(2/k + 1/h) with the gap drop Q/h."""
+    assert r["procedure"] == "heat transfer steady state"
+    T = [float(x) for x in r["temperature"]]
+    ids = [int(x) for x in r["node_ids"]]
+    i = {nid: k for k, nid in enumerate(ids)}
+    k, h, dT = 1.0, 1.0, 100.0
+    Q = dT / (2.0 / k + 1.0 / h)
+    tm = sum(T[i[n]] for n in (5, 6, 7, 8)) / 4.0
+    ts = sum(T[i[n]] for n in (9, 10, 11, 12)) / 4.0
+    assert abs(h * (ts - tm) - Q) < tol * Q
+
+
+_FRICTION_TWO_BLOCK = _CONTACT_TWO_BLOCK.replace(
+    "*CONTACT PAIR", "*FRICTION\n0.3, 1.0e6\n*CONTACT PAIR")
+
+CONTACT_CORPUS = [
+    ("n2s_two_block", _CONTACT_TWO_BLOCK, 1e-6, _check_two_block_equilibrium,
+     "node-to-surface penalty: two stacked cubes, load via contact"),
+    ("n2s_friction", _FRICTION_TWO_BLOCK, 1e-6, _check_friction_equilibrium,
+     "node-to-surface + Coulomb *FRICTION: normal load crosses interface"),
+    ("thermal_gap", _THERMAL_CONTACT_TWO_BLOCK, 1e-6, _check_thermal_gap,
+     "thermal *GAP CONDUCTANCE: series-resistance through-flux"),
+]
+
+
+@pytest.mark.parametrize(
+    "name, deck, tol, checker, desc",
+    CONTACT_CORPUS,
+    ids=[c[0] for c in CONTACT_CORPUS],
+)
+def test_contact_corpus_analytical(name, deck, tol, checker, desc):
+    """(6.5/6.6) Parametrized contact regression: each analytical contact deck solves end
+    to end from Python and reproduces its closed-form interface state within its per-deck
+    tolerance. Analytical references (not a stock .dat.ref) — the stock contact decks use
+    NLGEOM + CalculiX's exact exponential law + MPCs, not gated (see tasks.md 1.5/2.1)."""
+    import calculixpp as cx
+
+    r = cx.solve_text(deck)
+    checker(r, tol)
+
+
+def test_contact_deferred_mortar_rejects_clearly():
+    """(6.3) A TYPE=SURFACE TO SURFACE (mortar) contact pair is rejected with a clear,
+    actionable error naming the deferral — never silently mis-solved as node-to-surface."""
+    import calculixpp as cx
+
+    deck = _CONTACT_TWO_BLOCK.replace("TYPE=NODE TO SURFACE", "TYPE=SURFACE TO SURFACE")
+    with pytest.raises(RuntimeError) as exc:
+        cx.solve_text(deck)
+    msg = str(exc.value).lower()
+    assert "surface-to-surface" in msg or "surface to surface" in msg or "mortar" in msg

@@ -62,6 +62,50 @@ Voigt6 strain_from_gradients(const std::array<std::array<Real, 3>, kMaxNodes>& g
 std::vector<Real> element_stiffness(ElementType type, std::span<const Vec3> coords,
                                     const ElasticIso& mat);
 
+// Dense scalar conduction matrix (n x n, row-major) for a temperature field with
+// one DOF per node (spec: heat-transfer-analysis — steady conduction). For an
+// isotropic conductivity k:
+//   Kt_e[a][b] = Σ_gp (g_a · g_b) · k · det(J) · w
+// where g_k are the physical shape-function gradients. This reuses the exact same
+// shape functions, Gauss rules, and physical_gradients as the mechanical stiffness,
+// so every solid element family is supported. (Note the topology-agnostic gradient
+// dot product — no B-matrix, since the unknown is scalar.)
+std::vector<Real> element_conduction(ElementType type, std::span<const Vec3> coords,
+                                     Real k);
+
+// Dense scalar capacitance matrix (n x n, row-major) for the transient thermal term:
+//   C_e[a][b] = Σ_gp rho*c · N_a N_b · det(J) · w.
+// Zero rho*c yields a zero matrix (steady-state). (spec: heat-transfer-analysis —
+// transient conduction; provided now so the transient driver can reuse it.)
+std::vector<Real> element_capacitance(ElementType type, std::span<const Vec3> coords,
+                                      Real rho_c);
+
+// Thermal-strain equivalent nodal load (spec: heat-transfer — thermal expansion).
+// For a thermal strain eps_th = alpha (T - Tref) on the normal components (Voigt
+// xx,yy,zz), the mechanical residual gains f_th = ∫ Bᵀ D eps_th dV, so heating a
+// constrained body induces the correct thermal stress. `te` is the per-node
+// temperature CHANGE (T - Tref) of the element (size n); it is interpolated to each
+// Gauss point through the shape functions and multiplied by `alpha`. Returns the 3n
+// force vector (DOF order [u1,v1,w1,...]); add it to the mechanical rhs. For zero
+// temperature change (or alpha 0) the vector is zero, so the mechanical path is
+// unchanged. (Reuses the same Gauss rule / physical_gradients as element_stiffness.)
+std::vector<Real> element_thermal_load(ElementType type,
+                                       std::span<const Vec3> coords, const D6& D,
+                                       Real alpha, std::span<const Real> te);
+
+// Thermal->mechanical COUPLING block C_e (3n x n, row-major) for the MONOLITHIC
+// coupled tangent (spec: heat-transfer — coupled): C_e[a][j] maps the nodal
+// temperature CHANGE (T_j - Tref) to the mechanical force at DOF a, i.e.
+//   f_th_e[a] = Σ_j C_e[a][j] (T_j - Tref)   ==   element_thermal_load(..., te)
+// with te_j = T_j - Tref. Concretely C_e[a][j] = ∫ B_aᵀ D {alpha,alpha,alpha,0,0,0} N_j dV,
+// the derivative of the thermal-strain load w.r.t. the nodal temperature. In the 4-DOF
+// (u,v,w,T) monolithic system it is the off-diagonal K_uT block (moved to the LHS with
+// a minus sign, since f_th enters the residual). Reuses the same Gauss/B machinery as
+// element_thermal_load, so C_e . (T - Tref) reproduces that load exactly.
+std::vector<Real> element_thermal_coupling(ElementType type,
+                                           std::span<const Vec3> coords, const D6& D,
+                                           Real alpha);
+
 // Material-point element assembly. For each Gauss point it forms the small-strain
 // B ue, evaluates `material` (advancing per-point `state`), and accumulates the
 // consistent tangent and internal force:

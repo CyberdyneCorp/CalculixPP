@@ -15,6 +15,10 @@ add_library(calculixpp_core
   fem/assembly.cpp
   fem/stress.cpp
   fem/loads.cpp
+  fem/thermal.cpp
+  fem/cavity_radiation.cpp
+  fem/contact_search.cpp
+  fem/contact.cpp
   io/inp_parser.cpp
   io/results_writer.cpp
   geometry/cad_mesher.cpp)
@@ -33,7 +37,9 @@ if(CALCULIXPP_WITH_SOLVER)
   add_library(calculixpp_numerics
     compute/cpu_backend.cpp
     numerics/linear_static.cpp
-    numerics/nonlinear_static.cpp)
+    numerics/nonlinear_static.cpp
+    numerics/heat_transfer.cpp
+    numerics/multistep.cpp)
   target_link_libraries(calculixpp_numerics PUBLIC calculixpp_core scipp::scipp)
   target_link_libraries(calculixpp_numerics PRIVATE calculixpp_warnings)
   target_compile_features(calculixpp_numerics PUBLIC cxx_std_20)

@@ -17,7 +17,9 @@
 #include "calculixpp/core/element.hpp"
 #include "calculixpp/io/inp_parser.hpp"
 #include "calculixpp/io/results_writer.hpp"
+#include "calculixpp/numerics/heat_transfer.hpp"
 #include "calculixpp/numerics/linear_static.hpp"
+#include "calculixpp/numerics/multistep.hpp"
 #include "calculixpp/numerics/nonlinear_static.hpp"
 
 namespace py = pybind11;
@@ -108,6 +110,12 @@ py::dict summary_dict(const Model& m) {
   d["num_materials"] = m.materials.size();
   d["materials"] = materials;
   d["requested_solver"] = requested_solver_name(m.solver);
+  // Analysis procedure: "static" (mechanical) or heat transfer (steady/transient).
+  d["procedure"] =
+      m.procedure == Procedure::HeatTransferSteady      ? "heat transfer steady state"
+      : m.procedure == Procedure::HeatTransferTransient ? "heat transfer transient"
+      : m.procedure == Procedure::Coupled ? "coupled temperature-displacement"
+                                                        : "static";
 
   // Phase-2 introspection.
   d["element_type_counts"] = element_type_counts(m);
@@ -152,6 +160,71 @@ py::dict result_dict(const Model& m, const StaticFields& f) {
   d["reaction"] = vec3_to_array(f.reaction);
   d["num_nodes"] = n;
   d["num_elements"] = m.mesh.num_elements();
+  // Contact results (CSTR) per slave node — a list of dicts (node, closed, pressure,
+  // gap, tau). Empty for a contact-free deck. (spec: contact — contact output.)
+  py::list contact;
+  for (const ContactPoint& c : f.contact) {
+    py::dict cd;
+    cd["node"] = c.node_id;
+    cd["closed"] = c.closed;
+    cd["pressure"] = c.p;
+    cd["gap"] = c.gap;
+    cd["tau"] = c.tau;
+    contact.append(cd);
+  }
+  d["contact"] = contact;
+  return d;
+}
+
+// A heat-transfer result as NumPy arrays: node ids/coords plus temperature (NT) and
+// heat-flux reaction (RFL), one scalar per node. (spec: heat-transfer-analysis.)
+py::dict thermal_result_dict(const Model& m, const ThermalFields& t) {
+  const std::size_t n = m.mesh.num_nodes();
+  py::array_t<int> ids(static_cast<py::ssize_t>(n));
+  py::array_t<double> coords({static_cast<py::ssize_t>(n), py::ssize_t{3}});
+  py::array_t<double> temp(static_cast<py::ssize_t>(n));
+  py::array_t<double> rfl(static_cast<py::ssize_t>(n));
+  py::array_t<double> hfl({static_cast<py::ssize_t>(n), py::ssize_t{3}});  // nodal HFL
+  auto ri = ids.mutable_unchecked<1>();
+  auto rc = coords.mutable_unchecked<2>();
+  auto rt = temp.mutable_unchecked<1>();
+  auto rr = rfl.mutable_unchecked<1>();
+  auto rh = hfl.mutable_unchecked<2>();
+  for (std::size_t i = 0; i < n; ++i) {
+    ri(static_cast<py::ssize_t>(i)) = m.mesh.nodes()[i].id;
+    for (py::ssize_t j = 0; j < 3; ++j)
+      rc(static_cast<py::ssize_t>(i), j) = m.mesh.nodes()[i].x[static_cast<std::size_t>(j)];
+    rt(static_cast<py::ssize_t>(i)) = t.temperature[i];
+    rr(static_cast<py::ssize_t>(i)) = t.flux_reaction[i];
+    for (py::ssize_t j = 0; j < 3; ++j)
+      rh(static_cast<py::ssize_t>(i), j) =
+          t.heat_flux.empty() ? 0.0 : t.heat_flux[i][static_cast<std::size_t>(j)];
+  }
+  // Integration-point HFL (*EL PRINT HFL): elem ids, gp indices, and the flux rows.
+  const std::size_t np = t.hfl_points.size();
+  py::array_t<int> hp_elem(static_cast<py::ssize_t>(np));
+  py::array_t<int> hp_gp(static_cast<py::ssize_t>(np));
+  py::array_t<double> hp_flux({static_cast<py::ssize_t>(np), py::ssize_t{3}});
+  auto pe = hp_elem.mutable_unchecked<1>();
+  auto pg = hp_gp.mutable_unchecked<1>();
+  auto pf = hp_flux.mutable_unchecked<2>();
+  for (std::size_t i = 0; i < np; ++i) {
+    pe(static_cast<py::ssize_t>(i)) = t.hfl_points[i].elem_id;
+    pg(static_cast<py::ssize_t>(i)) = t.hfl_points[i].gp;
+    for (py::ssize_t j = 0; j < 3; ++j)
+      pf(static_cast<py::ssize_t>(i), j) = t.hfl_points[i].flux[static_cast<std::size_t>(j)];
+  }
+  py::dict d;
+  d["node_ids"] = ids;
+  d["node_coords"] = coords;
+  d["temperature"] = temp;
+  d["flux_reaction"] = rfl;
+  d["heat_flux"] = hfl;
+  d["hfl_elem"] = hp_elem;
+  d["hfl_gp"] = hp_gp;
+  d["hfl_flux"] = hp_flux;
+  d["num_nodes"] = n;
+  d["num_elements"] = m.mesh.num_elements();
   return d;
 }
 
@@ -160,11 +233,38 @@ py::dict solve_model(const Model& m, const std::string& solver,
   // Validate/select the backend first (may raise on an unknown name) and record
   // the one that actually ran. Phase 1 routes every solve through the CPU path.
   const std::string used = resolve_backend(backend);
+  // A *COUPLED TEMPERATURE-DISPLACEMENT deck solves the thermal field, applies the
+  // resulting thermal strain, then the mechanical field (one-way coupling). The
+  // result dict carries the mechanical fields plus the temperature/flux_reaction.
+  if (m.procedure == Procedure::Coupled) {
+    const CoupledFields cf = numerics::solve_coupled(m, kind_of(solver));
+    py::dict cd = result_dict(m, cf.mechanical);
+    py::dict td = thermal_result_dict(m, cf.thermal);
+    cd["temperature"] = td["temperature"];
+    cd["flux_reaction"] = td["flux_reaction"];
+    cd["backend"] = used;
+    cd["procedure"] = "coupled temperature-displacement";
+    return cd;
+  }
+  // A *HEAT TRANSFER deck solves the scalar temperature field; the mechanical
+  // path is unchanged.
+  if (m.procedure == Procedure::HeatTransferSteady ||
+      m.procedure == Procedure::HeatTransferTransient) {
+    py::dict td = thermal_result_dict(
+        m, numerics::solve_heat_transfer(m, kind_of(solver)));
+    td["backend"] = used;
+    td["procedure"] = m.procedure == Procedure::HeatTransferTransient
+                          ? "heat transfer transient"
+                          : "heat transfer steady state";
+    return td;
+  }
   // A model with a nonlinear material (*PLASTIC / *HYPERELASTIC / *USER MATERIAL)
   // routes to the Newton-Raphson driver (load applied incrementally); a purely
   // linear-elastic model keeps the direct linear path unchanged.
   py::dict d;
-  if (m.has_nonlinear_material()) {
+  // A *CONTACT PAIR deck (nonlinear constraint) or a nonlinear material routes to the
+  // Newton driver; a purely linear-elastic contact-free model keeps the linear path.
+  if (m.has_nonlinear_material() || m.has_contact()) {
     numerics::NonlinearOptions opts;
     opts.forced = kind_of(solver);
     numerics::NonlinearReport rep;
@@ -220,6 +320,39 @@ py::dict solve_nonlinear_text(const std::string& text, const std::string& solver
   return solve_nonlinear_model(io::parse_inp(text), solver, backend, line_search);
 }
 
+// Multi-step linear-static solve (spec: multi-step analysis). Parses the deck into its
+// per-*STEP models and runs the step-loop driver, returning a LIST of per-step result
+// dicts (one per *STEP, each carrying the accumulated total displacement/stress/strain/
+// reaction at the end of that step). A single-*STEP deck returns a one-element list
+// whose fields equal solve()'s (the single-step fast path). Enables validating a stock
+// two-step deck's per-step *NODE PRINT blocks. `solver`/`backend` as in solve().
+py::list solve_multistep_models(const std::vector<Model>& steps,
+                                const std::string& solver, const std::string& backend) {
+  const std::string used = resolve_backend(backend);
+  numerics::MultiStepReport rep;
+  const std::vector<StaticFields> all =
+      numerics::solve_multistep_static_all(steps, kind_of(solver), &rep);
+  py::list out;
+  for (std::size_t i = 0; i < all.size(); ++i) {
+    py::dict d = result_dict(steps[i], all[i]);
+    d["backend"] = used;
+    d["step"] = static_cast<int>(i + 1);
+    d["num_steps"] = static_cast<int>(all.size());
+    out.append(d);
+  }
+  return out;
+}
+
+py::list solve_multistep_file(const std::string& path, const std::string& solver,
+                              const std::string& backend) {
+  return solve_multistep_models(io::parse_inp_steps_file(path), solver, backend);
+}
+
+py::list solve_multistep_text(const std::string& text, const std::string& solver,
+                              const std::string& backend) {
+  return solve_multistep_models(io::parse_inp_steps(text), solver, backend);
+}
+
 py::dict summary_file(const std::string& path) {
   return summary_dict(io::parse_inp_file(path));
 }
@@ -241,10 +374,27 @@ PYBIND11_MODULE(calculixpp, mod) {
           "a dict of NumPy arrays: node_ids, node_coords, displacement (Nx3), "
           "stress (Nx6, xx/yy/zz/xy/xz/yz), strain (Nx6, same order, engineering "
           "shear), reaction (Nx3), plus num_nodes, num_elements, and backend (the "
-          "backend that actually ran the solve).");
+          "backend that actually ran the solve). A *HEAT TRANSFER, STEADY STATE deck "
+          "auto-dispatches to the thermal solver and instead returns temperature "
+          "(N,) and flux_reaction (N,) with procedure='heat transfer steady state'.");
   mod.def("solve_text", &solve_text, py::arg("text"), py::arg("solver") = "",
           py::arg("backend") = "",
           "Like solve() but takes the deck contents as a string.");
+
+  mod.def("solve_multistep", &solve_multistep_file, py::arg("path"),
+          py::arg("solver") = "", py::arg("backend") = "",
+          "Parse a multi-*STEP .inp deck and solve every step in order with the "
+          "step-loop driver (spec: multi-step analysis), carrying the converged state "
+          "forward. Returns a LIST of per-step result dicts (same fields as solve(), "
+          "plus 'step' 1-based and 'num_steps'); entry i is the accumulated total at "
+          "the end of step i+1. Two linear load steps sum to the single-step result "
+          "(superposition); *MODEL CHANGE removes/re-adds elements across steps "
+          "(strain-free reactivation); *BOUNDARY,FIXED holds a DOF at its deformed "
+          "value; OP=NEW/MOD accumulate loads and *CHANGE SOLID SECTION rebinds at the "
+          "boundary. A single-*STEP deck returns a one-element list equal to solve().");
+  mod.def("solve_multistep_text", &solve_multistep_text, py::arg("text"),
+          py::arg("solver") = "", py::arg("backend") = "",
+          "Like solve_multistep() but takes the deck contents as a string.");
 
   mod.def("solve_nonlinear", &solve_nonlinear_file, py::arg("path"),
           py::arg("solver") = "", py::arg("backend") = "",

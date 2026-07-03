@@ -67,7 +67,9 @@ std::vector<Line> preprocess(const std::string& text) {
   std::vector<Line> out;
   for (std::size_t i = 0; i < raw.size();) {
     const std::string t = trim(raw[i]);
-    if (t.empty() || t.rfind("**", 0) == 0) {
+    // Skip blanks, comment lines (**), and a bare "*" — a keyword line with no
+    // name carries no card and appears as a separator in some stock decks.
+    if (t.empty() || t.rfind("**", 0) == 0 || t == "*") {
       ++i;
       continue;
     }
@@ -121,8 +123,41 @@ class Parser {
     return std::move(model_);
   }
 
+ public:
+  // Parse a deck into its list of *STEP models (spec: multi-step analysis). Each
+  // *STEP...*END STEP block is snapshotted at *END STEP as one fully-accumulated
+  // Model (loads/BCs/procedure/controls/active-element mask carried forward from the
+  // prior step, OP=NEW resetting per step; sections accumulate so *CHANGE SOLID
+  // SECTION rebinds at the boundary). Global (pre-step) data — mesh, nsets/elsets/
+  // surfaces, materials, amplitudes, physical constants, constraints — is shared, so
+  // the returned models differ only in their step-varying state. A single-*STEP deck
+  // returns exactly one model that is byte-for-byte the parse_inp() model.
+  std::vector<Model> run_steps(const std::string& text) {
+    const std::vector<Line> lines = preprocess(text);
+    for (const Line& ln : lines) {
+      const std::vector<std::string> fields = split_fields(ln.text);
+      if (fields.empty()) continue;
+      if (fields.front().rfind("*", 0) == 0)
+        begin_card(fields, ln.number);
+      else
+        data_line(fields, ln.number);
+    }
+    // A deck may omit *END STEP on its last step (or have a single implicit block);
+    // if the current step accumulated any step content beyond what was snapshotted,
+    // capture it. `in_step_` tracks whether we are inside an unterminated block.
+    if (in_step_) snapshot_step();
+    if (steps_.empty()) steps_.push_back(model_);  // no *STEP at all -> one model
+    // Flush the shared sets/surfaces into every step model's mesh.
+    for (Model& m : steps_) flush_sets_into(m);
+    return std::move(steps_);
+  }
+
  private:
   Model model_;
+  // Per-step snapshots captured at *END STEP (see run_steps). Each is a copy of the
+  // accumulated model_ at that boundary; sets are flushed into their meshes at the end.
+  std::vector<Model> steps_;
+  bool in_step_ = false;  // true between *STEP and *END STEP
   std::string card_;                                        // normalized keyword
   std::unordered_map<std::string, std::string> params_;     // normalized key -> value
   std::string cur_material_;
@@ -138,9 +173,20 @@ class Parser {
   bool op_seen_cload_ = false;
   bool op_seen_dload_ = false;
   bool op_seen_boundary_ = false;
+  bool op_seen_cflux_ = false;
+  bool op_seen_dflux_ = false;
+  // True once a *HEAT TRANSFER procedure card is seen, so *BOUNDARY dof 11 routes to
+  // a prescribed temperature and *DFLUX to a surface heat flux. (spec: heat-transfer.)
+  bool heat_step_ = false;
   std::unordered_map<std::string, std::vector<Index>> nsets_, elsets_;
   std::vector<Surface> surfaces_;  // built incrementally; flushed at end
   int cur_surface_ = -1;           // index into surfaces_, or -1 outside a surface
+
+  // *SURFACE INTERACTION / *SURFACE BEHAVIOR / *CONTACT PAIR (spec: contact). The
+  // current interaction name (so a following *SURFACE BEHAVIOR attaches to it) and the
+  // pair whose slave/master come on its data line. -1 / empty outside those cards.
+  std::string cur_interaction_;
+  int cur_contact_pair_ = -1;  // index into model_.contact_pairs, or -1
 
   // Connector (discrete) elements: SPRINGA/SPRING1/SPRING2, MASS, DASHPOTA/1/2.
   // These are not isoparametric solids, so they live outside the Mesh. We keep
@@ -168,6 +214,12 @@ class Parser {
   // *TIE: the tie being built (surfaces come on the data line).
   Tie tie_pending_;
   bool tie_has_pending_ = false;
+
+  // *MODEL CHANGE: the current card's TYPE (Element / ContactPair) and ADD/REMOVE
+  // sense, carried onto the data lines. (spec: model-change — element/contact birth-death.)
+  enum class ModelChangeType { Element, ContactPair };
+  ModelChangeType mc_type_ = ModelChangeType::Element;
+  bool mc_add_ = true;  // true = ADD (activate), false = REMOVE (deactivate)
 
   std::string param(const std::string& key) const {
     const auto it = params_.find(key);
@@ -201,12 +253,36 @@ class Parser {
     }
     // Cards that carry no data or need setup at declaration time.
     static const std::vector<std::string> ignored = {
-        "*NODEPRINT",   "*ELPRINT", "*NODEFILE",    "*ELFILE",
-        "*CONTACTFILE", "*OUTPUT",  "*RESTART",     "*STEP",
-        "*ENDSTEP",     "*HEADING", "*SECTIONPRINT"};
-    if (card_ == "*STATIC") {
+        "*NODEPRINT",   "*ELPRINT",     "*NODEFILE",    "*ELFILE",
+        "*CONTACTFILE", "*CONTACTPRINT", "*CONTACTOUTPUT", "*OUTPUT", "*RESTART",
+        "*HEADING",     "*SECTIONPRINT"};
+    if (card_ == "*STEP") {
+      begin_step();
+    } else if (card_ == "*ENDSTEP") {
+      end_step();
+    } else if (card_ == "*STATIC") {
       select_solver(line);
       begin_static();
+    } else if (card_ == "*HEATTRANSFER") {
+      begin_heat_transfer(line);
+    } else if (card_ == "*CONDUCTIVITY") {
+      begin_conductivity(line);
+    } else if (card_ == "*SPECIFICHEAT") {
+      begin_specific_heat(line);
+    } else if (card_ == "*EXPANSION") {
+      begin_expansion(line);
+    } else if (card_ == "*COUPLEDTEMPERATURE-DISPLACEMENT" ||
+               card_ == "*COUPLEDTEMPERATUREDISPLACEMENT") {
+      begin_coupled(line);
+    } else if (card_ == "*PHYSICALCONSTANTS") {
+      begin_physical_constants(line);
+    } else if (card_ == "*INITIALCONDITIONS") {
+      // TYPE=TEMPERATURE data lines set the transient initial field; other TYPEs
+      // (STRESS/PLASTIC STRAIN/...) are accepted and ignored in this slice.
+    } else if (card_ == "*FILM") {
+      // Data lines carry elem,F<face>,sink,h. No OP reset in this slice.
+    } else if (card_ == "*RADIATE") {
+      // Data lines carry elem,R<face>,ambient,emissivity.
     } else if (card_ == "*CONTROLS") {
       // Parameters carried on the card; data lines fill the tolerances/limits.
     } else if (card_ == "*TIMEPOINTS") {
@@ -230,6 +306,20 @@ class Parser {
       begin_amplitude(line);
     } else if (card_ == "*SURFACE") {
       begin_surface(line);
+    } else if (card_ == "*SURFACEINTERACTION") {
+      begin_surface_interaction(line);
+    } else if (card_ == "*SURFACEBEHAVIOR") {
+      begin_surface_behavior(line);
+    } else if (card_ == "*FRICTION") {
+      begin_friction(line);
+    } else if (card_ == "*GAPCONDUCTANCE") {
+      begin_gap_conductance(line);
+    } else if (card_ == "*GAPHEATGENERATION") {
+      begin_gap_heat_generation(line);
+    } else if (card_ == "*CONTACTPAIR") {
+      begin_contact_pair(line);
+    } else if (card_ == "*CLEARANCE") {
+      begin_clearance(line);
     } else if (card_ == "*SOLIDSECTION") {
       model_.sections.push_back(SolidSection{param("ELSET"), param("MATERIAL")});
     } else if (card_ == "*CLOAD") {
@@ -241,7 +331,16 @@ class Parser {
         model_.body_loads.clear();
       }
     } else if (card_ == "*BOUNDARY") {
-      if (apply_op_reset(op_seen_boundary_, line)) model_.spcs.clear();
+      if (apply_op_reset(op_seen_boundary_, line)) {
+        model_.spcs.clear();
+        model_.temp_bcs.clear();
+      }
+    } else if (card_ == "*CFLUX") {
+      if (apply_op_reset(op_seen_cflux_, line)) model_.cfluxes.clear();
+    } else if (card_ == "*DFLUX") {
+      if (apply_op_reset(op_seen_dflux_, line)) model_.dfluxes.clear();
+    } else if (card_ == "*TEMPERATURE") {
+      // Data lines carry node,value prescribed temperatures (treated as thermal BCs).
     } else if (card_ == "*SPRING" || card_ == "*DASHPOT") {
       // ELSET= names the connector elements this property attaches to. The
       // stiffness/damping (and, for SPRING1/2, the DOFs) come on the data lines.
@@ -267,6 +366,8 @@ class Parser {
       set_coupling_kind(line);
     } else if (card_ == "*TIE") {
       begin_tie(line);
+    } else if (card_ == "*MODELCHANGE") {
+      begin_model_change(line);
     } else if (card_ == "*CHANGEMATERIAL") {
       begin_change_material(line);
     } else if (card_ == "*CHANGEPLASTIC") {
@@ -286,15 +387,16 @@ class Parser {
     }
   }
 
-  // Reject a card the parser does not implement. Phase-2 capabilities that are
-  // deliberately DEFERRED (documented in tasks.md workstream 3/4) get a clear,
-  // actionable message that names the deferral, so a deck using them fails loudly
-  // and specifically rather than being silently mis-solved. Any other keyword is a
-  // generic "unsupported card". Either way this THROWS (never returns) — a deferred
-  // material/section card must never be silently ignored, which would yield a
-  // wrong solve. (spec: input-deck-parsing — graceful handling of unknown cards.)
+  // Reject a card the parser does not implement. Capabilities that are
+  // deliberately DEFERRED (documented in tasks.md) get a clear, actionable
+  // message that names the deferral, so a deck using them fails loudly and
+  // specifically rather than being silently mis-solved. Any other keyword is a
+  // generic "unsupported card". Either way this THROWS (never returns) — a
+  // deferred card must never be silently ignored, which would yield a wrong
+  // solve. (spec: input-deck-parsing — graceful handling of unknown cards.)
   [[noreturn]] void reject_card(const std::string& raw, int line) const {
-    // Normalized keyword -> the workstream/reason it is deferred.
+    // Normalized keyword -> the workstream/reason it is deferred (Phase-2
+    // material/section families that need extra kinematics or a transient driver).
     static const std::unordered_map<std::string, std::string> deferred = {
         {"*HYPERFOAM", "hyperelastic foam (Ogden) — deferred (tasks 4.3)"},
         {"*CREEP", "creep — deferred, needs a transient driver (tasks 4.4)"},
@@ -313,13 +415,21 @@ class Parser {
          "beam sections — deferred, needs beam kinematics (tasks 3.4)"},
         {"*MEMBRANESECTION",
          "membrane sections — deferred, needs shell kinematics (tasks 3.4)"},
+        {"*VIEWFACTOR",
+         "the *VIEWFACTOR read/write-to-file control is not implemented; cavity "
+         "radiation itself (*RADIATE ...,CR) IS supported — the view factors are "
+         "computed internally, so drop *VIEWFACTOR (tasks 3.4)"},
     };
     const auto it = deferred.find(card_);
     if (it != deferred.end())
-      throw ParseError(line, "card '" + raw + "' is a recognized Phase-2 capability "
-                                             "that is not yet implemented: " +
+      throw ParseError(line, "card '" + raw + "' is a recognized capability that is "
+                                             "not yet implemented: " +
                                  it->second + ". Remove it or use an implemented "
                                  "material/section; it cannot be silently ignored.");
+    // Phase-3 contact + thermal-contact cards (*CONTACT PAIR, *SURFACE INTERACTION,
+    // *SURFACE BEHAVIOR, *FRICTION, *GAP CONDUCTANCE, *GAP HEAT GENERATION, *CLEARANCE,
+    // *CONTACT FILE/PRINT/OUTPUT) are all handled above; anything reaching here is a
+    // genuinely unimplemented keyword.
     throw ParseError(line, "unsupported card '" + raw + "'");
   }
 
@@ -344,9 +454,244 @@ class Parser {
     }
   }
 
+  // *STEP: open a new analysis step (spec: multi-step analysis). Reset the per-step
+  // OP=NEW guards so an OP=NEW load/BC card resets once per step (CalculiX's
+  // once-per-type-per-step rule), and clear the heat-step flag so each step's
+  // procedure card re-selects the routing. All accumulated loads/BCs/state persist
+  // (they carry forward from the prior step); OP=NEW inside the step clears them.
+  void begin_step() {
+    in_step_ = true;
+    op_seen_cload_ = op_seen_dload_ = op_seen_boundary_ = false;
+    op_seen_cflux_ = op_seen_dflux_ = false;
+    heat_step_ = false;
+  }
+
+  // *END STEP: snapshot the fully-accumulated model as this step's Model.
+  void end_step() {
+    snapshot_step();
+    in_step_ = false;
+  }
+
+  // Capture the current accumulated model_ as one step. Called at *END STEP (and, for
+  // an unterminated final block, at end of parse). The snapshot is a plain copy — the
+  // shared sets are flushed into its mesh later by flush_sets_into.
+  void snapshot_step() { steps_.push_back(model_); }
+
   // *STATIC card: DIRECT parameter fixes the increment (no auto resizing).
   void begin_static() {
     if (params_.count("DIRECT") != 0) model_.increment.direct = true;
+  }
+
+  // *HEAT TRANSFER[, STEADY STATE]: select the thermal procedure. STEADY STATE
+  // solves Kt T = q; without it the step is transient (backward-Euler integration of
+  // the capacitance term over the step period). (spec: heat-transfer-analysis —
+  // steady + transient conduction.) The (unused) `line` keeps the card-handler
+  // signature uniform.
+  void begin_heat_transfer(int /*line*/) {
+    heat_step_ = true;
+    model_.procedure = (params_.count("STEADYSTATE") != 0)
+                           ? Procedure::HeatTransferSteady
+                           : Procedure::HeatTransferTransient;
+  }
+
+  // *CONDUCTIVITY: isotropic scalar conductivity on the current material. The data
+  // line is "k[, temperature]"; only the first (isotropic) value is used.
+  void begin_conductivity(int line) {
+    if (cur_material_.empty())
+      throw ParseError(line, "*CONDUCTIVITY without *MATERIAL");
+    ensure_thermal();
+  }
+
+  // *SPECIFIC HEAT: scalar specific heat on the current material (transient only).
+  void begin_specific_heat(int line) {
+    if (cur_material_.empty())
+      throw ParseError(line, "*SPECIFIC HEAT without *MATERIAL");
+    ensure_thermal();
+  }
+
+  Thermal& ensure_thermal() {
+    auto& mat = model_.materials[cur_material_];
+    if (!mat.thermal) mat.thermal = Thermal{};
+    return *mat.thermal;
+  }
+
+  // *EXPANSION[, ZERO=Tref]: isotropic thermal-expansion coefficient on the current
+  // material. ZERO= gives the reference (stress-free) temperature Tref (default 0).
+  // The data line is "alpha[, temperature]"; only the first isotropic value is used.
+  // (spec: heat-transfer — thermal expansion; material-models — *EXPANSION.)
+  void begin_expansion(int line) {
+    if (cur_material_.empty())
+      throw ParseError(line, "*EXPANSION without *MATERIAL");
+    Expansion& ex = ensure_expansion();
+    if (params_.count("ZERO") != 0) ex.t_ref = to_double(param("ZERO"), line);
+  }
+
+  Expansion& ensure_expansion() {
+    auto& mat = model_.materials[cur_material_];
+    if (!mat.expansion) mat.expansion = Expansion{};
+    return *mat.expansion;
+  }
+
+  void expansion_data(const std::vector<std::string>& f, int line) {
+    if (cur_material_.empty())
+      throw ParseError(line, "*EXPANSION without *MATERIAL");
+    append_property_row(ensure_expansion().alpha, f, line, "*EXPANSION");
+  }
+
+  // *COUPLED TEMPERATURE-DISPLACEMENT[, SOLUTIONS=MONOLITHIC|STAGGERED]: select the
+  // coupled thermomechanical procedure. A heat step for the thermal cards (temperature
+  // BCs, fluxes, film) whose solve also computes the displacement/thermal-stress field.
+  // SOLUTIONS= picks the scheme (default STAGGERED — its single-pass degeneracy is the
+  // historical one-way solve; MONOLITHIC assembles the 4-DOF/node system). Both agree
+  // for a pure thermal-stress problem. (spec: heat-transfer — coupled.) `line` keeps the
+  // handler signature uniform.
+  void begin_coupled(int /*line*/) {
+    heat_step_ = true;  // thermal cards (temperature BCs, flux, film) route to thermal
+    model_.procedure = Procedure::Coupled;
+    const std::string sol = param("SOLUTIONS");
+    if (sol == "MONOLITHIC")
+      model_.coupled_scheme = CoupledScheme::Monolithic;
+    else if (sol == "STAGGERED")
+      model_.coupled_scheme = CoupledScheme::Staggered;
+  }
+
+  // Append one (value[, temperature]) row to a temperature-dependent property table.
+  // A row with only a value (or a bare 0 temperature on the first row) is the constant
+  // case; multiple rows form a piecewise-linear k(T)/c(T)/alpha(T). Temperatures must
+  // be strictly increasing (CalculiX requirement); an omitted temperature defaults 0.
+  void append_property_row(PropertyTable& table, const std::vector<std::string>& f,
+                           int line, const char* card) {
+    if (f.empty() || f[0].empty())
+      throw ParseError(line, std::string(card) + " needs a value");
+    const Real value = to_double(f[0], line);
+    const Real temperature = (f.size() > 1 && !f[1].empty()) ? to_double(f[1], line) : 0.0;
+    if (!table.temp.empty() && temperature <= table.temp.back())
+      throw ParseError(line, std::string(card) +
+                                 " temperatures must strictly increase");
+    table.value.push_back(value);
+    table.temp.push_back(temperature);
+  }
+
+  void conductivity_data(const std::vector<std::string>& f, int line) {
+    if (cur_material_.empty())
+      throw ParseError(line, "*CONDUCTIVITY without *MATERIAL");
+    append_property_row(ensure_thermal().conductivity, f, line, "*CONDUCTIVITY");
+  }
+
+  void specific_heat_data(const std::vector<std::string>& f, int line) {
+    if (cur_material_.empty())
+      throw ParseError(line, "*SPECIFIC HEAT without *MATERIAL");
+    append_property_row(ensure_thermal().specific_heat, f, line, "*SPECIFIC HEAT");
+  }
+
+  // *PHYSICAL CONSTANTS: ABSOLUTE ZERO / STEFAN BOLTZMANN carried as card
+  // parameters (radiation converts to absolute temperature and needs sigma).
+  void begin_physical_constants(int line) {
+    if (params_.count("ABSOLUTEZERO") != 0)
+      model_.physical.absolute_zero = to_double(param("ABSOLUTEZERO"), line);
+    if (params_.count("STEFANBOLTZMANN") != 0)
+      model_.physical.sigma = to_double(param("STEFANBOLTZMANN"), line);
+  }
+
+  // *INITIAL CONDITIONS, TYPE=TEMPERATURE data: "node_or_nset, value". Sets the
+  // transient initial temperature field (a bare "Nall" set covering every node acts
+  // as the uniform default). Non-TEMPERATURE types are ignored.
+  void initial_conditions_data(const std::vector<std::string>& f, int line) {
+    if (param("TYPE") != "TEMPERATURE") return;
+    if (f.size() < 2) throw ParseError(line, "*INITIAL CONDITIONS needs node,value");
+    const Real val = to_double(f[1], line);
+    const std::vector<Index> nodes = node_refs(f[0], line);
+    // A set spanning all nodes doubles as the uniform default; still record the
+    // per-node values so partial sets win over it.
+    if (nodes.size() == model_.mesh.num_nodes()) model_.initial_temperature = val;
+    for (const Index nd : nodes) model_.initial_temperature_by_node[nd] = val;
+  }
+
+  // Parse a face label like "F1"/"R3"/"S2" -> face number, validating the prefix.
+  int face_label(const std::string& raw, char prefix, const char* card, int line) {
+    const std::string label = upper(raw);
+    if (label.empty() || label[0] != prefix)
+      throw ParseError(line, std::string(card) + " face must be " + prefix + "<n>");
+    return static_cast<int>(to_index(label.substr(1), line));
+  }
+
+  // *FILM data: "elem_or_elset, F<face>, sink_temp, film_coefficient". Applies a
+  // convective boundary q = h (T - T_sink) on the face. (Forced-convection network
+  // film labels FC/F<face>N are out of scope for this solid-only slice.)
+  void film_data(const std::vector<std::string>& f, int line) {
+    if (f.size() < 4) throw ParseError(line, "*FILM needs elem,F<face>,sink,h");
+    const int face = face_label(f[1], 'F', "*FILM", line);
+    const Real sink = to_double(f[2], line);
+    const Real h = to_double(f[3], line);
+    const std::string amp = param("AMPLITUDE");
+    for (const Index eid : elem_refs(f[0], line))
+      model_.films.push_back(Film{eid, face, sink, h, amp});
+  }
+
+  // *RADIATE data: "elem_or_elset, R<face>[CR], ambient_temp, emissivity". Two forms:
+  //   R<face>       surface-to-ambient q = eps sigma (T^4 - T_amb^4) against a fixed
+  //                 ambient temperature (field 3);
+  //   R<face>CR     gray-body cavity patch — the face joins the radiating enclosure
+  //                 whose net flux is computed from the view factors between all CR
+  //                 faces (field 3, the environment temperature, is optional/ignored
+  //                 in this closed-enclosure slice; field 4 is the emissivity).
+  void radiate_data(const std::vector<std::string>& f, int line) {
+    if (f.size() < 4) throw ParseError(line, "*RADIATE needs elem,R<face>,ambient,eps");
+    std::string label = upper(f[1]);
+    const bool cavity = label.size() >= 2 && label.compare(label.size() - 2, 2, "CR") == 0;
+    if (cavity) label.erase(label.size() - 2);  // strip the CR suffix -> R<face>
+    const int face = face_label(label, 'R', "*RADIATE", line);
+    const Real amb = f[2].empty() ? 0.0 : to_double(f[2], line);
+    const Real eps = to_double(f[3], line);
+    const std::string amp = param("AMPLITUDE");
+    for (const Index eid : elem_refs(f[0], line))
+      model_.radiates.push_back(Radiate{eid, face, amb, eps, cavity, amp});
+  }
+
+  // *CFLUX data: "node_or_nset, dof, value". The dof (0 or 11) selects the
+  // temperature DOF and is ignored; the flux is added at the node.
+  void cflux_data(const std::vector<std::string>& f, int line) {
+    if (f.size() < 3) throw ParseError(line, "*CFLUX needs node,dof,value");
+    const Real val = to_double(f[2], line);
+    const std::string amp = param("AMPLITUDE");
+    for (const Index nd : node_refs(f[0], line))
+      model_.cfluxes.push_back(Cflux{nd, val, amp});
+  }
+
+  // *DFLUX data: "elem_or_elset, S<face>, magnitude" (distributed surface flux). A
+  // BF (body-heat-generation) label is not implemented in this slice.
+  void dflux_data(const std::vector<std::string>& f, int line) {
+    if (f.size() < 3) throw ParseError(line, "*DFLUX needs element,S<face>,magnitude");
+    const std::string label = upper(f[1]);
+    if (label == "BF")
+      throw ParseError(line,
+                       "*DFLUX BF (body heat generation) is not implemented yet; "
+                       "only surface flux S<face> is supported");
+    if (label.empty() || label[0] != 'S')
+      throw ParseError(line, "unsupported *DFLUX type '" + f[1] +
+                                 "' (supports surface flux S<face>)");
+    const int face = static_cast<int>(to_index(label.substr(1), line));
+    const Real flux = to_double(f[2], line);
+    const std::string amp = param("AMPLITUDE");
+    for (const Index eid : elem_refs(f[0], line))
+      model_.dfluxes.push_back(Dflux{eid, face, flux, amp});
+  }
+
+  // *TEMPERATURE data: "node_or_nset, value". In a heat-transfer step it prescribes a
+  // nodal temperature BC (an alternative to *BOUNDARY dof 11). In a MECHANICAL / coupled
+  // step it defines the applied temperature field that drives thermal expansion
+  // (eps_th = alpha (T - Tref)); the field lands in model.applied_temperature keyed by
+  // node id. (spec: heat-transfer — thermal expansion coupling.)
+  void temperature_data(const std::vector<std::string>& f, int line) {
+    if (f.size() < 2) throw ParseError(line, "*TEMPERATURE needs node,value");
+    const Real val = to_double(f[1], line);
+    const std::string amp = param("AMPLITUDE");
+    for (const Index nd : node_refs(f[0], line)) {
+      if (heat_step_)
+        model_.temp_bcs.push_back(TempBc{nd, val, amp});
+      else
+        model_.applied_temperature[nd] = val;
+    }
   }
 
   // *STATIC data line: initial_inc, total_time, min_inc, max_inc (all optional,
@@ -753,6 +1098,55 @@ class Parser {
     tie_has_pending_ = false;
   }
 
+  // *MODEL CHANGE card: TYPE=ELEMENT (default) or TYPE=CONTACT PAIR, with ADD or
+  // REMOVE selecting activation/deactivation. The affected element ids / contact-pair
+  // surfaces come on the data lines. (spec: model-change — element/contact-pair
+  // birth-death.) Within the current single-step model, a REMOVE deactivates the
+  // element for the whole step; an ADD (re)activates it strain-free (the solve starts
+  // undeformed). True cross-step birth-death needs the multi-step engine (tasks 5.1).
+  void begin_model_change(int line) {
+    const std::string type = param("TYPE");
+    if (type.empty() || type == "ELEMENT") {
+      mc_type_ = ModelChangeType::Element;
+    } else if (type == "CONTACTPAIR" || type == "CONTACT PAIR") {
+      mc_type_ = ModelChangeType::ContactPair;
+    } else {
+      throw ParseError(line, "*MODEL CHANGE TYPE must be ELEMENT or CONTACT PAIR, got '" +
+                                 type + "'");
+    }
+    // ADD / REMOVE given as bare parameters (CalculiX). Exactly one is required.
+    const bool has_add = params_.count("ADD") != 0;
+    const bool has_remove = params_.count("REMOVE") != 0;
+    if (has_add == has_remove)
+      throw ParseError(line, "*MODEL CHANGE needs exactly one of ADD or REMOVE");
+    mc_add_ = has_add;
+  }
+
+  // *MODEL CHANGE data line. For TYPE=ELEMENT: an element id or elset name per token;
+  // REMOVE deactivates them, ADD reactivates (drops them from the deactivated set).
+  // For TYPE=CONTACT PAIR: "surface_a, surface_b" recorded for the contact workflow.
+  void model_change_data(const std::vector<std::string>& f, int line) {
+    if (f.empty() || f[0].empty()) return;
+    if (mc_type_ == ModelChangeType::ContactPair) {
+      if (f.size() < 2)
+        throw ParseError(line, "*MODEL CHANGE, TYPE=CONTACT PAIR needs two surfaces");
+      model_.contact_pair_changes.push_back(
+          ContactPairChange{f[0], f[1], mc_add_});
+      return;
+    }
+    for (const std::string& tok : f) {
+      if (tok.empty()) continue;
+      for (const Index eid : elem_refs(tok, line)) {
+        if (mc_add_)
+          std::erase(model_.deactivated_elements, eid);
+        else if (std::find(model_.deactivated_elements.begin(),
+                           model_.deactivated_elements.end(),
+                           eid) == model_.deactivated_elements.end())
+          model_.deactivated_elements.push_back(eid);
+      }
+    }
+  }
+
   // Resolve a *SURFACE (or nset) name to its node ids. Element surfaces contribute the
   // nodes of their listed faces; node surfaces contribute their node list; an nset
   // name contributes its nodes.
@@ -788,7 +1182,13 @@ class Parser {
         "*DASHPOT", "*PLASTIC", "*CYCLICHARDENING", "*HYPERELASTIC",
         "*USERMATERIAL", "*DEPVAR", "*RATEDEPENDENT", "*EQUATION", "*MPC",
         "*RIGIDBODY", "*COUPLING", "*DISTRIBUTINGCOUPLING", "*KINEMATIC",
-        "*DISTRIBUTING", "*TIE"};
+        "*DISTRIBUTING", "*TIE", "*MODELCHANGE",
+        // Contact (Phase 3) data cards with a data line.
+        "*GAPCONDUCTANCE", "*GAPHEATGENERATION",
+        // Thermal (Phase 3) data cards.
+        "*HEATTRANSFER", "*CONDUCTIVITY", "*SPECIFICHEAT", "*EXPANSION", "*CFLUX",
+        "*DFLUX", "*TEMPERATURE", "*FILM", "*RADIATE", "*INITIALCONDITIONS",
+        "*COUPLEDTEMPERATURE-DISPLACEMENT", "*COUPLEDTEMPERATUREDISPLACEMENT"};
     return std::find(data_cards.begin(), data_cards.end(), card_) != data_cards.end();
   }
 
@@ -810,7 +1210,25 @@ class Parser {
     if (card_ == "*DLOAD") return dload(f, line);
     if (card_ == "*DSLOAD") return dsload(f, line);
     if (card_ == "*SURFACE") return surface_data(f, line);
+    if (card_ == "*SURFACEBEHAVIOR") return surface_behavior_data(f, line);
+    if (card_ == "*FRICTION") return friction_data(f, line);
+    if (card_ == "*GAPCONDUCTANCE") return gap_conductance_data(f, line);
+    if (card_ == "*GAPHEATGENERATION") return gap_heat_generation_data(f, line);
+    if (card_ == "*CONTACTPAIR") return contact_pair_data(f, line);
     if (card_ == "*STATIC") return static_data(f, line);
+    if (card_ == "*HEATTRANSFER") return static_data(f, line);  // same inc data line
+    if (card_ == "*COUPLEDTEMPERATURE-DISPLACEMENT" ||
+        card_ == "*COUPLEDTEMPERATUREDISPLACEMENT")
+      return static_data(f, line);  // same increment data line as *STATIC
+    if (card_ == "*CONDUCTIVITY") return conductivity_data(f, line);
+    if (card_ == "*SPECIFICHEAT") return specific_heat_data(f, line);
+    if (card_ == "*EXPANSION") return expansion_data(f, line);
+    if (card_ == "*CFLUX") return cflux_data(f, line);
+    if (card_ == "*DFLUX") return dflux_data(f, line);
+    if (card_ == "*FILM") return film_data(f, line);
+    if (card_ == "*RADIATE") return radiate_data(f, line);
+    if (card_ == "*INITIALCONDITIONS") return initial_conditions_data(f, line);
+    if (card_ == "*TEMPERATURE") return temperature_data(f, line);
     if (card_ == "*CONTROLS") return controls_data(f, line);
     if (card_ == "*TIMEPOINTS") return time_points_data(f, line);
     if (card_ == "*AMPLITUDE") return amplitude_data(f, line);
@@ -824,6 +1242,7 @@ class Parser {
       return coupling_data(f, line);
     if (card_ == "*DISTRIBUTINGCOUPLING") return distributing_coupling_data(f, line);
     if (card_ == "*TIE") return tie_data(f, line);
+    if (card_ == "*MODELCHANGE") return model_change_data(f, line);
     // *SOLID SECTION optional thickness line, output requests, amplitudes:
     // accepted and ignored in Phase 1.
   }
@@ -1024,9 +1443,21 @@ class Parser {
     const int d2 = f.size() > 2 && !f[2].empty() ? static_cast<int>(to_index(f[2], line)) : d1;
     const Real val = f.size() > 3 ? to_double(f[3], line) : 0.0;
     const std::string amp = param("AMPLITUDE");
-    for (const Index nd : node_refs(f[0], line))
+    // *BOUNDARY, FIXED holds each listed DOF at its currently-attained (deformed)
+    // value; the multi-step driver resolves that at solve time (see Spc::fixed).
+    const bool fixed = params_.count("FIXED") != 0;
+    // Temperature DOF: CalculiX numbers the nodal temperature as DOF 11 (and accepts
+    // 0 as the temperature DOF in *CFLUX). In a heat step, *BOUNDARY on DOF 11 (or 0)
+    // prescribes a temperature; mechanical DOFs 1..3 still prescribe displacements.
+    const bool temp_dof = (d1 == 11) || (heat_step_ && d1 == 0);
+    for (const Index nd : node_refs(f[0], line)) {
+      if (temp_dof) {
+        model_.temp_bcs.push_back(TempBc{nd, val, amp});
+        continue;
+      }
       for (int c = d1; c <= d2 && c <= kDofsPerNode; ++c)
-        model_.spcs.push_back(Spc{nd, c, val, amp});
+        model_.spcs.push_back(Spc{nd, c, val, amp, fixed});
+    }
   }
 
   void cload(const std::vector<std::string>& f, int line) {
@@ -1138,14 +1569,14 @@ class Parser {
     surfaces_.push_back(std::move(s));
   }
 
-  // Parse a face id 'S<n>' -> n (1..4 for tets); reject anything else.
+  // Parse a face id 'S<n>' -> n (1..4 tet, 1..5 wedge, 1..6 hex); reject anything else.
   int surface_face(const std::string& tok, int line) {
     const std::string t = upper(tok);
     if (t.size() < 2 || t[0] != 'S')
       throw ParseError(line, "*SURFACE face must be S<n>, got '" + tok + "'");
     const int face = static_cast<int>(to_index(t.substr(1), line));
-    if (face < 1 || face > 4)
-      throw ParseError(line, "*SURFACE face out of range (1..4): '" + tok + "'");
+    if (face < 1 || face > 6)
+      throw ParseError(line, "*SURFACE face out of range (1..6): '" + tok + "'");
     return face;
   }
 
@@ -1166,10 +1597,184 @@ class Parser {
       s.faces.emplace_back(eid, face);
   }
 
-  void flush_sets() {
-    for (auto& [name, ids] : nsets_) model_.mesh.add_nset(name, ids);
-    for (auto& [name, ids] : elsets_) model_.mesh.add_elset(name, ids);
-    for (auto& s : surfaces_) model_.mesh.add_surface(std::move(s));
+  // *SURFACE INTERACTION, NAME=<name>: open a named interaction that a *SURFACE BEHAVIOR
+  // fills and a *CONTACT PAIR references. (spec: contact — surface interaction.)
+  void begin_surface_interaction(int line) {
+    const std::string name = param("NAME");
+    if (name.empty()) throw ParseError(line, "*SURFACE INTERACTION without NAME");
+    cur_interaction_ = name;
+    SurfaceInteraction si;
+    si.name = name;
+    model_.surface_interactions[name] = si;
+  }
+
+  // *SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=HARD|LINEAR|EXPONENTIAL. The law is set from
+  // the parameter here; its parameters (slope / p0,c0) come on the data line. Attaches to
+  // the most recent *SURFACE INTERACTION. (spec: contact — surface behavior normal.)
+  void begin_surface_behavior(int line) {
+    if (cur_interaction_.empty())
+      throw ParseError(line, "*SURFACE BEHAVIOR outside a *SURFACE INTERACTION");
+    SurfaceInteraction& si = model_.surface_interactions[cur_interaction_];
+    std::string po = param("PRESSURE-OVERCLOSURE");
+    if (po.empty()) po = param("PRESSUREOVERCLOSURE");
+    if (po.empty() || po == "HARD") si.behavior.law = SurfaceBehavior::Law::Hard;
+    else if (po == "LINEAR") si.behavior.law = SurfaceBehavior::Law::Linear;
+    else if (po == "EXPONENTIAL") si.behavior.law = SurfaceBehavior::Law::Exponential;
+    else if (po == "TIED") si.behavior.law = SurfaceBehavior::Law::Hard;  // treat tied as hard
+    else throw ParseError(line, "unsupported *SURFACE BEHAVIOR PRESSURE-OVERCLOSURE=" + po);
+    si.has_behavior = true;
+  }
+
+  // *SURFACE BEHAVIOR data line: LINEAR -> "slope"; EXPONENTIAL -> "c0, p0" (CalculiX
+  // orders the exponential card as c0=pressure-at-zero-clearance, then the clearance);
+  // HARD -> no data. (spec: contact — surface behavior parameters.)
+  void surface_behavior_data(const std::vector<std::string>& f, int line) {
+    if (cur_interaction_.empty()) return;
+    SurfaceInteraction& si = model_.surface_interactions[cur_interaction_];
+    if (si.behavior.law == SurfaceBehavior::Law::Linear) {
+      if (f.empty()) throw ParseError(line, "*SURFACE BEHAVIOR LINEAR needs a slope");
+      si.behavior.k = to_double(f[0], line);
+    } else if (si.behavior.law == SurfaceBehavior::Law::Exponential) {
+      if (f.size() < 2)
+        throw ParseError(line, "*SURFACE BEHAVIOR EXPONENTIAL needs 'c0, p0'");
+      // CalculiX EXPONENTIAL card: field 1 = c0 (pressure at zero clearance p0 in our
+      // struct), field 2 = the clearance at which pressure vanishes (c0 in our struct).
+      si.behavior.p0 = to_double(f[0], line);
+      si.behavior.c0 = to_double(f[1], line);
+    }
+    // HARD: no parameters.
+  }
+
+  // *FRICTION: open Coulomb friction on the most recent *SURFACE INTERACTION; mu and the
+  // optional stick stiffness come on the data line. (spec: contact — Coulomb friction.)
+  void begin_friction(int line) {
+    if (cur_interaction_.empty())
+      throw ParseError(line, "*FRICTION outside a *SURFACE INTERACTION");
+    model_.surface_interactions[cur_interaction_].friction.has = true;
+  }
+
+  // *FRICTION data line: "mu [, stick_stiffness]". mu is the Coulomb coefficient; the
+  // optional second field is the tangential stick (lambda) stiffness (0/absent -> the
+  // contact operator auto-sizes it from the normal penalty). Attaches to the most recent
+  // *SURFACE INTERACTION. (spec: contact — tangential contact / stick-slip.)
+  void friction_data(const std::vector<std::string>& f, int line) {
+    if (cur_interaction_.empty()) return;
+    Friction& fr = model_.surface_interactions[cur_interaction_].friction;
+    if (f.empty()) throw ParseError(line, "*FRICTION needs a friction coefficient mu");
+    fr.mu = to_double(f[0], line);
+    if (f.size() >= 2 && !f[1].empty()) fr.stick = to_double(f[1], line);
+    fr.has = true;
+  }
+
+  // *GAP CONDUCTANCE: open thermal contact conductance on the most recent *SURFACE
+  // INTERACTION; the coefficient comes on the data line. (spec: contact — thermal contact.)
+  void begin_gap_conductance(int line) {
+    if (cur_interaction_.empty())
+      throw ParseError(line, "*GAP CONDUCTANCE outside a *SURFACE INTERACTION");
+    model_.surface_interactions[cur_interaction_].conductance.has = true;
+  }
+
+  // *GAP CONDUCTANCE data line: "h [, ...]". The first field is the conductance
+  // coefficient (heat per unit area per unit temperature drop). CalculiX allows a
+  // pressure/temperature table; this slice consumes the constant first coefficient.
+  // (spec: contact — thermal contact conductance.)
+  void gap_conductance_data(const std::vector<std::string>& f, int line) {
+    if (cur_interaction_.empty()) return;
+    if (f.empty() || f[0].empty())
+      throw ParseError(line, "*GAP CONDUCTANCE needs a conductance coefficient");
+    GapConductance& gc = model_.surface_interactions[cur_interaction_].conductance;
+    gc.h = to_double(f[0], line);
+    gc.has = true;
+  }
+
+  // *GAP HEAT GENERATION: open interface heat generation on the most recent *SURFACE
+  // INTERACTION; the generated flux comes on the data line. (spec: contact — gap heat.)
+  void begin_gap_heat_generation(int line) {
+    if (cur_interaction_.empty())
+      throw ParseError(line, "*GAP HEAT GENERATION outside a *SURFACE INTERACTION");
+    model_.surface_interactions[cur_interaction_].heat_generation.has = true;
+  }
+
+  // *GAP HEAT GENERATION data line: "q [, ...]". The first field is the generated heat
+  // flux per unit contacting area (total; split evenly between the two surfaces).
+  // (spec: contact — gap heat generation.)
+  void gap_heat_generation_data(const std::vector<std::string>& f, int line) {
+    if (cur_interaction_.empty()) return;
+    if (f.empty() || f[0].empty())
+      throw ParseError(line, "*GAP HEAT GENERATION needs a generated-flux value");
+    GapHeatGeneration& gh = model_.surface_interactions[cur_interaction_].heat_generation;
+    gh.q = to_double(f[0], line);
+    gh.has = true;
+  }
+
+  // *CONTACT PAIR, INTERACTION=<name>, TYPE=NODE TO SURFACE|SURFACE TO SURFACE. The pair
+  // is opened here; slave/master surfaces come on the data line. (spec: contact — pairs.)
+  void begin_contact_pair(int line) {
+    ContactPair cp;
+    cp.interaction = param("INTERACTION");
+    if (cp.interaction.empty())
+      throw ParseError(line, "*CONTACT PAIR needs INTERACTION=");
+    std::string type = normalize(param("TYPE"));  // strip spaces: "NODE TO SURFACE"
+    if (type.empty() || type == "NODETOSURFACE")
+      cp.formulation = ContactPair::Formulation::NodeToSurface;
+    else if (type == "SURFACETOSURFACE")
+      cp.formulation = ContactPair::Formulation::SurfaceToSurface;
+    else
+      throw ParseError(line, "*CONTACT PAIR TYPE must be NODE TO SURFACE or SURFACE TO "
+                             "SURFACE, got '" + type + "'");
+    if (!param("ADJUST").empty()) cp.search = to_double(param("ADJUST"), line);
+    cur_contact_pair_ = static_cast<int>(model_.contact_pairs.size());
+    model_.contact_pairs.push_back(cp);
+  }
+
+  // *CONTACT PAIR data line: "slave_surface, master_surface". (spec: contact — pairs.)
+  void contact_pair_data(const std::vector<std::string>& f, int line) {
+    if (cur_contact_pair_ < 0)
+      throw ParseError(line, "*CONTACT PAIR data without a pair");
+    if (f.size() < 2)
+      throw ParseError(line, "*CONTACT PAIR needs 'slave_surface, master_surface'");
+    ContactPair& cp = model_.contact_pairs[static_cast<std::size_t>(cur_contact_pair_)];
+    // Surface names are stored uppercased (like *SURFACE NAME=); match that here so a
+    // mixed-case reference on the data line resolves. (Mesh surface keys are uppercase.)
+    cp.slave_surface = upper(f[0]);
+    cp.master_surface = upper(f[1]);
+  }
+
+  // *CLEARANCE, MASTER=<surf>, SLAVE=<surf>, VALUE=<v>: set a uniform initial clearance on
+  // the matching *CONTACT PAIR (spec: contact — contact modifiers). The clearance overrides
+  // the geometric gap so the interface starts at exactly `VALUE` regardless of the mesh.
+  // The card carries no data line. (spec: contact — *CLEARANCE initial gap.)
+  void begin_clearance(int line) {
+    const std::string master = upper(param("MASTER"));
+    const std::string slave = upper(param("SLAVE"));
+    if (master.empty() || slave.empty())
+      throw ParseError(line, "*CLEARANCE needs MASTER= and SLAVE= surface names");
+    if (param("VALUE").empty())
+      throw ParseError(line, "*CLEARANCE needs VALUE=");
+    const Real value = to_double(param("VALUE"), line);
+    bool matched = false;
+    for (ContactPair& cp : model_.contact_pairs) {
+      const bool same = (cp.master_surface == master && cp.slave_surface == slave) ||
+                        (cp.master_surface == slave && cp.slave_surface == master);
+      if (same) {
+        cp.clearance = value;
+        cp.has_clearance = true;
+        matched = true;
+      }
+    }
+    if (!matched)
+      throw ParseError(line, "*CLEARANCE MASTER=/SLAVE= match no *CONTACT PAIR");
+  }
+
+  void flush_sets() { flush_sets_into(model_); }
+
+  // Add the parsed nsets/elsets/surfaces into `m`'s mesh. Used for the single-model
+  // path (into model_) and for each step model in run_steps. Surfaces are copied (not
+  // moved) so several step meshes can each receive them.
+  void flush_sets_into(Model& m) {
+    for (auto& [name, ids] : nsets_) m.mesh.add_nset(name, ids);
+    for (auto& [name, ids] : elsets_) m.mesh.add_elset(name, ids);
+    for (const auto& s : surfaces_) m.mesh.add_surface(s);
   }
 };
 
@@ -1177,12 +1782,24 @@ class Parser {
 
 Model parse_inp(const std::string& text) { return Parser{}.run(text); }
 
+std::vector<Model> parse_inp_steps(const std::string& text) {
+  return Parser{}.run_steps(text);
+}
+
 Model parse_inp_file(const std::string& path) {
   std::ifstream in(path);
   if (!in) throw ParseError(0, "cannot open file '" + path + "'");
   std::stringstream ss;
   ss << in.rdbuf();
   return parse_inp(ss.str());
+}
+
+std::vector<Model> parse_inp_steps_file(const std::string& path) {
+  std::ifstream in(path);
+  if (!in) throw ParseError(0, "cannot open file '" + path + "'");
+  std::stringstream ss;
+  ss << in.rdbuf();
+  return parse_inp_steps(ss.str());
 }
 
 }  // namespace cxpp::io
