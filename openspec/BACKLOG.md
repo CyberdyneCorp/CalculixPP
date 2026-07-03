@@ -29,3 +29,15 @@ their own work when picked up:
 
 Deferred cards currently raise a clear `ParseError` naming the capability, so a
 deck that uses them fails loudly rather than solving silently-wrong.
+
+## From Phase 3 (`phase-3-thermal-and-contact`)
+
+| Item | What's missing | Enabler needed | Baseline spec |
+|---|---|---|---|
+| **5.1 `*MODEL CHANGE, TYPE=ELEMENT` (cross-step)** | Element active in one step, removed in the next, then re-added strain-free relative to the *deformed* geometry at reactivation. Within-step birth-death (a set removed/re-added inside the single step, strain-free from the undeformed state) is done and validated. | Multi-step analysis / step-history loop (same enabler as OP=MOD/NEW and *CHANGE MATERIAL cross-step). | `model-change` |
+| **5.2 `*MODEL CHANGE, TYPE=CONTACT PAIR` (activation)** | Actually enabling/disabling a contact pair per step. The card is parsed and each change stored on `Model::contact_pair_changes`, but nothing consumes it yet. | The contact workstream (contact search + assembly) plus multi-step step handling. | `model-change` |
+
+Model-change note: unlike the deferred material/section cards, `*MODEL CHANGE`
+does NOT raise — the feasible within-step slice is implemented, and the
+cross-step semantics degrade to the single-step interpretation rather than
+failing (documented in tasks 5.1/5.2).

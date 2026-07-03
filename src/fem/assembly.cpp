@@ -229,11 +229,13 @@ LinearSystem assemble_linear_static(const Model& model) {
   const Index n_free = sys.n_free;
 
   const std::vector<ElasticIso> elastic = model.element_elastic();
+  const std::vector<bool> active = model.element_active_mask();
   std::unordered_map<std::int64_t, Real> kmap;
   std::vector<Index> nidx;
   std::vector<Vec3> coords, ue;
 
   for (std::size_t e = 0; e < mesh.num_elements(); ++e) {
+    if (!active[e]) continue;  // *MODEL CHANGE, REMOVE: element carries no stiffness
     const Element& elem = mesh.elements()[e];
     const int n = nodes_per_element(elem.type);
     gather(mesh, elem, n, nullptr, nidx, coords, ue);
@@ -246,6 +248,9 @@ LinearSystem assemble_linear_static(const Model& model) {
 
   // External loads, distributed through the constraint transform.
   add_external_load(sys, external_load_vector(model), sys.rhs);
+  // Thermal-strain equivalent load (zero unless *EXPANSION + an applied temperature
+  // field are present, so the pure-mechanical path is untouched).
+  add_external_load(sys, thermal_strain_load_vector(model), sys.rhs);
 
   flush_coo(kmap, n_free, sys);
   return sys;
@@ -313,11 +318,13 @@ LinearSystem assemble_material_tangent(const Model& model,
   const Index n_free = sys.n_free;
 
   f_int.assign(mesh.num_nodes() * kDofsPerNode, 0.0);
+  const std::vector<bool> active = model.element_active_mask();
   std::unordered_map<std::int64_t, Real> kmap;
   std::vector<Index> nidx;
   std::vector<Vec3> coords, ue;
 
   for (std::size_t e = 0; e < mesh.num_elements(); ++e) {
+    if (!active[e]) continue;  // *MODEL CHANGE, REMOVE: no tangent / internal force
     const Element& elem = mesh.elements()[e];
     const int n = nodes_per_element(elem.type);
     const int ndof = n * kDofsPerNode;

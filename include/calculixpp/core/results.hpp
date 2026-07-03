@@ -16,4 +16,23 @@ struct StaticFields {
   std::vector<Vec3> reaction;      // RF (f_int - f_ext)
 };
 
+// Nodal result fields for a heat-transfer step, aligned with mesh node indices
+// (spec: heat-transfer-analysis / results-output). `temperature` is the NT field;
+// `flux_reaction` is the concentrated nodal heat-flux reaction RFL at prescribed-
+// temperature nodes (Kt*T at the constrained DOFs), analogous to mechanical RF.
+struct ThermalFields {
+  std::vector<Real> temperature;     // NT
+  std::vector<Real> flux_reaction;   // RFL
+};
+
+// Combined result of a *COUPLED TEMPERATURE-DISPLACEMENT step (spec:
+// heat-transfer-analysis — coupled). `thermal` is the solved temperature field
+// (NT/RFL); `mechanical` is the displacement/stress/reaction field computed with the
+// thermal strain eps_th = alpha (T - Tref) applied. The one-way (sequential) scheme
+// fills `thermal` first, then `mechanical` from the resulting temperature field.
+struct CoupledFields {
+  ThermalFields thermal;
+  StaticFields mechanical;
+};
+
 }  // namespace cxpp

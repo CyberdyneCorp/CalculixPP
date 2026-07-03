@@ -76,6 +76,31 @@ struct UserMaterial {
   bool empty() const { return name.empty(); }
 };
 
+// Thermal material properties for heat-transfer analysis (spec:
+// heat-transfer-analysis / material-models — *CONDUCTIVITY, *SPECIFIC HEAT).
+// Conductivity is stored isotropically: `k` is the scalar conductivity used in the
+// conduction element matrix Kt_e = ∫ ∇N_a·(k ∇N_b) dV. Specific heat and density
+// (via Material::density) feed the transient capacitance C_e = ∫ rho*c N_a N_b dV.
+struct Thermal {
+  Real conductivity{0.0};   // *CONDUCTIVITY (isotropic scalar k)
+  Real specific_heat{0.0};  // *SPECIFIC HEAT (c), used by transient capacitance
+  bool empty() const { return conductivity == 0.0 && specific_heat == 0.0; }
+};
+
+// Thermal-expansion data (spec: heat-transfer-analysis — coupled; material-models —
+// *EXPANSION). Isotropic linear expansion: the thermal strain is
+// eps_th = alpha (T - Tref) applied to the three normal components (Voigt xx,yy,zz),
+// which the mechanical path subtracts from the total strain so
+// sigma = D (eps_mech - eps_th). `alpha` is the *EXPANSION coefficient (first,
+// isotropic value); `t_ref` is the ZERO parameter on *EXPANSION (the reference /
+// stress-free temperature, default 0). Only the isotropic first coefficient is
+// consumed; temperature-dependent tables are deferred.
+struct Expansion {
+  Real alpha{0.0};   // *EXPANSION coefficient (isotropic)
+  Real t_ref{0.0};   // reference (stress-free) temperature — *EXPANSION, ZERO=
+  bool empty() const { return alpha == 0.0; }
+};
+
 struct Material {
   std::string name;
   std::optional<ElasticIso> elastic;
@@ -83,6 +108,8 @@ struct Material {
   std::optional<Plastic> plastic;  // *PLASTIC / *CYCLIC HARDENING (J2 plasticity)
   std::optional<Hyperelastic> hyperelastic;  // *HYPERELASTIC / *HYPERFOAM (4.3)
   std::optional<UserMaterial> user;          // *USER MATERIAL / *DEPVAR (4.6)
+  std::optional<Thermal> thermal;            // *CONDUCTIVITY / *SPECIFIC HEAT (Phase 3)
+  std::optional<Expansion> expansion;        // *EXPANSION (thermal-strain coupling)
 
   // Effective isotropic elastic properties for the linear DOF-map / initial-tangent
   // assembly. Returns the *ELASTIC block if present; otherwise derives an equivalent

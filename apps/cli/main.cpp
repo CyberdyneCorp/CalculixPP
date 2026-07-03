@@ -8,6 +8,7 @@
 
 #include "calculixpp/io/inp_parser.hpp"
 #include "calculixpp/io/results_writer.hpp"
+#include "calculixpp/numerics/heat_transfer.hpp"
 #include "calculixpp/numerics/linear_static.hpp"
 #include "calculixpp/numerics/nonlinear_static.hpp"
 
@@ -63,6 +64,54 @@ int main(int argc, char** argv) {
 
   try {
     const Model model = cxpp::io::parse_inp_file(input);
+
+    // A *COUPLED TEMPERATURE-DISPLACEMENT deck solves the thermal field, applies the
+    // resulting thermal strain, then solves the mechanical field (one-way coupling).
+    // The written .frd/.dat carry the mechanical (displacement/stress) result.
+    if (model.procedure == Procedure::Coupled) {
+      const CoupledFields cf = numerics::solve_coupled(model, forced);
+      Real umax = 0.0, svm_max = 0.0;
+      for (std::size_t i = 0; i < model.mesh.num_nodes(); ++i) {
+        const Vec3& u = cf.mechanical.displacement[i];
+        umax = std::max(umax, std::sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]));
+        svm_max = std::max(svm_max, von_mises(cf.mechanical.stress[i]));
+      }
+      cxpp::io::write_frd(out + ".frd", model, cf.mechanical);
+      cxpp::io::write_dat(out + ".dat", model, cf.mechanical);
+      std::printf("CalculiX++  %s  (coupled temperature-displacement)\n",
+                  input.c_str());
+      std::printf("  nodes=%zu  elements=%zu\n", model.mesh.num_nodes(),
+                  model.mesh.num_elements());
+      std::printf("  max |u|        = %.6g\n", umax);
+      std::printf("  max von Mises  = %.6g\n", svm_max);
+      std::printf("  wrote %s.frd, %s.dat\n", out.c_str(), out.c_str());
+      return 0;
+    }
+
+    // Auto-dispatch on the parsed procedure: a *HEAT TRANSFER deck (steady or
+    // transient) solves the scalar temperature field; everything else takes the
+    // mechanical path.
+    if (model.procedure == Procedure::HeatTransferSteady ||
+        model.procedure == Procedure::HeatTransferTransient) {
+      const bool transient = model.procedure == Procedure::HeatTransferTransient;
+      const ThermalFields t = numerics::solve_heat_transfer(model, forced);
+      Real tmin = 0.0, tmax = 0.0;
+      if (!t.temperature.empty()) tmin = tmax = t.temperature[0];
+      for (const Real v : t.temperature) {
+        tmin = std::min(tmin, v);
+        tmax = std::max(tmax, v);
+      }
+      cxpp::io::write_frd(out + ".frd", model, t);
+      cxpp::io::write_dat(out + ".dat", model, t);
+      std::printf("CalculiX++  %s  (heat transfer, %s)\n", input.c_str(),
+                  transient ? "transient" : "steady state");
+      std::printf("  nodes=%zu  elements=%zu\n", model.mesh.num_nodes(),
+                  model.mesh.num_elements());
+      std::printf("  temperature range = [%.6g, %.6g]\n", tmin, tmax);
+      std::printf("  wrote %s.frd, %s.dat\n", out.c_str(), out.c_str());
+      return 0;
+    }
+
     // --solver overrides; otherwise honor the deck's SOLVER= (Auto by default).
     // --nonlinear routes through the Newton-Raphson driver (identical results on a
     // linear model); the default path stays the linear solve.

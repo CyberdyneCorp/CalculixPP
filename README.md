@@ -9,6 +9,8 @@ Numerics come from in-house libraries — **[NumPP](https://github.com/Cyberdyne
 > **Phase 1 (Foundation) is complete and validated.** The linear-static pipeline solves the reference `beam10p.inp` cantilever and its nodal displacements match **stock CalculiX to a relative L2 of 5.4 × 10⁻⁸**. A larger 8,268-DOF model solves in **0.34 s** (sparse Cholesky).
 >
 > **Phase 2 (Nonlinear statics & materials) is in progress.** A Newton-Raphson driver (`solve_nonlinear`) with automatic incrementation now drives J2 plasticity, a C++ user-material seam, and the full hex/wedge element family (`C3D8`/`C3D20`/`C3D6`/`C3D15` + reduced `C3D8R`/`C3D20R`), plus amplitudes, body loads (`GRAV`/`CENTRIF`), springs/masses, and constraints (`*EQUATION`/`*MPC`/`*RIGID BODY`/`*COUPLING`/`*TIE`). New reference decks validate: `beam8p` (C3D8) and `beam20p` (C3D20) match stock CalculiX to **rel-L2 ~5.7 × 10⁻⁸**, and the nonlinear driver reproduces the linear solve to **< 10⁻¹⁰** in one increment.
+>
+> **Phase 3 (Thermal & contact) — the THERMAL track is landed and validated.** A scalar 1-DOF/node temperature field runs in parallel to the mechanical path, reusing the same mesh, shape functions/Gauss rules, and sparse solve: steady-state and transient (backward-Euler) conduction, `*CFLUX`/`*DFLUX` heat loads, convective `*FILM`, linearized surface `*RADIATE`, and one-way `*COUPLED TEMPERATURE-DISPLACEMENT` thermal stress (`*EXPANSION`), plus element/contact-pair `*MODEL CHANGE`. `solve()` auto-dispatches a `*HEAT TRANSFER` deck and returns nodal temperature (`NT`) and heat-flux reaction (`RFL`). Validated against stock CalculiX heat decks (`oneel20cf`/`df`/`fi` steady conduction to ~1e-9, `oneel20fi2` transient film relaxation to ~1e-4) and the `beamt` thermal-stress deck (rel-L2 ~2.4 × 10⁻⁶). **Contact (search engine, contact pairs, friction, thermal gap conductance) is the next workflow** — those cards are parsed but rejected with an actionable error rather than silently mis-solved.
 
 ---
 
@@ -178,6 +180,55 @@ s = calculixpp.summary_text(plastic_cube)
 print(s["element_type_counts"], "plastic:", s["has_plasticity"])
 ```
 
+### Python — heat transfer (Phase 3)
+
+A `*HEAT TRANSFER` deck is auto-dispatched by `solve()` to the scalar thermal solver, which returns the nodal temperature field (`NT`) and the heat-flux reaction (`RFL`) instead of displacement/stress. This unit cube conducts between a hot face (x=1, held at 100) and a cold face (x=0, held at 0); the analytic steady field is a linear profile, recovered exactly:
+
+```python
+import calculixpp
+
+heat_cube = """
+*NODE
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 1., 1., 0.
+4, 0., 1., 0.
+5, 0., 0., 1.
+6, 1., 0., 1.
+7, 1., 1., 1.
+8, 0., 1., 1.
+*ELEMENT, TYPE=C3D8, ELSET=EALL
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*MATERIAL, NAME=COND
+*CONDUCTIVITY
+50.
+*SOLID SECTION, ELSET=EALL, MATERIAL=COND
+*STEP
+*HEAT TRANSFER, STEADY STATE
+*BOUNDARY
+1, 11, 11, 0.
+4, 11, 11, 0.
+5, 11, 11, 0.
+8, 11, 11, 0.
+2, 11, 11, 100.
+3, 11, 11, 100.
+6, 11, 11, 100.
+7, 11, 11, 100.
+*END STEP
+"""
+
+r = calculixpp.solve_text(heat_cube)
+print(r["procedure"])                              # -> "heat transfer steady state"
+T = r["temperature"]                               # (N,) nodal temperature (NT)
+Q = r["flux_reaction"]                             # (N,) heat-flux reaction (RFL)
+print("T range:", float(min(T)), "->", float(max(T)))   # 0.0 -> 100.0 (linear profile)
+
+# summary() reports the analysis procedure without solving.
+print(calculixpp.summary_text(heat_cube)["procedure"])  # "heat transfer steady state"
+```
+
+Transient conduction (drop `STEADY STATE`, add `*SPECIFIC HEAT` / `*DENSITY` and an `*INITIAL CONDITIONS, TYPE=TEMPERATURE`) marches backward-Euler over the step period; `*COUPLED TEMPERATURE-DISPLACEMENT` returns both the temperature and the thermal-stress mechanical fields in one result dict.
+
 ### C++
 
 ```cpp
@@ -222,6 +273,7 @@ Direct is fastest and exact for small/medium systems; IC0-CG keeps memory linear
 - **Accuracy (Phase 1)** — `beam10p.inp` (90 nodes, 31 C3D10) nodal displacements vs stock CalculiX `beam10p.dat.ref`: **relative L2 = 5.36 × 10⁻⁸**.
 - **Accuracy (Phase 2)** — the hex family matches stock CalculiX references: `beam8p` (C3D8) **rel-L2 = 5.71 × 10⁻⁸**, `beam20p` (C3D20) **rel-L2 = 5.76 × 10⁻⁸**; `achtel*` decks validate `*EQUATION` constraints and `GRAV`/`CENTRIF` body loads to rel-L2 ~1–2 × 10⁻⁷.
 - **Nonlinear gate** — the Newton-Raphson driver reproduces the linear direct solve to **rel-L2 < 10⁻¹⁰** in one increment (single-tet and beam10p), so nonlinear does not perturb linear results. J2 plasticity and the C++ user material are validated against their analytic solutions.
+- **Accuracy (Phase 3 — thermal)** — heat-transfer nodal temperatures (`NT`) vs stock CalculiX: steady conduction `oneel20cf`/`df`/`fi` (`*CFLUX`/`*DFLUX`/`*FILM`) to **max abs ~10⁻⁹**, transient film `oneel20fi2` relaxing to the end-of-step steady field to **~10⁻⁴** (reference uses adaptive sub-stepping, we march fixed sub-steps). One-way thermal stress `beamt` (C3D20R `*EXPANSION` + `*TEMPERATURE`) to **rel-L2 ~2.4 × 10⁻⁶**. The pure-mechanical path is byte-for-byte unchanged (a deck with no applied temperature never touches the thermal gates).
 - **Scaling** — `segmentunsmooth` (8,268 DOF): sparse direct **0.34 s**; IC0-CG **1.30 s** — both to the same solution. (The earlier dense path took 94 s; see [SciPP #10](https://github.com/CyberdyneCorp/SciPP/issues/10).)
 - **Correctness harness** — analytical element patch tests (gradient consistency, uniaxial stress/strain, hex/wedge partition-of-unity + rigid-body null space), pressure-load equilibrium, consistent-tangent finite-difference checks, and reference-deck regression, all in CI.
 
@@ -234,7 +286,7 @@ timeline
   title CalculiX++ phased roadmap
   Phase 1 (done) : Foundation and linear-static slice : engine build-and-tooling
   Phase 2 (in progress) : Nonlinear statics and materials : engine nonlinear-solution-control
-  Phase 3 : Thermal and contact : engine contact-search
+  Phase 3 (thermal landed) : Thermal and contact : engine contact-search
   Phase 4 : Dynamics and eigenproblems : engine eigensolution
   Phase 5 : Advanced physics : engine field-coupling
 ```
@@ -243,7 +295,7 @@ timeline
 |---|---|---|
 | **1 — Foundation** | Build system, NumPP/SciPP, CPU backend, linear-static slice, Python bindings | ✅ complete |
 | **2 — Nonlinear** | Newton-Raphson, plasticity, user material, hex/wedge & load breadth, constraints | 🚧 in progress |
-| **3 — Thermal & contact** | Heat transfer, coupled thermomechanics, contact | 📋 specified |
+| **3 — Thermal & contact** | Heat transfer, coupled thermomechanics, model change, contact | 🚧 thermal landed; contact next |
 | **4 — Dynamics** | Frequency, buckling, direct/modal dynamics, substructures | 📋 specified |
 | **5 — Advanced** | CFD/networks, electromagnetics, crack propagation, optimization | 📋 specified |
 

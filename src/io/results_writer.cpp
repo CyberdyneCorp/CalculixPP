@@ -44,13 +44,9 @@ Voigt6 to_frd_order(const Voigt6& s) {
   return {s[0], s[1], s[2], s[3], s[5], s[4]};
 }
 
-}  // namespace
-
-void write_frd(const std::string& path, const Model& model, const StaticFields& f) {
-  std::ofstream out(path);
-  if (!out) throw std::runtime_error("cannot open .frd for writing: " + path);
-  const Mesh& mesh = model.mesh;
-
+// Write the .frd header + node + element mesh blocks (shared by static and thermal
+// result writers). Leaves the stream positioned to append result datasets.
+void write_frd_mesh(std::ofstream& out, const Mesh& mesh) {
   out << "    1C\n";
   out << "    1UUSER   CalculiX++\n";
 
@@ -72,6 +68,15 @@ void write_frd(const std::string& path, const Model& model, const StaticFields& 
     out << "\n";
   }
   out << " -3\n";
+}
+
+}  // namespace
+
+void write_frd(const std::string& path, const Model& model, const StaticFields& f) {
+  std::ofstream out(path);
+  if (!out) throw std::runtime_error("cannot open .frd for writing: " + path);
+  const Mesh& mesh = model.mesh;
+  write_frd_mesh(out, mesh);
 
   auto dataset_header = [&](const char* name, int ncomp) {
     out << "  100CL  101" << e12_5(1.0) << i10(static_cast<long>(mesh.num_nodes()))
@@ -153,6 +158,37 @@ void write_dat(const std::string& path, const Model& model, const StaticFields& 
   for (std::size_t i = 0; i < mesh.num_nodes(); ++i)
     out << i10(mesh.nodes()[i].id) << e12_5(f.reaction[i][0])
         << e12_5(f.reaction[i][1]) << e12_5(f.reaction[i][2]) << "\n";
+}
+
+void write_frd(const std::string& path, const Model& model, const ThermalFields& t) {
+  std::ofstream out(path);
+  if (!out) throw std::runtime_error("cannot open .frd for writing: " + path);
+  const Mesh& mesh = model.mesh;
+  write_frd_mesh(out, mesh);
+
+  // NDTEMP scalar temperature dataset (CGX field name NDTEMP / component T1).
+  out << "  100CL  101" << e12_5(1.0) << i10(static_cast<long>(mesh.num_nodes()))
+      << "                     0    1           1\n";
+  out << " -4  NDTEMP      1    1\n";
+  out << " -5  T           1    1    0    0\n";
+  for (std::size_t i = 0; i < mesh.num_nodes(); ++i)
+    out << " -1" << i10(mesh.nodes()[i].id) << e12_5(t.temperature[i]) << "\n";
+  out << " -3\n";
+  out << " 9999\n";
+}
+
+void write_dat(const std::string& path, const Model& model, const ThermalFields& t) {
+  std::ofstream out(path);
+  if (!out) throw std::runtime_error("cannot open .dat for writing: " + path);
+  const Mesh& mesh = model.mesh;
+
+  out << "\n temperatures (t)\n\n";
+  for (std::size_t i = 0; i < mesh.num_nodes(); ++i)
+    out << i10(mesh.nodes()[i].id) << e12_5(t.temperature[i]) << "\n";
+
+  out << "\n heat generation (rfl)\n\n";
+  for (std::size_t i = 0; i < mesh.num_nodes(); ++i)
+    out << i10(mesh.nodes()[i].id) << e12_5(t.flux_reaction[i]) << "\n";
 }
 
 }  // namespace cxpp::io

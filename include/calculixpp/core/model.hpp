@@ -58,6 +58,64 @@ struct BodyLoad {
   std::string amplitude;
 };
 
+// Prescribed nodal temperature for a heat-transfer step (spec:
+// heat-transfer-analysis). In a heat step *BOUNDARY node,11[,11],value fixes the
+// temperature DOF; *TEMPERATURE node,value does the same. `amplitude` scales the
+// value over step time (empty -> default linear ramp), mirroring Spc.
+struct TempBc {
+  Index node_id{};
+  Real value{0.0};
+  std::string amplitude;
+};
+
+// Concentrated nodal heat flux (*CFLUX node,dof,value). The dof field (0 or 11 in
+// CalculiX) selects the temperature DOF and is not stored; the flux adds directly
+// to the thermal rhs. `amplitude` scales the value over step time.
+struct Cflux {
+  Index node_id{};
+  Real value{0.0};
+  std::string amplitude;
+};
+
+// Distributed surface heat flux on an element face (*DFLUX elem,S<face>,magnitude).
+// Positive `flux` is heat flowing INTO the element across the face (integrated as
+// ∫ N_a * flux dA over the face). Face 1..6 depending on element topology.
+// `amplitude` scales the flux over step time. (spec: heat-transfer-analysis.)
+struct Dflux {
+  Index elem_id{};
+  int face{};       // 1..6 (tet 1..4)
+  Real flux{0.0};
+  std::string amplitude;
+};
+
+// Convective film boundary condition on an element face (*FILM elem,F<face>,
+// T_sink,h). The face loses heat q_film = h (T - T_sink) per unit area, which adds
+// h ∫N_a N_b dA to the conduction matrix and h T_sink ∫N_a dA to the thermal rhs.
+// `amplitude` scales the sink temperature over step time. Face 1..6 (tet 1..4).
+// (spec: heat-transfer-analysis — convective film loads.)
+struct Film {
+  Index elem_id{};
+  int face{};        // 1..6 (tet 1..4)
+  Real sink_temp{0.0};
+  Real h{0.0};       // film (convection) coefficient
+  std::string amplitude;
+};
+
+// Surface-to-ambient radiation on an element face (*RADIATE elem,R<face>,T_amb,eps).
+// The face radiates q = eps sigma (T^4 - T_amb^4) per unit area (absolute
+// temperatures), linearized within the thermal Newton iteration. `emissivity` is
+// eps in [0,1]; the Stefan-Boltzmann constant and absolute-zero offset come from
+// the model's PhysicalConstants. `amplitude` scales the ambient temperature over
+// step time. Cavity view-factor radiation is deferred (surface-to-ambient only).
+// (spec: heat-transfer-analysis — radiation.)
+struct Radiate {
+  Index elem_id{};
+  int face{};          // 1..6 (tet 1..4)
+  Real ambient_temp{0.0};
+  Real emissivity{0.0};
+  std::string amplitude;
+};
+
 // Which linear solver the step requested (via SOLVER= on *STATIC). Maps the
 // CalculiX solver names onto the paths CalculiX++ implements. When SOLVER= is
 // unspecified the request is Auto: the numerics layer picks sparse-direct for
@@ -67,6 +125,41 @@ enum class RequestedSolver {
   Auto,    // default; size-based direct-vs-CG choice (see resolve_solver_kind)
   Direct,  // SPOOLES/PARDISO/PASTIX/DIRECT map here (sparse spsolve)
   CG,      // ITERATIVE*/CG (IC0-preconditioned cg)
+};
+
+// Analysis procedure selected by the step's procedure card. Static is the default
+// (mechanical *STATIC); HeatTransferSteady is a *HEAT TRANSFER, STEADY STATE step,
+// HeatTransferTransient a transient *HEAT TRANSFER step (backward-Euler time
+// integration of the capacitance term). Both are scalar temperature fields.
+// (spec: heat-transfer-analysis.)
+enum class Procedure {
+  Static,
+  HeatTransferSteady,
+  HeatTransferTransient,
+  // *COUPLED TEMPERATURE-DISPLACEMENT: temperature + displacement solved together.
+  // The one-way (sequential) scheme solves the steady thermal field first, then
+  // applies its thermal strain to a mechanical solve. (spec: heat-transfer — coupled.)
+  Coupled,
+};
+
+// A *MODEL CHANGE, TYPE=CONTACT PAIR record (spec: model-change — activate/deactivate
+// a named contact pair between steps). Parsed and stored only in this thermal track;
+// the contact assembly that consumes it lands in the contact workflow. `add` is true
+// for ADD (activate), false for REMOVE (deactivate). The two surface names identify the
+// pair (order as written on the *CONTACT PAIR card). (spec: model-change — contact pair.)
+struct ContactPairChange {
+  std::string surface_a;  // first *SURFACE name of the pair
+  std::string surface_b;  // second *SURFACE name of the pair
+  bool add{true};         // true = ADD (activate), false = REMOVE (deactivate)
+};
+
+// Physical constants for radiation and absolute-temperature conversion, from
+// *PHYSICAL CONSTANTS (ABSOLUTE ZERO, STEFAN BOLTZMANN). Radiation works in
+// absolute temperature T_abs = T - absolute_zero; sigma is the Stefan-Boltzmann
+// constant. Zero sigma (no card) makes *RADIATE inert. (spec: heat-transfer.)
+struct PhysicalConstants {
+  Real absolute_zero{0.0};  // e.g. -273.15 for Celsius decks
+  Real sigma{0.0};          // Stefan-Boltzmann constant
 };
 
 // The assembled analysis model for the linear-static slice.
@@ -80,6 +173,31 @@ class Model {
   std::vector<Dload> dloads;
   std::vector<BodyLoad> body_loads;
   std::unordered_map<std::string, Amplitude> amplitudes;
+
+  // Thermal step data (spec: heat-transfer-analysis). Populated only for a
+  // *HEAT TRANSFER step; inert on the mechanical path.
+  Procedure procedure{Procedure::Static};
+  std::vector<TempBc> temp_bcs;  // prescribed temperatures (*BOUNDARY dof 11 / *TEMPERATURE)
+  std::vector<Cflux> cfluxes;    // concentrated nodal heat flux (*CFLUX)
+  std::vector<Dflux> dfluxes;    // distributed surface heat flux (*DFLUX)
+  std::vector<Film> films;       // convective film boundary (*FILM)
+  std::vector<Radiate> radiates; // surface-to-ambient radiation (*RADIATE)
+  PhysicalConstants physical;    // *PHYSICAL CONSTANTS (radiation sigma / abs zero)
+
+  // Uniform initial temperature for a transient step (*INITIAL CONDITIONS,
+  // TYPE=TEMPERATURE). Per-node overrides land in initial_temperature_by_node;
+  // nodes absent from it fall back to initial_temperature. Steady state ignores it.
+  Real initial_temperature{0.0};
+  std::unordered_map<Index, Real> initial_temperature_by_node;
+
+  // Applied nodal temperature field for a MECHANICAL step with thermal expansion
+  // (spec: heat-transfer — coupled / thermal expansion). On a plain *STATIC deck the
+  // parser fills this from *TEMPERATURE cards; a *COUPLED TEMPERATURE-DISPLACEMENT
+  // step overwrites it with the solved thermal field before the mechanical solve.
+  // Nodes absent from the map carry no temperature change (thermal strain zero). The
+  // thermal strain of an element with *EXPANSION(alpha,Tref) is
+  // eps_th = alpha (T - Tref) on the normal components. Empty -> pure mechanics.
+  std::unordered_map<Index, Real> applied_temperature;
 
   // Discrete/connector elements (spec: element-sections — *SPRING/*MASS/*DASHPOT).
   // Springs contribute to the static stiffness; masses and dashpots are stored for
@@ -96,6 +214,28 @@ class Model {
   std::vector<RigidBody> rigid_bodies;
   std::vector<Coupling> couplings;
   std::vector<Tie> ties;
+
+  // Element birth-death from *MODEL CHANGE, TYPE=ELEMENT (spec: model-change). Element
+  // ids listed here are DEACTIVATED for the (single) step: they contribute no
+  // stiffness, mass, internal force, body load, or thermal-strain load, and no stress.
+  // A `TYPE=ELEMENT, ADD` for an id removes it from this set (reactivation). Because the
+  // current model is single-step, reactivation is strain-free by construction — the
+  // solve starts from the undeformed state, so a re-added element carries zero initial
+  // strain. Cross-step birth-death (an element active in one step, removed in the next,
+  // re-added strain-free relative to the deformed geometry) needs the multi-step engine
+  // and is deferred (see openspec/BACKLOG.md / tasks.md 5.1). Empty -> every element
+  // active (byte-for-byte the pre-model-change path).
+  std::vector<Index> deactivated_elements;
+
+  // *MODEL CHANGE, TYPE=CONTACT PAIR records, parsed and stored only here (consumed by
+  // the contact workflow). (spec: model-change — contact pair activation.)
+  std::vector<ContactPairChange> contact_pair_changes;
+
+  // Per-element active flag aligned with mesh.elements(): false for an id in
+  // `deactivated_elements`, true otherwise. All-true when no element was removed, so
+  // callers that gate their element loops on this mask are unchanged on a deck without
+  // *MODEL CHANGE. (spec: model-change — deactivated elements carry no load.)
+  std::vector<bool> element_active_mask() const;
 
   // Solver requested by the *STATIC step (SOLVER=), Auto when unspecified.
   RequestedSolver solver{RequestedSolver::Auto};
@@ -137,6 +277,29 @@ class Model {
   // Mass density per element (aligned with mesh.elements()), resolved from the
   // solid sections' materials. Elements without *DENSITY get 0. Used by body loads.
   std::vector<Real> element_density() const;
+
+  // Isotropic thermal conductivity per element (aligned with mesh.elements()),
+  // resolved from the solid sections' materials. Throws on a missing elset/material
+  // or an element left without a section (like element_elastic). An element whose
+  // material carries no *CONDUCTIVITY throws — a heat-transfer solve needs it.
+  // (spec: heat-transfer-analysis — *CONDUCTIVITY consumed in the conduction kernel.)
+  std::vector<Real> element_conductivity() const;
+
+  // Thermal-expansion data per element (aligned with mesh.elements()), resolved from
+  // the solid sections' materials. Elements whose material carries no *EXPANSION get
+  // an empty optional (no thermal strain). Last-writer wins per element, like
+  // element_elastic. (spec: heat-transfer — thermal expansion coupling.)
+  std::vector<std::optional<Expansion>> element_expansion() const;
+
+  // True when any element's material carries *EXPANSION AND an applied temperature
+  // field is present. When true a mechanical solve adds the thermal-strain load and
+  // subtracts eps_th in stress recovery; when false the mechanical path is unchanged.
+  bool has_thermal_strain() const;
+
+  // Volumetric heat capacity rho*c per element (aligned with mesh.elements()) for
+  // the transient capacitance matrix. Elements without both *DENSITY and *SPECIFIC
+  // HEAT get 0 (steady-state does not use it). (spec: heat-transfer-analysis.)
+  std::vector<Real> element_heat_capacity() const;
 
   // Expand every constraint (the raw *EQUATION relations plus the *MPC / *RIGID BODY
   // / *COUPLING / *TIE cards) into a flat list of linear Equations, ready for the

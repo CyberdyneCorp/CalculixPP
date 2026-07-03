@@ -112,6 +112,28 @@ std::vector<std::optional<UserMaterial>> Model::element_user_material() const {
   return out;
 }
 
+std::vector<std::optional<Expansion>> Model::element_expansion() const {
+  std::vector<std::optional<Expansion>> out(mesh.num_elements());
+  for (const auto& section : sections) {
+    const std::vector<Index>* ids = mesh.elset(section.elset);
+    if (ids == nullptr) continue;  // element_elastic() already validates elsets
+    const auto mat = materials.find(section.material);
+    if (mat == materials.end()) continue;
+    for (const Index elem_id : *ids) {
+      const Index ei = mesh.element_index(elem_id);
+      if (ei >= 0) out[static_cast<std::size_t>(ei)] = mat->second.expansion;
+    }
+  }
+  return out;
+}
+
+bool Model::has_thermal_strain() const {
+  if (applied_temperature.empty()) return false;
+  for (const auto& [name, mat] : materials)
+    if (mat.expansion && !mat.expansion->empty()) return true;
+  return false;
+}
+
 bool Model::has_nonlinear_material() const {
   for (const auto& [name, mat] : materials) {
     if (mat.plastic && !mat.plastic->empty()) return true;
@@ -127,6 +149,15 @@ bool Model::has_plasticity() const {
   return false;
 }
 
+std::vector<bool> Model::element_active_mask() const {
+  std::vector<bool> active(mesh.num_elements(), true);
+  for (const Index elem_id : deactivated_elements) {
+    const Index ei = mesh.element_index(elem_id);
+    if (ei >= 0) active[static_cast<std::size_t>(ei)] = false;
+  }
+  return active;
+}
+
 std::vector<Real> Model::element_density() const {
   std::vector<Real> out(mesh.num_elements(), 0.0);
   for (const auto& section : sections) {
@@ -137,6 +168,63 @@ std::vector<Real> Model::element_density() const {
     for (const Index elem_id : *ids) {
       const Index ei = mesh.element_index(elem_id);
       if (ei >= 0) out[static_cast<std::size_t>(ei)] = *mat->second.density;
+    }
+  }
+  return out;
+}
+
+std::vector<Real> Model::element_conductivity() const {
+  std::vector<Real> out(mesh.num_elements(), 0.0);
+  std::vector<bool> assigned(mesh.num_elements(), false);
+
+  for (const auto& section : sections) {
+    const std::vector<Index>* ids = mesh.elset(section.elset);
+    if (ids == nullptr) {
+      throw std::runtime_error("solid section references unknown elset '" +
+                               section.elset + "'");
+    }
+    const auto mat = materials.find(section.material);
+    if (mat == materials.end()) {
+      throw std::runtime_error("solid section references unknown material '" +
+                               section.material + "'");
+    }
+    if (!mat->second.thermal || mat->second.thermal->conductivity == 0.0) {
+      throw std::runtime_error("material '" + section.material +
+                               "' has no *CONDUCTIVITY data (needed for heat transfer)");
+    }
+    for (const Index elem_id : *ids) {
+      const Index ei = mesh.element_index(elem_id);
+      if (ei < 0) {
+        throw std::runtime_error("elset '" + section.elset +
+                                 "' references unknown element");
+      }
+      out[static_cast<std::size_t>(ei)] = mat->second.thermal->conductivity;
+      assigned[static_cast<std::size_t>(ei)] = true;
+    }
+  }
+
+  for (std::size_t i = 0; i < assigned.size(); ++i) {
+    if (!assigned[i]) {
+      throw std::runtime_error("element " +
+                               std::to_string(mesh.elements()[i].id) +
+                               " has no solid section / material");
+    }
+  }
+  return out;
+}
+
+std::vector<Real> Model::element_heat_capacity() const {
+  std::vector<Real> out(mesh.num_elements(), 0.0);
+  for (const auto& section : sections) {
+    const std::vector<Index>* ids = mesh.elset(section.elset);
+    if (ids == nullptr) continue;  // element_conductivity() validates elsets
+    const auto mat = materials.find(section.material);
+    if (mat == materials.end() || !mat->second.thermal || !mat->second.density)
+      continue;
+    const Real rho_c = *mat->second.density * mat->second.thermal->specific_heat;
+    for (const Index elem_id : *ids) {
+      const Index ei = mesh.element_index(elem_id);
+      if (ei >= 0) out[static_cast<std::size_t>(ei)] = rho_c;
     }
   }
   return out;

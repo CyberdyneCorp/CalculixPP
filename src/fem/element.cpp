@@ -600,6 +600,37 @@ std::vector<Real> element_stiffness(ElementType type, std::span<const Vec3> coor
   return Ke;
 }
 
+std::vector<Real> element_thermal_load(ElementType type,
+                                       std::span<const Vec3> coords, const D6& D,
+                                       Real alpha, std::span<const Real> te) {
+  const int n = nodes_per_element(type);
+  const int ndof = n * kDofsPerNode;
+  std::vector<Real> fe(static_cast<std::size_t>(ndof), 0.0);
+  std::array<std::array<Real, 3>, kMaxNodes> g{};
+
+  for (const GaussPoint& gp : gauss_rule(type)) {
+    const Shape s = shape(type, gp.xi, gp.et, gp.ze);
+    const Real det = physical_gradients(s, coords, g);
+    // Temperature change interpolated to this Gauss point: dT = Σ_k N_k te_k.
+    Real dT = 0.0;
+    for (int k = 0; k < n; ++k)
+      dT += s.N[static_cast<std::size_t>(k)] * te[static_cast<std::size_t>(k)];
+    // Thermal strain (normal components only) and its stress D eps_th.
+    const Real eth = alpha * dT;
+    const Voigt6 eps_th{eth, eth, eth, 0.0, 0.0, 0.0};
+    Voigt6 sig_th{};
+    for (int i = 0; i < kVoigt; ++i) {
+      Real v = 0.0;
+      for (int j = 0; j < kVoigt; ++j)
+        v += D[static_cast<std::size_t>(i)][static_cast<std::size_t>(j)] *
+             eps_th[static_cast<std::size_t>(j)];
+      sig_th[static_cast<std::size_t>(i)] = v;
+    }
+    accumulate_fint(g, ndof, sig_th, det * gp.w, fe);
+  }
+  return fe;
+}
+
 ElementResponse element_tangent_force(ElementType type, std::span<const Vec3> coords,
                                       std::span<const Vec3> ue,
                                       const MaterialModel& material,
@@ -635,6 +666,47 @@ ElementResponse element_tangent_force(ElementType type, std::span<const Vec3> co
   }
   mirror_upper(ndof, out.Ke);
   return out;
+}
+
+std::vector<Real> element_conduction(ElementType type, std::span<const Vec3> coords,
+                                     Real k) {
+  const int n = nodes_per_element(type);
+  std::vector<Real> Kt(static_cast<std::size_t>(n) * static_cast<std::size_t>(n), 0.0);
+  std::array<std::array<Real, 3>, kMaxNodes> g{};
+  for (const GaussPoint& gp : gauss_rule(type)) {
+    const Shape s = shape(type, gp.xi, gp.et, gp.ze);
+    const Real det = physical_gradients(s, coords, g);
+    const Real scale = k * det * gp.w;
+    // Kt[a][b] += (g_a · g_b) * k * detJ * w. Symmetric; fill the full matrix.
+    for (int a = 0; a < n; ++a)
+      for (int b = 0; b < n; ++b) {
+        const Real dot = g[static_cast<std::size_t>(a)][0] * g[static_cast<std::size_t>(b)][0] +
+                         g[static_cast<std::size_t>(a)][1] * g[static_cast<std::size_t>(b)][1] +
+                         g[static_cast<std::size_t>(a)][2] * g[static_cast<std::size_t>(b)][2];
+        Kt[static_cast<std::size_t>(a) * static_cast<std::size_t>(n) +
+           static_cast<std::size_t>(b)] += scale * dot;
+      }
+  }
+  return Kt;
+}
+
+std::vector<Real> element_capacitance(ElementType type, std::span<const Vec3> coords,
+                                      Real rho_c) {
+  const int n = nodes_per_element(type);
+  std::vector<Real> Ce(static_cast<std::size_t>(n) * static_cast<std::size_t>(n), 0.0);
+  if (rho_c == 0.0) return Ce;
+  std::array<std::array<Real, 3>, kMaxNodes> g{};
+  for (const GaussPoint& gp : gauss_rule(type)) {
+    const Shape s = shape(type, gp.xi, gp.et, gp.ze);
+    const Real det = physical_gradients(s, coords, g);  // detJ only
+    const Real scale = rho_c * det * gp.w;
+    for (int a = 0; a < n; ++a)
+      for (int b = 0; b < n; ++b)
+        Ce[static_cast<std::size_t>(a) * static_cast<std::size_t>(n) +
+           static_cast<std::size_t>(b)] +=
+            scale * s.N[static_cast<std::size_t>(a)] * s.N[static_cast<std::size_t>(b)];
+  }
+  return Ce;
 }
 
 ElasticIsoMaterial::ElasticIsoMaterial(const ElasticIso& props)
