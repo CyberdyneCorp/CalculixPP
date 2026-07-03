@@ -34,6 +34,11 @@ deck that uses them fails loudly rather than solving silently-wrong.
 
 | Item | What's missing | Enabler needed | Baseline spec |
 |---|---|---|---|
+| **3.4 Cavity radiation** | `*RADIATE ...,CR` gray-body cavity exchange (surface-to-ambient radiation is done) | View-factor computation (O(n²) geometric) + radiosity solve | `heat-transfer-analysis` |
+| **4.1 Monolithic coupling** | Fully-coupled 4-DOF/node temperature-displacement tangent (one-way sequential coupling is done) | Multi-field monolithic tangent (mechanical→thermal feedback) | `heat-transfer-analysis` |
+| **4.2 Iterated staggered coupling** | Gauss-Seidel staggered loop with two-way convergence (degenerate single-pass is done) | Same mechanical→thermal feedback path as 4.1 | `heat-transfer-analysis` |
+| **Temp-dependent material tables** | `α(T)` / `k(T)` / `c(T)` interpolation (only the first constant is consumed) | Temperature-indexed property evaluation in the kernels | `material-models` |
+| **Integration-point HFL output** | `*EL PRINT HFL` Gauss-point heat flux (nodal NT/RFL are done) | GP heat-flux recovery + `.dat`/`.frd` emission | `results-output` |
 | **5.1 `*MODEL CHANGE, TYPE=ELEMENT` (cross-step)** | Element active in one step, removed in the next, then re-added strain-free relative to the *deformed* geometry at reactivation. Within-step birth-death (a set removed/re-added inside the single step, strain-free from the undeformed state) is done and validated. | Multi-step analysis / step-history loop (same enabler as OP=MOD/NEW and *CHANGE MATERIAL cross-step). | `model-change` |
 | **5.2 `*MODEL CHANGE, TYPE=CONTACT PAIR` (activation)** | Actually enabling/disabling a contact pair per step. The card is parsed and each change stored on `Model::contact_pair_changes`, but nothing consumes it yet. | The contact workstream (contact search + assembly) plus multi-step step handling. | `model-change` |
 
