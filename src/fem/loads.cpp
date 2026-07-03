@@ -164,6 +164,13 @@ void accumulate_body_load(const Model& model, const BodyLoad& bl, Real factor,
 }  // namespace
 
 std::vector<int> face_nodes(ElementType type, int face) {
+  // Pressure faces are currently implemented for tetrahedra only. Hex/wedge face
+  // topology (6 quad + optional tri faces, different node counts) is not wired for
+  // *DLOAD P<face>/*DSLOAD yet; body loads (GRAV/CENTRIF) work for all topologies.
+  if (type != ElementType::C3D4 && type != ElementType::C3D10)
+    throw std::runtime_error(
+        "pressure faces (*DLOAD P<face>) are supported only for C3D4/C3D10 "
+        "tetrahedra; hex/wedge pressure faces are not implemented yet");
   if (face < 1 || face > 4) throw std::runtime_error("tet face must be 1..4");
   const int nf = (type == ElementType::C3D4) ? 3 : 6;
   std::vector<int> out(static_cast<std::size_t>(nf));

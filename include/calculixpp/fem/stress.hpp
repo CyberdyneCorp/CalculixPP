@@ -4,6 +4,7 @@
 #include "calculixpp/core/model.hpp"
 #include "calculixpp/core/results.hpp"
 #include "calculixpp/core/types.hpp"
+#include "calculixpp/fem/assembly.hpp"
 
 namespace cxpp::fem {
 
@@ -21,5 +22,13 @@ std::vector<Real> internal_force(const Model& model, const std::vector<Vec3>& u)
 // (spec: static-analysis / results-output — reimplemented from CalculiX
 // resultsmech.f / extrapolate.f, not copied.)
 void recover_fields(const Model& model, StaticFields& fields);
+
+// Plasticity-aware field recovery. Identical to recover_fields for elastic elements,
+// but the integration-point stress/strain and the internal force come from the
+// committed material-point state (radial-return stress, not linear D*strain), so a
+// plastic solve reports the true stress on the hardening curve. `mp` must be the
+// driver's converged MaterialPoints (committed history), aligned with mesh.elements().
+// (spec: material-models / results-output — stress from the committed plastic state.)
+void recover_fields(const Model& model, StaticFields& fields, MaterialPoints& mp);
 
 }  // namespace cxpp::fem

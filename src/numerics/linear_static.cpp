@@ -36,14 +36,15 @@ StaticFields solve_linear_static(const Model& model,
   StaticFields res;
   const std::size_t n_nodes = model.mesh.num_nodes();
   res.displacement.assign(n_nodes, Vec3{0, 0, 0});
-  for (std::size_t ni = 0; ni < n_nodes; ++ni) {
+  // Expand the free solution to full nodal displacement through the constraint
+  // transform: free DOFs take uf[eq], SPC DOFs take their prescribed value (full
+  // magnitude here), MPC slaves are reconstructed from their masters.
+  for (std::size_t ni = 0; ni < n_nodes; ++ni)
     for (int c = 0; c < kDofsPerNode; ++c) {
       const std::size_t g = ni * kDofsPerNode + static_cast<std::size_t>(c);
-      const Index eq = sys.dof_eq[g];
       res.displacement[ni][static_cast<std::size_t>(c)] =
-          (eq >= 0) ? uf[static_cast<std::size_t>(eq)] : sys.prescribed[g];
+          sys.transform.displacement(g, uf, sys.prescribed);
     }
-  }
   fem::recover_fields(model, res);  // fills stress + reaction
   return res;
 }

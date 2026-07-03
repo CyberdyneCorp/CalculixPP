@@ -6,11 +6,39 @@
 
 namespace cxpp {
 
-// Phase-1 element library: linear and quadratic tetrahedra.
-enum class ElementType { C3D4, C3D10 };
+// Solid element library.
+//   Phase 1: linear/quadratic tetrahedra (C3D4, C3D10).
+//   Phase 2 (workstream 3): hexahedra and wedges with full integration
+//   (C3D8, C3D20, C3D6, C3D15) and reduced-integration variants (C3D8R, C3D20R).
+enum class ElementType {
+  C3D4,
+  C3D10,
+  C3D8,
+  C3D8R,
+  C3D20,
+  C3D20R,
+  C3D6,
+  C3D15,
+};
 
 constexpr int nodes_per_element(ElementType t) {
-  return t == ElementType::C3D4 ? 4 : 10;
+  switch (t) {
+    case ElementType::C3D4:
+      return 4;
+    case ElementType::C3D10:
+      return 10;
+    case ElementType::C3D8:
+    case ElementType::C3D8R:
+      return 8;
+    case ElementType::C3D20:
+    case ElementType::C3D20R:
+      return 20;
+    case ElementType::C3D6:
+      return 6;
+    case ElementType::C3D15:
+      return 15;
+  }
+  return 0;
 }
 
 std::string_view element_type_name(ElementType t);

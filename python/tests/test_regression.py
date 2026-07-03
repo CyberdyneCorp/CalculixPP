@@ -11,10 +11,13 @@ import pytest
 
 CCX_TEST = "/home/leonardo/work/CalculiX/test"
 
-# Small, clean linear-static tetrahedral decks with stock-CalculiX .dat.ref output.
-# (beam10p is the practical reference case: contact4tet uses S8 shells, circ11p uses
-# *USE REFINED MESH, and segmentunsmooth is too large for a fast CI gate.)
-REFERENCE_DECKS = ["beam10p"]
+# Small, clean linear-static decks with stock-CalculiX .dat.ref output.
+#   beam10p : C3D10 quadratic-tet cantilever (Phase-1 reference case).
+#   beam8p  : C3D8 linear-hex cantilever  (validates the Phase-2 hex family).
+#   beam20p : C3D20 quadratic-hex cantilever (validates the Phase-2 hex family).
+# (contact4tet uses S8 shells, circ11p uses *USE REFINED MESH, and segmentunsmooth
+# is too large for a fast CI gate.)
+REFERENCE_DECKS = ["beam10p", "beam8p", "beam20p"]
 
 # Minimal C3D4 deck: base fixed, pressure 100 on face 3 (nodes 2,3,4). The outward
 # face normal is (1,1,1)/sqrt(3) and the area sqrt(3)/2, so the total applied force
@@ -96,6 +99,41 @@ def test_displacements_match_calculix(deck):
     rel_l2 = math.sqrt(num / den) if den > 0 else math.sqrt(num)
     assert rel_l2 < 1e-4, f"{deck}: relative L2 displacement error {rel_l2:.3e}"
     assert max_abs < 1e-3, f"{deck}: max abs displacement error {max_abs:.3e}"
+
+
+def test_equation_constraint_matches_calculix():
+    """GATE (spec: constraints 5.1): the achtel2 deck (C3D20R cube with 2-term
+    *EQUATION cards tying node 178 to node 78 in all 3 DOFs) reproduces stock
+    CalculiX .dat.ref displacements within tolerance — validates dependent-DOF
+    elimination against a real reference deck."""
+    inp = os.path.join(CCX_TEST, "achtel2.inp")
+    ref_path = os.path.join(CCX_TEST, "achtel2.dat.ref")
+    if not (os.path.exists(inp) and os.path.exists(ref_path)):
+        pytest.skip("achtel2 reference deck not available")
+    import calculixpp
+
+    res = calculixpp.solve(inp)
+    ids = res["node_ids"]
+    U = res["displacement"]
+    id2idx = {int(n): i for i, n in enumerate(ids)}
+    ref = parse_ref_displacements(ref_path)
+    assert len(ref) > 0
+
+    num = den = 0.0
+    for nid, ru in ref.items():
+        if nid not in id2idx:
+            continue
+        u = U[id2idx[nid]]
+        for c in range(3):
+            d = float(u[c]) - ru[c]
+            num += d * d
+            den += ru[c] ** 2
+    rel_l2 = math.sqrt(num / den) if den > 0 else math.sqrt(num)
+    assert rel_l2 < 1e-4, f"achtel2: relative L2 displacement error {rel_l2:.3e}"
+
+    # The eliminated dependent DOFs (node 178) equal their masters (node 78).
+    for c in range(3):
+        assert abs(float(U[id2idx[178]][c]) - float(U[id2idx[78]][c])) < 1e-10
 
 
 def _rel_l2_disp(a, b):
@@ -185,6 +223,91 @@ def test_large_deck_solvers_agree():
             den += float(ud[k][j]) ** 2
     rel = math.sqrt(num / den) if den else 0.0
     assert rel < 1e-5, f"direct vs IC0-CG disagree: relL2={rel:.3e}"
+
+
+# Single C3D8 unit cube, uniaxial STRESS along z: symmetry planes fix the three back
+# faces, a *CLOAD along z on the top face drives it past yield. Analytic hardening:
+#   sigma = sy0 + H*eps_p,  eps_p = (sigma - sy0)/H,  eps = sigma/E + eps_p.
+# With sy0=800, H=(960-800)/0.02=8000, a total axial force 900 (area 1) gives
+# sigma=900 exactly. (No clean *PLASTIC *STATIC C3D4/C3D10 .dat.ref exists in the
+# reference corpus — those decks use NLGEOM, multi-step, orthotropic elasticity, or
+# Johnson-Cook — so plasticity is validated against the analytic uniaxial solution.)
+_PLASTIC_CUBE = """
+*NODE
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 1., 1., 0.
+4, 0., 1., 0.
+5, 0., 0., 1.
+6, 1., 0., 1.
+7, 1., 1., 1.
+8, 0., 1., 1.
+*ELEMENT, TYPE=C3D8, ELSET=EALL
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*BOUNDARY
+1, 1, 1
+4, 1, 1
+5, 1, 1
+8, 1, 1
+1, 2, 2
+2, 2, 2
+5, 2, 2
+6, 2, 2
+1, 3, 3
+2, 3, 3
+3, 3, 3
+4, 3, 3
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000., 0.3
+*PLASTIC
+800., 0.0
+960., 0.02
+*SOLID SECTION, ELSET=EALL, MATERIAL=STEEL
+*STEP
+*STATIC
+0.25, 1.0
+*CLOAD
+5, 3, 225.
+6, 3, 225.
+7, 3, 225.
+8, 3, 225.
+*END STEP
+"""
+
+
+def test_plasticity_uniaxial_hardening():
+    """Validation (a): a single C3D8 past yield follows the analytic uniaxial
+    hardening curve. Also checks that solve() auto-routes a *PLASTIC deck to the
+    Newton driver (converged/newton_* keys present)."""
+    import calculixpp
+
+    E, sy0, H = 210000.0, 800.0, 8000.0
+    sigma = 900.0  # total force 900 over unit area
+    eps_p = (sigma - sy0) / H
+    eps = sigma / E + eps_p
+
+    # solve() must auto-dispatch to the nonlinear driver for a plastic model.
+    res = calculixpp.solve_text(_PLASTIC_CUBE)
+    assert res["converged"] is True
+    assert int(res["newton_increments"]) >= 1
+
+    S = res["stress"]
+    szz = sum(float(S[k][2]) for k in range(len(S))) / len(S)
+    assert abs(szz - sigma) < 1e-3 * sigma, f"axial stress {szz} vs {sigma}"
+
+    U = res["displacement"]
+    uz = max(float(U[k][2]) for k in range(len(U)))
+    assert abs(uz - eps) < 1e-3 * eps, f"axial strain {uz} vs {eps}"
+
+
+def test_plasticity_matches_nonlinear_call():
+    """solve() (auto-dispatch) and solve_nonlinear() give the same plastic result."""
+    import calculixpp
+
+    a = calculixpp.solve_text(_PLASTIC_CUBE)
+    b = calculixpp.solve_nonlinear_text(_PLASTIC_CUBE)
+    assert _rel_l2_disp(a["displacement"], b["displacement"]) < 1e-12
 
 
 def test_exception_propagation():

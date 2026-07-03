@@ -5,6 +5,27 @@
 
 namespace cxpp {
 
+std::optional<ElasticIso> Material::effective_elastic() const {
+  if (elastic) return *elastic;
+  if (hyperelastic && !hyperelastic->empty()) {
+    // Derive (E, nu) from the neo-Hookean initial moduli mu = 2 C10, kappa = 2/D1:
+    //   E = 9 K mu / (3 K + mu),  nu = (3 K - 2 mu) / (2 (3 K + mu)).
+    const Real mu = hyperelastic->mu != 0.0 ? hyperelastic->mu
+                                            : 2.0 * hyperelastic->c10;
+    const Real K = hyperelastic->kappa != 0.0
+                       ? hyperelastic->kappa
+                       : (hyperelastic->d1 != 0.0 ? 2.0 / hyperelastic->d1 : 0.0);
+    if (mu > 0.0 && K > 0.0) {
+      const Real E = 9.0 * K * mu / (3.0 * K + mu);
+      const Real nu = (3.0 * K - 2.0 * mu) / (2.0 * (3.0 * K + mu));
+      return ElasticIso{E, nu};
+    }
+  }
+  if (user && !user->empty() && user->constants.size() >= 2)
+    return ElasticIso{user->constants[0], user->constants[1]};
+  return std::nullopt;
+}
+
 std::vector<ElasticIso> Model::element_elastic() const {
   std::vector<ElasticIso> out(mesh.num_elements());
   std::vector<bool> assigned(mesh.num_elements(), false);
@@ -20,9 +41,10 @@ std::vector<ElasticIso> Model::element_elastic() const {
       throw std::runtime_error("solid section references unknown material '" +
                                section.material + "'");
     }
-    if (!mat->second.elastic) {
+    const std::optional<ElasticIso> eff = mat->second.effective_elastic();
+    if (!eff) {
       throw std::runtime_error("material '" + section.material +
-                               "' has no *ELASTIC data");
+                               "' has no *ELASTIC (or hyperelastic/user) data");
     }
     for (const Index elem_id : *ids) {
       const Index ei = mesh.element_index(elem_id);
@@ -30,7 +52,7 @@ std::vector<ElasticIso> Model::element_elastic() const {
         throw std::runtime_error("elset '" + section.elset +
                                  "' references unknown element");
       }
-      out[static_cast<std::size_t>(ei)] = *mat->second.elastic;
+      out[static_cast<std::size_t>(ei)] = *eff;
       assigned[static_cast<std::size_t>(ei)] = true;
     }
   }
@@ -43,6 +65,66 @@ std::vector<ElasticIso> Model::element_elastic() const {
     }
   }
   return out;
+}
+
+std::vector<std::optional<Plastic>> Model::element_plastic() const {
+  std::vector<std::optional<Plastic>> out(mesh.num_elements());
+  for (const auto& section : sections) {
+    const std::vector<Index>* ids = mesh.elset(section.elset);
+    if (ids == nullptr) continue;  // element_elastic() already validates elsets
+    const auto mat = materials.find(section.material);
+    if (mat == materials.end()) continue;
+    for (const Index elem_id : *ids) {
+      const Index ei = mesh.element_index(elem_id);
+      if (ei >= 0) out[static_cast<std::size_t>(ei)] = mat->second.plastic;
+    }
+  }
+  return out;
+}
+
+std::vector<std::optional<Hyperelastic>> Model::element_hyperelastic() const {
+  std::vector<std::optional<Hyperelastic>> out(mesh.num_elements());
+  for (const auto& section : sections) {
+    const std::vector<Index>* ids = mesh.elset(section.elset);
+    if (ids == nullptr) continue;
+    const auto mat = materials.find(section.material);
+    if (mat == materials.end()) continue;
+    for (const Index elem_id : *ids) {
+      const Index ei = mesh.element_index(elem_id);
+      if (ei >= 0) out[static_cast<std::size_t>(ei)] = mat->second.hyperelastic;
+    }
+  }
+  return out;
+}
+
+std::vector<std::optional<UserMaterial>> Model::element_user_material() const {
+  std::vector<std::optional<UserMaterial>> out(mesh.num_elements());
+  for (const auto& section : sections) {
+    const std::vector<Index>* ids = mesh.elset(section.elset);
+    if (ids == nullptr) continue;
+    const auto mat = materials.find(section.material);
+    if (mat == materials.end()) continue;
+    for (const Index elem_id : *ids) {
+      const Index ei = mesh.element_index(elem_id);
+      if (ei >= 0) out[static_cast<std::size_t>(ei)] = mat->second.user;
+    }
+  }
+  return out;
+}
+
+bool Model::has_nonlinear_material() const {
+  for (const auto& [name, mat] : materials) {
+    if (mat.plastic && !mat.plastic->empty()) return true;
+    if (mat.hyperelastic && !mat.hyperelastic->empty()) return true;
+    if (mat.user && !mat.user->empty()) return true;
+  }
+  return false;
+}
+
+bool Model::has_plasticity() const {
+  for (const auto& [name, mat] : materials)
+    if (mat.plastic && !mat.plastic->empty()) return true;
+  return false;
 }
 
 std::vector<Real> Model::element_density() const {

@@ -6,7 +6,12 @@ add_library(calculixpp_core
   core/element.cpp
   core/mesh.cpp
   core/model.cpp
+  core/constraints.cpp
   fem/element.cpp
+  fem/constraint_transform.cpp
+  fem/plasticity.cpp
+  fem/hyperelastic.cpp
+  fem/user_material.cpp
   fem/assembly.cpp
   fem/stress.cpp
   fem/loads.cpp

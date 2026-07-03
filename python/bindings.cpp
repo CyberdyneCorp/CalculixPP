@@ -115,7 +115,22 @@ py::dict solve_model(const Model& m, const std::string& solver,
   // Validate/select the backend first (may raise on an unknown name) and record
   // the one that actually ran. Phase 1 routes every solve through the CPU path.
   const std::string used = resolve_backend(backend);
-  py::dict d = result_dict(m, numerics::solve_linear_static(m, kind_of(solver)));
+  // A model with a nonlinear material (*PLASTIC / *HYPERELASTIC / *USER MATERIAL)
+  // routes to the Newton-Raphson driver (load applied incrementally); a purely
+  // linear-elastic model keeps the direct linear path unchanged.
+  py::dict d;
+  if (m.has_nonlinear_material()) {
+    numerics::NonlinearOptions opts;
+    opts.forced = kind_of(solver);
+    numerics::NonlinearReport rep;
+    d = result_dict(m, numerics::solve_nonlinear_static(m, opts, &rep));
+    d["newton_increments"] = rep.increments;
+    d["newton_iterations"] = rep.iterations;
+    d["newton_cutbacks"] = rep.cutbacks;
+    d["converged"] = rep.converged;
+  } else {
+    d = result_dict(m, numerics::solve_linear_static(m, kind_of(solver)));
+  }
   d["backend"] = used;
   return d;
 }

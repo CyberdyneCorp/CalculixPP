@@ -7,8 +7,26 @@
 namespace cxpp::io {
 namespace {
 
-// CGX/.frd element type codes.
-int frd_elem_type(ElementType t) { return t == ElementType::C3D4 ? 3 : 6; }
+// CGX/.frd element type codes (cgx element type numbering).
+int frd_elem_type(ElementType t) {
+  switch (t) {
+    case ElementType::C3D8:
+    case ElementType::C3D8R:
+      return 1;
+    case ElementType::C3D6:
+      return 2;
+    case ElementType::C3D4:
+      return 3;
+    case ElementType::C3D20:
+    case ElementType::C3D20R:
+      return 4;
+    case ElementType::C3D15:
+      return 5;
+    case ElementType::C3D10:
+      return 6;
+  }
+  return 3;
+}
 
 std::string e12_5(Real v) {
   char buf[24];

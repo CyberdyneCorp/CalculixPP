@@ -8,7 +8,7 @@ foreach(t IN ITEMS test_element test_assembly test_geometry test_step_changes)
 endforeach()
 
 if(CALCULIXPP_WITH_SOLVER AND TARGET calculixpp_numerics)
-  foreach(t IN ITEMS test_solve test_parser test_results test_pressure test_backend test_nonlinear test_loads)
+  foreach(t IN ITEMS test_solve test_parser test_results test_pressure test_backend test_nonlinear test_loads test_hex test_connector test_plasticity test_material_models test_constraints)
     add_executable(${t} ${t}.cpp)
     target_link_libraries(${t} PRIVATE calculixpp_numerics)
     target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
