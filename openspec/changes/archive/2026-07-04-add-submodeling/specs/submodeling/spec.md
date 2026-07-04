@@ -1,19 +1,5 @@
-# Submodeling
+## MODIFIED Requirements
 
-## Purpose
-
-CalculixPP supports submodeling — driving a local, finer model from the results of a
-prior global analysis at the submodel's cut boundary — ported to pure C++20. A
-`*SUBMODEL` card declares the global boundary (nodes and/or surfaces) whose driven
-values are read from the global solution and interpolated onto the submodel boundary;
-`*BOUNDARY, SUBMODEL` and `*CLOAD/*DSLOAD, SUBMODEL` then apply those driven values as
-the local model's boundary conditions (see loads-and-boundary-conditions). Interpolation
-and the local solve run through the `ComputeBackend` (CPU/NumPP by default, GPU optional
-and never required). Submodel results SHALL match reference CalculiX within tolerance and
-are reachable from the Python bindings. (ref: src/submodels.f, src/calinput.f)
-
-**Porting Phase:** 5 — Advanced physics
-## Requirements
 ### Requirement: Submodel boundary declaration
 A `*SUBMODEL, TYPE=NODE` card SHALL declare the submodel's cut boundary as a set of driven nodes and identify the global result source (the global displacement field and the global element set searched for host elements), and the declaration SHALL be reachable from the Python bindings.
 
@@ -80,4 +66,3 @@ A submodel driven by a global solution's displacements on its cut boundary SHALL
 - GIVEN a beam solved globally and a sub-region cut from it whose cut-boundary nodes are driven by the interpolated global displacements
 - WHEN CalculixPP solves the submodel
 - THEN the submodel displacement field SHALL match the global displacement field inside the region to relative L2 error below 1e-3
-

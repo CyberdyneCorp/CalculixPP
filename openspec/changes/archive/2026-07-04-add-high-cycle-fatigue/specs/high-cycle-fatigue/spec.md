@@ -1,18 +1,7 @@
-# High-Cycle Fatigue
+# High-Cycle Fatigue Specification
 
-## Purpose
+## MODIFIED Requirements
 
-Estimates high-cycle-fatigue (HCF) life and critical locations from an already-computed
-stress result — typically a cyclic, modal, or steady-state dynamic solution — by applying
-a fatigue/damage criterion over the stored field. In CalculixPP the criterion evaluation
-runs as C++20 kernels over **NumPP** containers dispatched through the **ComputeBackend**
-(CPU default and always available; CUDA/OpenCL/Metal optional and never required), and the
-evaluation is reachable from the Python bindings. It consumes results produced under
-**Results and Output** from a preceding **Eigenvalue Analysis (Frequency, Buckling, Complex
-Frequency)** or **Dynamic Analysis** run. (ref: src/CalculiX.c HCF path, src/hcf.f)
-
-**Porting Phase:** 5 — Advanced physics
-## Requirements
 ### Requirement: Request HCF evaluation over prior results
 A `*HCF` step SHALL request a stress-life high-cycle-fatigue evaluation over the stress field of the preceding stress-producing model, selecting the uniaxial-equivalent stress criterion (signed or plain von Mises) that reduces each point's stress tensor to a scalar amplitude.
 
@@ -66,4 +55,3 @@ This replaces the CalculiX crack-growth reference-fidelity requirement for the H
 - WHEN the fatigue evaluation completes
 - THEN the reported life at that point SHALL equal `(S/a)^(1/b)` within `1e-6` relative tolerance
 - AND the worst-case location SHALL be the highest-amplitude point
-

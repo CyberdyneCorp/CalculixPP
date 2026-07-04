@@ -13,10 +13,12 @@
 #include "calculixpp/numerics/direct_dynamics.hpp"
 #include "calculixpp/numerics/eigensolution.hpp"
 #include "calculixpp/numerics/heat_transfer.hpp"
+#include "calculixpp/numerics/high_cycle_fatigue.hpp"
 #include "calculixpp/numerics/linear_static.hpp"
 #include "calculixpp/numerics/modal_dynamics.hpp"
 #include "calculixpp/numerics/multistep.hpp"
 #include "calculixpp/numerics/nonlinear_static.hpp"
+#include "calculixpp/numerics/sensitivity.hpp"
 #include "calculixpp/numerics/substructure.hpp"
 
 namespace {
@@ -76,8 +78,13 @@ int main(int argc, char** argv) {
     // multi-step is out of this slice; those decks are handled single-step as before.
     {
       const std::vector<Model> steps = cxpp::io::parse_inp_steps_file(input);
+      // Genuine multi-step mechanical: every step is *STATIC. A deck whose final step is
+      // a different procedure (e.g. a *SENSITIVITY step following a load-defining *STATIC
+      // step) collapses to the single merged model below (parse_inp_file), which carries
+      // the accumulated loads/BCs and the final procedure.
       if (steps.size() > 1 && steps.front().procedure == Procedure::Static &&
-          !nonlinear && !steps.front().has_nonlinear_material()) {
+          steps.back().procedure == Procedure::Static && !nonlinear &&
+          !steps.front().has_nonlinear_material()) {
         const Model& last = steps.back();
         const StaticFields f = numerics::solve_multistep_static(steps, forced);
         Real umax = 0.0, svm_max = 0.0;
@@ -294,6 +301,42 @@ int main(int argc, char** argv) {
                   se.n_retained, se.n_modes, se.dim());
       std::printf("  wrote %s%s\n", mpath.c_str(),
                   se.m_reduced.empty() ? " (stiffness)" : " (stiffness + mass)");
+      return 0;
+    }
+
+    // A *HCF deck evaluates stress-based high-cycle fatigue over the recovered stress
+    // field: it inverts the material S-N (Basquin) curve per node and reports the
+    // worst-case location + cycles-to-failure (spec: high-cycle-fatigue).
+    if (model.procedure == Procedure::HighCycleFatigue) {
+      const numerics::HcfReport rep = numerics::evaluate_hcf(model);
+      std::printf("CalculiX++  %s  (high-cycle fatigue)\n", input.c_str());
+      std::printf("  nodes=%zu  elements=%zu\n", model.mesh.num_nodes(),
+                  model.mesh.num_elements());
+      std::printf("  worst-case node = %lld\n",
+                  static_cast<long long>(rep.worst_node_id));
+      std::printf("  stress amplitude = %.6g\n", rep.worst_amplitude);
+      std::printf("  cycles-to-failure = %.6g\n", rep.worst_life);
+      return 0;
+    }
+    // A *SENSITIVITY deck computes dObjective/dx of each *DESIGN RESPONSE with respect
+    // to the coordinate design variables by the adjoint method (spec:
+    // design-optimization). The CLI prints the gradient table; the Python bindings
+    // expose the full per-variable gradient arrays.
+    if (model.procedure == Procedure::Sensitivity) {
+      const numerics::SensitivityReport rep = numerics::solve_sensitivity(model);
+      std::printf("CalculiX++  %s  (sensitivity: %zu response(s), %zu design vars)\n",
+                  input.c_str(), rep.responses.size(),
+                  model.design_variables.size());
+      std::printf("  nodes=%zu  elements=%zu\n", model.mesh.num_nodes(),
+                  model.mesh.num_elements());
+      for (const numerics::SensitivityResult& r : rep.responses) {
+        std::printf("  RESPONSE %s = %.7e\n", r.response_name.c_str(), r.objective);
+        std::printf("    NODE  COMP   dObjective/dx\n");
+        for (std::size_t v = 0; v < model.design_variables.size(); ++v)
+          std::printf("    %5lld    %d    %+.7e\n",
+                      static_cast<long long>(model.design_variables[v].node_id),
+                      model.design_variables[v].comp, r.dgdx[v]);
+      }
       return 0;
     }
 

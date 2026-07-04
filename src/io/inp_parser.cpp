@@ -188,6 +188,10 @@ class Parser {
   std::string cur_interaction_;
   int cur_contact_pair_ = -1;  // index into model_.contact_pairs, or -1
 
+  // *DESIGN RESPONSE / *OBJECTIVE (spec: design-optimization). The name from the
+  // current *DESIGN RESPONSE NAME= (attached to the response its data line defines).
+  std::string cur_design_response_;
+
   // Connector (discrete) elements: SPRINGA/SPRING1/SPRING2, MASS, DASHPOTA/1/2.
   // These are not isoparametric solids, so they live outside the Mesh. We keep
   // their connectivity keyed by element id and by elset so a following *SPRING /
@@ -220,6 +224,10 @@ class Parser {
   enum class ModelChangeType { Element, ContactPair };
   ModelChangeType mc_type_ = ModelChangeType::Element;
   bool mc_add_ = true;  // true = ADD (activate), false = REMOVE (deactivate)
+
+  // *SUBMODEL (spec: submodeling): the GLOBAL ELSET= carried from the card onto its data
+  // lines (each data line names a driven boundary node set). Empty outside the card.
+  std::string submodel_global_elset_;
 
   std::string param(const std::string& key) const {
     const auto it = params_.find(key);
@@ -269,6 +277,10 @@ class Parser {
       begin_frequency(line);
     } else if (card_ == "*BUCKLE") {
       begin_buckle(line);
+    } else if (card_ == "*HCF") {
+      begin_hcf(line);
+    } else if (card_ == "*FATIGUE") {
+      begin_fatigue(line);
     } else if (card_ == "*DYNAMIC") {
       begin_dynamic(line);
     } else if (card_ == "*MODALDYNAMIC") {
@@ -283,6 +295,8 @@ class Parser {
       begin_modal_damping(line);
     } else if (card_ == "*BASEMOTION") {
       begin_base_motion(line);
+    } else if (card_ == "*SUBMODEL") {
+      begin_submodel(line);
     } else if (card_ == "*SUBSTRUCTUREGENERATE") {
       begin_substructure_generate(line);
     } else if (card_ == "*RETAINEDNODALDOFS") {
@@ -294,6 +308,14 @@ class Parser {
       // The reduced-substructure path already exposes the assembled operators; the flags
       // are accepted and recorded on the substructure output request. Data lines (none).
       begin_matrix_assemble(line);
+    } else if (card_ == "*SENSITIVITY") {
+      model_.procedure = Procedure::Sensitivity;
+    } else if (card_ == "*DESIGNVARIABLES") {
+      begin_design_variables(line);
+    } else if (card_ == "*DESIGNRESPONSE" || card_ == "*OBJECTIVE") {
+      // NAME= labels the response; its type (STRAIN ENERGY / nodal displacement) and
+      // scope come on the data line. *OBJECTIVE is the Abaqus spelling of the same.
+      cur_design_response_ = param("NAME");
     } else if (card_ == "*CONDUCTIVITY") {
       begin_conductivity(line);
     } else if (card_ == "*SPECIFICHEAT") {
@@ -460,6 +482,25 @@ class Parser {
         {"*GREEN",
          "Green-function step — deferred; builds on the shipped modal engine but "
          "needs the unit-excitation response basis (Phase-4 tasks 4.4)"},
+        // Design-optimization layers on top of the shipped sensitivity core, deferred
+        // in this slice (openspec add-design-optimization tasks 1.6 / 2.5 / 4.x).
+        {"*FILTER",
+         "sensitivity filtering — deferred; the raw adjoint gradient (*SENSITIVITY) "
+         "IS supported (add-design-optimization tasks 2.5)"},
+        {"*FEASIBLEDIRECTION",
+         "feasible-direction optimization loop — deferred; consumes the shipped "
+         "sensitivity gradient (add-design-optimization tasks 4.1)"},
+        {"*ROBUSTDESIGN",
+         "robust design — deferred; needs a random-field decomposition "
+         "(add-design-optimization tasks 4.2)"},
+        {"*RANDOMFIELD",
+         "random field — deferred with *ROBUST DESIGN (add-design-optimization tasks 4.2)"},
+        {"*CORRELATIONLENGTH",
+         "correlation length — deferred with *ROBUST DESIGN (add-design-optimization "
+         "tasks 4.2)"},
+        {"*GEOMETRICCONSTRAINT",
+         "geometric constraint — deferred; part of the optimization loop "
+         "(add-design-optimization tasks 4.1)"},
     };
     const auto it = deferred.find(card_);
     if (it != deferred.end())
@@ -577,6 +618,103 @@ class Parser {
         (f.empty() || f[0].empty())
             ? 1
             : std::max(1, static_cast<int>(to_double(f[0], line)));
+  }
+
+  // *HCF[, CRITERION=SIGNED-VON-MISES|VON-MISES]: stress-based high-cycle-fatigue over the
+  // preceding stress field (spec: high-cycle-fatigue — *HCF). Selects the procedure and the
+  // stress-amplitude reduction; SIGNED-VON-MISES is the default. Any other CRITERION= is
+  // rejected — a criterion we do not implement must not be silently mis-evaluated. There is
+  // no data line (the S-N curve comes from the material *FATIGUE card).
+  void begin_hcf(int line) {
+    model_.procedure = Procedure::HighCycleFatigue;
+    const std::string crit = param("CRITERION");
+    if (crit.empty() || crit == "SIGNED-VON-MISES")
+      model_.hcf_criterion = FatigueCriterion::SignedVonMises;
+    else if (crit == "VON-MISES")
+      model_.hcf_criterion = FatigueCriterion::VonMises;
+    else
+      throw ParseError(line, "*HCF: unsupported CRITERION=" + crit +
+                                 " (expected SIGNED-VON-MISES or VON-MISES)");
+  }
+
+  // *FATIGUE: Basquin S-N endurance curve on the current material (spec: high-cycle-fatigue
+  // — *FATIGUE). The data line is "a, b" (S_a = a * N^b, b < 0), filled by fatigue_data.
+  void begin_fatigue(int line) {
+    if (cur_material_.empty()) throw ParseError(line, "*FATIGUE without *MATERIAL");
+  }
+
+  // *FATIGUE data line: "a, b" — the Basquin coefficient a and exponent b of the S-N curve
+  // S_a = a * N^b. Stored on the current material's SNCurve.
+  void fatigue_data(const std::vector<std::string>& f, int line) {
+    if (cur_material_.empty()) throw ParseError(line, "*FATIGUE without *MATERIAL");
+    if (f.size() < 2 || f[0].empty() || f[1].empty())
+      throw ParseError(line, "*FATIGUE needs two values: a, b");
+    SNCurve sn;
+    sn.a = to_double(f[0], line);
+    sn.b = to_double(f[1], line);
+    model_.materials[cur_material_].sn_curve = sn;
+  }
+  // *DESIGN VARIABLES, TYPE=COORDINATE: declare the design field for a *SENSITIVITY
+  // step (spec: design-optimization). Only TYPE=COORDINATE (shape) variables are
+  // implemented; TYPE=ORIENTATION (sensi_orien) is deferred and rejected here so a deck
+  // using it fails loudly rather than being silently mis-solved. The referenced nodes
+  // come on the data line(s) as an nset name or node ids.
+  void begin_design_variables(int line) {
+    const std::string type = param("TYPE");
+    if (!type.empty() && type != "COORDINATE")
+      throw ParseError(line,
+                       "*DESIGN VARIABLES, TYPE=" + type +
+                           " is not implemented (only TYPE=COORDINATE shape variables "
+                           "are supported this slice); TYPE=ORIENTATION is deferred.");
+  }
+
+  // *DESIGN VARIABLES data: an nset name or node id per field. Each referenced node
+  // contributes three coordinate design variables (x, y, z), in node-then-component
+  // order. Duplicate nodes are de-duplicated so a node listed twice is one variable set.
+  void design_variables_data(const std::vector<std::string>& f, int line) {
+    for (const std::string& tok : f) {
+      if (tok.empty()) continue;
+      for (const Index nid : node_refs(tok, line)) {
+        bool seen = false;
+        for (const DesignVariable& dv : model_.design_variables)
+          if (dv.node_id == nid) { seen = true; break; }
+        if (seen) continue;
+        for (int c = 1; c <= 3; ++c)
+          model_.design_variables.push_back(DesignVariable{nid, c});
+      }
+    }
+  }
+
+  // *DESIGN RESPONSE / *OBJECTIVE data: "<type>[, scope]". Supported types:
+  //   STRAIN ENERGY / ENERGY / COMPLIANCE  -> the self-adjoint compliance g = fᵀu
+  //     (the scope elset, e.g. EALL, is accepted; the response is the whole-model
+  //     external work in this slice).
+  //   ALL-DISP / U / DISPLACEMENT, <node>, <comp> -> a single nodal displacement DOF.
+  // Mass / stress / eigenfrequency responses are out of this slice and rejected.
+  void design_response_data(const std::vector<std::string>& f, int line) {
+    if (f.empty() || f[0].empty())
+      throw ParseError(line, "*DESIGN RESPONSE needs a response type");
+    DesignResponse resp;
+    resp.name = cur_design_response_;
+    const std::string type = normalize(f[0]);  // uppercase, spaces stripped
+    if (type == "STRAINENERGY" || type == "ENERGY" || type == "COMPLIANCE") {
+      resp.kind = DesignResponse::Kind::Compliance;
+    } else if (type == "ALL-DISP" || type == "ALLDISP" || type == "U" ||
+               type == "DISPLACEMENT") {
+      resp.kind = DesignResponse::Kind::Displacement;
+      if (f.size() < 3)
+        throw ParseError(line,
+                         "*DESIGN RESPONSE displacement needs '<type>, node, comp'");
+      resp.node_id = to_index(f[1], line);
+      resp.comp = static_cast<int>(to_index(f[2], line));
+      if (resp.comp < 1 || resp.comp > 3)
+        throw ParseError(line, "*DESIGN RESPONSE displacement comp must be 1..3");
+    } else {
+      throw ParseError(line, "*DESIGN RESPONSE type '" + type +
+                                 "' is not implemented (supported: STRAIN ENERGY, "
+                                 "DISPLACEMENT); mass/stress/frequency are deferred.");
+    }
+    model_.design_responses.push_back(std::move(resp));
   }
 
   // *DYNAMIC[, DIRECT][, ALPHA=][, NLGEOM]: direct time integration of the equations of
@@ -704,6 +842,38 @@ class Parser {
   // matrix and fixed-interface modes are requested (Craig-Bampton). No data line.
   void begin_substructure_generate(int /*line*/) {
     model_.procedure = Procedure::Substructure;
+  }
+
+  // *SUBMODEL, TYPE=NODE[, GLOBAL ELSET=<name>][, INPUT=<file>]: declare a driven
+  // boundary sourced from a prior global analysis (spec: submodeling). Only TYPE=NODE is
+  // implemented; TYPE=SURFACE is deferred and rejected. GLOBAL ELSET= (the global element
+  // set searched for host elements) is recorded and carried onto the data lines, each of
+  // which names a driven boundary node set. INPUT= (the global result file) is accepted
+  // and ignored here — the displacement-driven slice supplies the global solution through
+  // the API. (ref: src/submodels.f.)
+  void begin_submodel(int line) {
+    const std::string type = param("TYPE");
+    if (type == "SURFACE" || type == "T")
+      throw ParseError(line,
+                       "*SUBMODEL, TYPE=SURFACE is deferred (tasks 3.3): only "
+                       "TYPE=NODE is implemented; use a boundary node set");
+    if (!type.empty() && type != "NODE" && type != "N")
+      throw ParseError(line, "*SUBMODEL: unknown TYPE=" + type + " (expected NODE)");
+    // GLOBAL ELSET= may be written "GLOBAL ELSET" (space stripped by normalize) or
+    // "GLOBALELSET"; params_ is keyed on the normalized (space-free) name.
+    submodel_global_elset_ = param("GLOBALELSET");
+  }
+
+  // *SUBMODEL data line: a driven boundary node set name (one per line / field). Each
+  // registers a SubmodelSpec bound to the card's GLOBAL ELSET=. (spec: submodeling.)
+  void submodel_data(const std::vector<std::string>& f, int /*line*/) {
+    for (const std::string& tok : f) {
+      if (tok.empty()) continue;
+      SubmodelSpec spec;
+      spec.boundary_nset = upper(trim(tok));
+      spec.global_elset = submodel_global_elset_;
+      model_.submodels.push_back(std::move(spec));
+    }
   }
 
   // *RETAINED NODAL DOFS data: "node_or_nset, first_dof, last_dof" — every DOF in
@@ -1452,7 +1622,9 @@ class Parser {
         // Dynamics (Phase 4) data cards with a data line.
         "*DYNAMIC", "*MODALDYNAMIC", "*STEADYSTATEDYNAMICS", "*COMPLEXFREQUENCY",
         "*MODALDAMPING", "*BASEMOTION", "*RETAINEDNODALDOFS",
-        "*COUPLEDTEMPERATURE-DISPLACEMENT", "*COUPLEDTEMPERATUREDISPLACEMENT"};
+        "*COUPLEDTEMPERATURE-DISPLACEMENT", "*COUPLEDTEMPERATUREDISPLACEMENT",
+        // Submodeling (Phase 5): the boundary node set(s) come on the data line.
+        "*SUBMODEL"};
     return std::find(data_cards.begin(), data_cards.end(), card_) != data_cards.end();
   }
 
@@ -1483,6 +1655,7 @@ class Parser {
     if (card_ == "*HEATTRANSFER") return static_data(f, line);  // same inc data line
     if (card_ == "*FREQUENCY") return frequency_data(f, line);
     if (card_ == "*BUCKLE") return buckle_data(f, line);
+    if (card_ == "*FATIGUE") return fatigue_data(f, line);
     if (card_ == "*DYNAMIC") return modal_dynamic_data(f, line);  // "dt, t_end"
     if (card_ == "*MODALDYNAMIC") return modal_dynamic_data(f, line);
     if (card_ == "*STEADYSTATEDYNAMICS") return steady_state_data(f, line);
@@ -1490,6 +1663,10 @@ class Parser {
     if (card_ == "*MODALDAMPING") return modal_damping_data(f, line);
     if (card_ == "*BASEMOTION") return base_motion_data(f, line);
     if (card_ == "*RETAINEDNODALDOFS") return retained_nodal_dofs_data(f, line);
+    if (card_ == "*SUBMODEL") return submodel_data(f, line);
+    if (card_ == "*DESIGNVARIABLES") return design_variables_data(f, line);
+    if (card_ == "*DESIGNRESPONSE" || card_ == "*OBJECTIVE")
+      return design_response_data(f, line);
     if (card_ == "*COUPLEDTEMPERATURE-DISPLACEMENT" ||
         card_ == "*COUPLEDTEMPERATUREDISPLACEMENT")
       return static_data(f, line);  // same increment data line as *STATIC
@@ -1719,6 +1896,10 @@ class Parser {
     // *BOUNDARY, FIXED holds each listed DOF at its currently-attained (deformed)
     // value; the multi-step driver resolves that at solve time (see Spc::fixed).
     const bool fixed = params_.count("FIXED") != 0;
+    // *BOUNDARY, SUBMODEL: the listed DOFs are DRIVEN from a global solution (spec:
+    // submodeling). The value on the card is a placeholder; the submodel driver fills
+    // each DOF with the global displacement interpolated at the node before the solve.
+    const bool driven = params_.count("SUBMODEL") != 0;
     // Temperature DOF: CalculiX numbers the nodal temperature as DOF 11 (and accepts
     // 0 as the temperature DOF in *CFLUX). In a heat step, *BOUNDARY on DOF 11 (or 0)
     // prescribes a temperature; mechanical DOFs 1..3 still prescribe displacements.
@@ -1729,7 +1910,7 @@ class Parser {
         continue;
       }
       for (int c = d1; c <= d2 && c <= kDofsPerNode; ++c)
-        model_.spcs.push_back(Spc{nd, c, val, amp, fixed});
+        model_.spcs.push_back(Spc{nd, c, val, amp, fixed, driven});
     }
   }
 

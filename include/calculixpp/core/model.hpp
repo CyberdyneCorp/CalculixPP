@@ -13,6 +13,7 @@
 #include "calculixpp/core/mesh.hpp"
 #include "calculixpp/core/section.hpp"
 #include "calculixpp/core/solution_control.hpp"
+#include "calculixpp/core/submodel.hpp"
 
 namespace cxpp {
 
@@ -30,6 +31,12 @@ struct Spc {
   // no prior deformation so FIXED reduces to value 0 (the DOF's start state), i.e. the
   // single-step path is unchanged. (spec: multi-step analysis — FIXED boundary.)
   bool fixed{false};
+  // *BOUNDARY, SUBMODEL: this DOF is DRIVEN from a global solution (spec: submodeling).
+  // `value` is a placeholder — the submodel driver overwrites it with the global
+  // displacement interpolated at the node's location before the local solve. A non-driven
+  // SPC (the default) is a literal prescribed value, so the ordinary path is unchanged.
+  // Declared AFTER `fixed` so the existing `Spc{...,fixed}` aggregate inits stay valid.
+  bool driven{false};
 };
 
 // Concentrated load on a nodal DOF (*CLOAD). `amplitude` scales the value over
@@ -187,7 +194,47 @@ enum class Procedure {
   // reduced matrices are exported by *SUBSTRUCTURE MATRIX OUTPUT / *MATRIX ASSEMBLE.
   // (spec: substructure-generation.) (numerics/substructure.)
   Substructure,
+  // *HCF: stress-based high-cycle-fatigue evaluation over a preceding stress-producing
+  // model (spec: high-cycle-fatigue). Recovers the stress field, forms a per-point
+  // uniaxial-equivalent stress amplitude, and inverts the material S-N (Basquin) curve
+  // N = (S_a/a)^(1/b) for the cycles-to-failure, reporting the worst-case location + life.
+  // This is a stress-life estimate, NOT the CalculiX crack-growth cumulative HCF path
+  // (hcfs.f/combilcfhcf.f), which is a documented follow-on. (numerics/high_cycle_fatigue.)
+  HighCycleFatigue,
+  // *SENSITIVITY: design-sensitivity analysis — the gradient dObjective/dx of a design
+  // response with respect to coordinate design variables, by the adjoint method
+  // reusing the primal linear-static factorization (spec: design-optimization —
+  // sensitivity core). (numerics/sensitivity.)
+  Sensitivity,
 };
+
+// A design response for a *SENSITIVITY step (spec: design-optimization). Only linear
+// responses with a closed-form adjoint are implemented this slice:
+//   Compliance / StrainEnergy — the self-adjoint scalar g = fᵀu (external work);
+//   Displacement — a single nodal DOF g = u(node,comp), the general linear case.
+// `name` is the *DESIGN RESPONSE NAME=. For Displacement, `node_id`/`comp` (1..3)
+// select the DOF; unused for the energy responses.
+struct DesignResponse {
+  enum class Kind { Compliance, Displacement };
+  std::string name;
+  Kind kind{Kind::Compliance};
+  Index node_id{};  // Displacement: target node
+  int comp{1};      // Displacement: target component 1..3
+};
+
+// One scalar coordinate design variable: the (node, component 1..3) whose coordinate is
+// perturbed. A `*DESIGN VARIABLES, TYPE=COORDINATE` node set expands to three of these
+// per node (x, y, z). (spec: design-optimization — coordinate design variables.)
+struct DesignVariable {
+  Index node_id{};
+  int comp{};  // 1..3 (x,y,z coordinate)
+};
+
+// Scalar reduction of a stress tensor to a uniaxial-equivalent fatigue amplitude for the
+// *HCF evaluation (spec: high-cycle-fatigue — CRITERION=). SignedVonMises is the von Mises
+// equivalent carrying the sign of the hydrostatic (mean normal) stress, so tension and
+// compression are distinguished; VonMises is the plain (always non-negative) equivalent.
+enum class FatigueCriterion { SignedVonMises, VonMises };
 
 // Solution scheme for a *COUPLED TEMPERATURE-DISPLACEMENT step (spec: heat-transfer
 // — coupled). The two schemes solve the SAME coupled residual and agree to solver
@@ -250,6 +297,10 @@ class Model {
   std::unordered_map<std::string, Material> materials;
   std::vector<SolidSection> sections;
   std::vector<Spc> spcs;
+  // *SUBMODEL cards (spec: submodeling). Non-empty routes a *STATIC deck through the
+  // submodel driver, which fills the driven SPCs from a supplied global solution before
+  // the local solve. Empty -> ordinary analysis (byte-for-byte the pre-submodel path).
+  std::vector<SubmodelSpec> submodels;
   std::vector<Cload> cloads;
   std::vector<Dload> dloads;
   std::vector<BodyLoad> body_loads;
@@ -462,6 +513,16 @@ class Model {
   bool substructure_stiffness{true};   // *SUBSTRUCTURE MATRIX OUTPUT, STIFFNESS=YES
   bool substructure_mass{false};       // *SUBSTRUCTURE MATRIX OUTPUT, MASS=YES
   int substructure_modes{0};           // fixed-interface modes (Craig-Bampton); 0 = Guyan
+
+  // Stress-amplitude reduction for a *HCF step (spec: high-cycle-fatigue — CRITERION=).
+  // Inert unless procedure == HighCycleFatigue. Signed von Mises is the default.
+  FatigueCriterion hcf_criterion{FatigueCriterion::SignedVonMises};
+  // Design-sensitivity data (spec: design-optimization). Inert unless procedure ==
+  // Sensitivity. `design_variables` is the ordered list of coordinate design variables
+  // (three per *DESIGN VARIABLES node — x, y, z); `design_responses` are the parsed
+  // *DESIGN RESPONSE / *OBJECTIVE entries whose gradients the *SENSITIVITY step reports.
+  std::vector<DesignVariable> design_variables;
+  std::vector<DesignResponse> design_responses;
 
   // Nonlinear-solution controls, parsed from *CONTROLS / *STATIC / *TIME POINTS.
   // Unused by the default linear path; consumed by solve_nonlinear_static.

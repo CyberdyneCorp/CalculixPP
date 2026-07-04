@@ -23,11 +23,14 @@
 #include "calculixpp/numerics/buckling.hpp"
 #include "calculixpp/numerics/eigensolution.hpp"
 #include "calculixpp/numerics/heat_transfer.hpp"
+#include "calculixpp/numerics/high_cycle_fatigue.hpp"
 #include "calculixpp/numerics/direct_dynamics.hpp"
 #include "calculixpp/numerics/modal_dynamics.hpp"
 #include "calculixpp/numerics/linear_static.hpp"
 #include "calculixpp/numerics/multistep.hpp"
 #include "calculixpp/numerics/nonlinear_static.hpp"
+#include "calculixpp/numerics/submodel.hpp"
+#include "calculixpp/numerics/sensitivity.hpp"
 #include "calculixpp/numerics/substructure.hpp"
 
 namespace py = pybind11;
@@ -130,6 +133,7 @@ py::dict summary_dict(const Model& m) {
       : m.procedure == Procedure::ComplexFrequency ? "complex frequency"
       : m.procedure == Procedure::Dynamic ? "dynamic"
       : m.procedure == Procedure::Substructure ? "substructure generate"
+      : m.procedure == Procedure::HighCycleFatigue ? "high cycle fatigue"
                                                         : "static";
 
   // Phase-2 introspection.
@@ -378,6 +382,80 @@ py::dict buckling_result_dict(const Model& m, const numerics::BucklingReport& re
   d["num_elements"] = m.mesh.num_elements();
   d["factors"] = factors;
   d["mode_shape"] = shapes;
+  return d;
+}
+
+// A *HCF deck evaluates stress-based high-cycle fatigue over the recovered stress field
+// and returns per-node life/amplitude arrays plus the worst-case (critical) location and
+// its cycles-to-failure. (spec: high-cycle-fatigue — reachable from Python.)
+py::dict hcf_result_dict(const Model& m, const numerics::HcfReport& rep) {
+  const std::size_t nn = m.mesh.num_nodes();
+  py::array_t<double> life(static_cast<py::ssize_t>(nn));
+  py::array_t<double> amp(static_cast<py::ssize_t>(nn));
+  auto rl = life.mutable_unchecked<1>();
+  auto ra = amp.mutable_unchecked<1>();
+  for (std::size_t i = 0; i < nn; ++i) {
+    rl(static_cast<py::ssize_t>(i)) = rep.life[i];
+    ra(static_cast<py::ssize_t>(i)) = rep.amplitude[i];
+  }
+  py::dict d;
+  d["procedure"] = "high cycle fatigue";
+  d["num_nodes"] = nn;
+  d["num_elements"] = m.mesh.num_elements();
+  d["criterion"] = m.hcf_criterion == FatigueCriterion::VonMises ? "von-mises"
+                                                                 : "signed-von-mises";
+  d["life"] = life;            // (n_nodes,) cycles-to-failure N per node
+  d["amplitude"] = amp;        // (n_nodes,) scalar stress amplitude S_a per node
+  d["worst_node"] = rep.worst_node_id;
+  d["worst_location"] = std::vector<double>{rep.worst_location[0], rep.worst_location[1],
+                                            rep.worst_location[2]};
+  d["worst_amplitude"] = rep.worst_amplitude;
+  d["worst_life"] = rep.worst_life;
+  return d;
+}
+
+// A *SENSITIVITY deck reports dObjective/dx for each design response over the
+// coordinate design variables (spec: design-optimization). The dict exposes the
+// design-variable node/component vectors and, per response, its name, objective value,
+// and the per-variable gradient array — so the adjoint gradient is reachable from
+// Python (the finite-difference gate lives in the C++ test).
+py::dict sensitivity_result_dict(const Model& m,
+                                 const numerics::SensitivityReport& rep) {
+  const std::size_t nv = m.design_variables.size();
+  py::array_t<long long> var_node(static_cast<py::ssize_t>(nv));
+  py::array_t<int> var_comp(static_cast<py::ssize_t>(nv));
+  auto rn = var_node.mutable_unchecked<1>();
+  auto rc = var_comp.mutable_unchecked<1>();
+  for (std::size_t v = 0; v < nv; ++v) {
+    rn(static_cast<py::ssize_t>(v)) =
+        static_cast<long long>(m.design_variables[v].node_id);
+    rc(static_cast<py::ssize_t>(v)) = m.design_variables[v].comp;
+  }
+  py::list responses;
+  for (const numerics::SensitivityResult& r : rep.responses) {
+    py::array_t<double> grad(static_cast<py::ssize_t>(nv));
+    auto rg = grad.mutable_unchecked<1>();
+    for (std::size_t v = 0; v < nv; ++v)
+      rg(static_cast<py::ssize_t>(v)) = r.dgdx[v];
+    py::dict rd;
+    rd["name"] = r.response_name;
+    rd["objective"] = r.objective;
+    rd["gradient"] = grad;
+    responses.append(rd);
+  }
+  py::dict d;
+  d["procedure"] = "sensitivity";
+  d["num_design_vars"] = nv;
+  d["num_nodes"] = m.mesh.num_nodes();
+  d["num_elements"] = m.mesh.num_elements();
+  d["design_var_node"] = var_node;
+  d["design_var_comp"] = var_comp;
+  d["responses"] = responses;
+  // Convenience: the first response's gradient/name at the top level.
+  if (!rep.responses.empty()) {
+    d["response_name"] = rep.responses.front().response_name;
+    d["gradient"] = responses[0].cast<py::dict>()["gradient"];
+  }
   return d;
 }
 
@@ -688,6 +766,21 @@ py::dict solve_model(const Model& m, const std::string& solver,
     d["backend"] = used;
     return d;
   }
+  // A *HCF deck inverts the material S-N (Basquin) curve over the recovered stress field
+  // and returns per-node life/amplitude + the worst-case location. (spec: high-cycle-
+  // fatigue.)
+  if (m.procedure == Procedure::HighCycleFatigue) {
+    py::dict d = hcf_result_dict(m, numerics::evaluate_hcf(m));
+    d["backend"] = used;
+    return d;
+  }
+  // A *SENSITIVITY deck computes dObjective/dx for each design response over the
+  // coordinate design variables by the adjoint method. (spec: design-optimization.)
+  if (m.procedure == Procedure::Sensitivity) {
+    py::dict d = sensitivity_result_dict(m, numerics::solve_sensitivity(m));
+    d["backend"] = used;
+    return d;
+  }
   // A *COUPLED TEMPERATURE-DISPLACEMENT deck solves the thermal field, applies the
   // resulting thermal strain, then the mechanical field (one-way coupling). The
   // result dict carries the mechanical fields plus the temperature/flux_reaction.
@@ -738,6 +831,64 @@ py::dict solve_model(const Model& m, const std::string& solver,
 py::dict solve_file(const std::string& path, const std::string& solver,
                     const std::string& backend) {
   return solve_model(io::parse_inp_file(path), solver, backend);
+}
+
+// Build a GlobalSolution from NumPy arrays: node coordinates (n,3), nodal displacement
+// (n,3), a per-element connectivity list of 0-based node indices, and a matching list of
+// element-type names ("C3D8", "C3D10", ...). (spec: submodeling — global result source;
+// the in-memory carrier the interpolation kernel consumes.)
+GlobalSolution build_global(py::array_t<double> coords, py::array_t<double> disp,
+                            const std::vector<std::vector<int>>& conn,
+                            const std::vector<std::string>& types) {
+  if (coords.ndim() != 2 || coords.shape(1) != 3)
+    throw std::runtime_error("global coords must be an (n,3) array");
+  if (disp.ndim() != 2 || disp.shape(1) != 3 || disp.shape(0) != coords.shape(0))
+    throw std::runtime_error("global displacement must be an (n,3) array matching coords");
+  if (conn.size() != types.size())
+    throw std::runtime_error("global connectivity and element-type lists must be the same length");
+  GlobalSolution g;
+  auto rc = coords.unchecked<2>();
+  auto rd = disp.unchecked<2>();
+  const auto n = static_cast<std::size_t>(coords.shape(0));
+  for (std::size_t i = 0; i < n; ++i) {
+    g.node_ids.push_back(static_cast<Index>(i));
+    g.coords.push_back({rc(static_cast<py::ssize_t>(i), 0),
+                        rc(static_cast<py::ssize_t>(i), 1),
+                        rc(static_cast<py::ssize_t>(i), 2)});
+    g.displacement.push_back({rd(static_cast<py::ssize_t>(i), 0),
+                              rd(static_cast<py::ssize_t>(i), 1),
+                              rd(static_cast<py::ssize_t>(i), 2)});
+  }
+  for (std::size_t e = 0; e < conn.size(); ++e) {
+    ElementType et{};
+    if (!parse_element_type(types[e], et))
+      throw std::runtime_error("unknown global element type '" + types[e] + "'");
+    g.elem_type.push_back(et);
+    std::vector<Index> c;
+    for (int idx : conn[e]) c.push_back(static_cast<Index>(idx));
+    g.elem_conn.push_back(std::move(c));
+  }
+  return g;
+}
+
+// Solve a submodel deck driven by an in-memory global solution (spec: submodeling).
+// Parses the submodel deck (which carries *SUBMODEL + *BOUNDARY, SUBMODEL), fills the
+// driven boundary DOFs from the global displacement interpolated at each node, solves
+// the local static step, and returns the standard displacement/stress/reaction dict.
+py::dict solve_submodel_text(const std::string& sub_text,
+                             py::array_t<double> global_coords,
+                             py::array_t<double> global_disp,
+                             const std::vector<std::vector<int>>& global_conn,
+                             const std::vector<std::string>& global_types,
+                             const std::string& solver, const std::string& backend) {
+  const std::string used = resolve_backend(backend);
+  const Model m = io::parse_inp(sub_text);
+  const GlobalSolution g =
+      build_global(global_coords, global_disp, global_conn, global_types);
+  py::dict d = result_dict(m, numerics::solve_submodel(m, g, kind_of(solver)));
+  d["backend"] = used;
+  d["procedure"] = "submodel";
+  return d;
 }
 
 py::dict solve_text(const std::string& text, const std::string& solver,
@@ -864,6 +1015,20 @@ PYBIND11_MODULE(calculixpp, mod) {
           py::arg("solver") = "", py::arg("backend") = "",
           py::arg("line_search") = false,
           "Like solve_nonlinear() but takes the deck contents as a string.");
+
+  mod.def("solve_submodel", &solve_submodel_text, py::arg("text"),
+          py::arg("global_coords"), py::arg("global_disp"), py::arg("global_conn"),
+          py::arg("global_types"), py::arg("solver") = "", py::arg("backend") = "",
+          "Solve a submodel deck driven by an in-memory global solution (spec: "
+          "submodeling). 'text' is the submodel deck (with *SUBMODEL, TYPE=NODE and "
+          "*BOUNDARY, SUBMODEL). The global solution is passed as global_coords (n,3), "
+          "global_disp (n,3), global_conn (list of per-element 0-based node-index "
+          "lists), and global_types (list of element-type names, e.g. 'C3D8'). Each "
+          "driven boundary DOF is prescribed to the global displacement interpolated at "
+          "the node's location via the host element shape functions, then the local "
+          "static step is solved. Returns the same fields as solve() with "
+          "procedure='submodel'. Raises RuntimeError if a driven node lies outside the "
+          "global element set.");
 
   mod.def("summary", &summary_file, py::arg("path"),
           "Parse an .inp deck without solving and return a dict describing it. "
