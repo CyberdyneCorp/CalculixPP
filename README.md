@@ -11,6 +11,8 @@ Numerics come from in-house libraries — **[NumPP](https://github.com/Cyberdyne
 > **Phase 2 (Nonlinear statics & materials) is in progress.** A Newton-Raphson driver (`solve_nonlinear`) with automatic incrementation now drives J2 plasticity, a C++ user-material seam, and the full hex/wedge element family (`C3D8`/`C3D20`/`C3D6`/`C3D15` + reduced `C3D8R`/`C3D20R`), plus amplitudes, body loads (`GRAV`/`CENTRIF`), springs/masses, and constraints (`*EQUATION`/`*MPC`/`*RIGID BODY`/`*COUPLING`/`*TIE`). New reference decks validate: `beam8p` (C3D8) and `beam20p` (C3D20) match stock CalculiX to **rel-L2 ~5.7 × 10⁻⁸**, and the nonlinear driver reproduces the linear solve to **< 10⁻¹⁰** in one increment.
 >
 > **Phase 3 (Thermal & contact) — COMPLETE and validated.** A scalar 1-DOF/node temperature field runs in parallel to the mechanical path, reusing the same mesh, shape functions/Gauss rules, and sparse solve: steady-state and transient (backward-Euler) conduction, `*CFLUX`/`*DFLUX` heat loads, convective `*FILM`, linearized surface and gray-body cavity `*RADIATE`, monolithic + staggered `*COUPLED TEMPERATURE-DISPLACEMENT` thermal stress (`*EXPANSION`), and element/contact-pair `*MODEL CHANGE` on a multi-step engine. **Contact** is a nonlinear constraint contributing to the Newton tangent/residual: node-to-surface **penalty** contact with a spatial contact-search engine (uniform-grid broad phase + closest-point projection), `*SURFACE BEHAVIOR` (hard/linear/exponential), Coulomb `*FRICTION` (stick↔slip), thermal contact (`*GAP CONDUCTANCE` / `*GAP HEAT GENERATION`), `*CLEARANCE`, and CSTR contact output (status/pressure/gap/traction). `solve()` auto-dispatches `*HEAT TRANSFER` (returning `NT`/`RFL`) and `*CONTACT PAIR` (returning the mechanical fields plus a per-node `contact` list). Validated against stock CalculiX heat decks (`oneel20cf`/`df`/`fi` steady conduction to ~1e-9, `oneel20fi2` transient film relaxation to ~1e-4) and the `beamt` thermal-stress deck (rel-L2 ~2.4 × 10⁻⁶); contact and thermal contact against analytical two-block references (global equilibrium, penalty penetration `F/(4κ)`, series-resistance gap flux — the stock contact decks use NLGEOM + CalculiX's exact exponential law + MPCs and are not gated). **Surface-to-surface mortar contact is deferred** — a `TYPE=SURFACE TO SURFACE` pair is rejected with an actionable error rather than silently mis-solved.
+>
+> **Phase 4 (Dynamics & eigenproblems) — core in progress.** A mechanical **mass matrix** `M_e = ∫ρ NᵀN dV` (consistent + lumped, the mechanical analog of the thermal capacitance) and an **eigensolution engine** for the generalized symmetric problem `K φ = λ M φ` (dense Cholesky-reduction path on NumPP `eigh`, mass-normalized ascending basis, participation factors / effective mass) underpin the frequency-domain and transient procedures: `*FREQUENCY` (natural frequencies + mode shapes), `*MODAL DYNAMIC` (modal superposition, exact Nigam-Jennings recurrence), `*STEADY STATE DYNAMICS` (harmonic sweep), `*DYNAMIC` (implicit HHT-α direct integration, linear + nonlinear), Rayleigh / modal `*DAMPING`, and `*SUBSTRUCTURE GENERATE` Craig-Bampton / Guyan reduction. Validated against stock CalculiX `beam8f` (`*FREQUENCY` C3D8 cantilever — 10 eigenvalues, frequencies, participation + effective mass to **< 1e-4 rel**) and `substructure` (Guyan reduced stiffness, 60 retained DOFs, **< 1e-6 rel**), plus analytical references (SDOF step response, α=0 energy conservation, resonant peak/bandwidth). **Buckling** (`*BUCKLE`, needs `K_geo` / NLGEOM), **complex/damped modes** (`*COMPLEX FREQUENCY`), **cyclic symmetry**, explicit `*DYNAMIC, EXPLICIT`, and `*GREEN` are deferred (a sparse shift-invert Lanczos awaits a sparse generalized eigensolver in NumPP/SciPP); each blocked card fails with an actionable parse error naming its enabler.
 
 ---
 
@@ -299,6 +301,114 @@ for c in r["contact"]:                                     # CSTR per slave node
 
 Add `*FRICTION` (Coulomb, stick↔slip) for tangential traction, `*GAP CONDUCTANCE` / `*GAP HEAT GENERATION` for thermal contact (heat crossing the interface, reachable from a `*HEAT TRANSFER` deck), and `*CLEARANCE` for an initial gap. `*MODEL CHANGE, TYPE=CONTACT PAIR` activates/deactivates a pair between steps. Surface-to-surface **mortar** contact is not implemented — a `TYPE=SURFACE TO SURFACE` pair is rejected with an actionable error rather than silently mis-solved.
 
+### Python — frequency & substructure (Phase 4)
+
+A `*FREQUENCY` deck extracts the lowest _N_ natural frequencies and mode shapes of the generalized eigenproblem `K φ = ω² M φ` (mechanical **mass matrix** `M_e = ∫ρ NᵀN dV` + a dense generalized eigensolve on NumPP); `solve()` returns `eigenvalue`/`omega`/`frequency`/`mode_shape` plus modal `participation`/`effective_mass`.
+
+A `*SUBSTRUCTURE GENERATE` step condenses the model onto the **retained (master) DOFs** of `*RETAINED NODAL DOFS`, producing a superelement. Static **Guyan** reduction forms the reduced stiffness Schur complement `K̂ = K_bb − K_bi K_ii⁻¹ K_ib`; adding a mass request (`*SUBSTRUCTURE MATRIX OUTPUT, MASS=YES`) and fixed-interface modes (a `*FREQUENCY` card inside the step) switches to **Craig-Bampton** reduction (constraint modes + fixed-interface normal modes from the eigensolution engine). The reduced matrices export in the reference `*MATRIX TYPE=STIFFNESS/MASS` lower-triangular format; `solve()` returns `k_reduced` / `m_reduced` plus the retained-DOF labels and `modal_omega`:
+
+```python
+import calculixpp
+
+# Craig-Bampton reduction of a cantilever column onto its top-face DOFs + 6 modes.
+deck = """
+*NODE
+1,0.,0.,0.
+2,1.,0.,0.
+3,1.,1.,0.
+4,0.,1.,0.
+5,0.,0.,1.
+6,1.,0.,1.
+7,1.,1.,1.
+8,0.,1.,1.
+9,0.,0.,2.
+10,1.,0.,2.
+11,1.,1.,2.
+12,0.,1.,2.
+*ELEMENT,TYPE=C3D8,ELSET=EALL
+1,1,2,3,4,5,6,7,8
+2,5,6,7,8,9,10,11,12
+*NSET,NSET=TOP
+9,10,11,12
+*MATERIAL,NAME=EL
+*ELASTIC
+210000.,0.3
+*DENSITY
+7.8e-9
+*SOLID SECTION,ELSET=EALL,MATERIAL=EL
+*BOUNDARY
+1,1,3
+2,1,3
+3,1,3
+4,1,3
+*STEP
+*SUBSTRUCTURE GENERATE
+*FREQUENCY
+6
+*RETAINED NODAL DOFS,SORTED=NO
+TOP,1,3
+*SUBSTRUCTURE MATRIX OUTPUT,STIFFNESS=YES,MASS=YES
+*END STEP
+"""
+
+s = calculixpp.solve_text(deck)
+print(s["procedure"])       # -> "substructure generate"
+print(s["num_retained"])    # -> 12  (4 top nodes × 3 DOFs)
+print(s["num_modes"])       # -> 6   (fixed-interface normal modes)
+print(s["dim"])             # -> 18  (reduced order = retained + modes)
+K = s["k_reduced"]          # 18×18 reduced stiffness (numpy array)
+M = s["m_reduced"]          # 18×18 reduced mass
+# The reduced model's low eigenfrequencies approximate the full model's (< 2%).
+```
+
+The reduced stiffness of the stock `*SUBSTRUCTURE GENERATE` deck (Guyan, 60 retained DOFs) matches reference CalculiX to < 1e-6 relative. Linear **buckling** (`*BUCKLE`, needs the geometric stiffness `K_geo` / NLGEOM), **complex/damped modes** (`*COMPLEX FREQUENCY`), and **cyclic symmetry** are specified and deferred (see `openspec/BACKLOG.md`). Each blocked card fails with an actionable parse error naming the enabler it waits on, rather than being silently mis-solved.
+
+### Python — dynamics (Phase 4)
+
+Three transient/harmonic procedures build on the eigensolution engine and the mechanical mass matrix. All three auto-dispatch from `solve()` / `solve_text()`:
+
+- **`*DYNAMIC`** — direct time integration of `M a + C v + K u = f(t)` by the implicit **HHT-α** (Hilber-Hughes-Taylor) generalization of Newmark-β. `ALPHA=` sets the numerical damping (`α ∈ [-1/3, 0]`; `α=0` is trapezoidal, conserving energy). Returns `time` + `displacement`/`velocity`/`acceleration`/`total_energy` histories plus `hht_alpha`, `energy_drift`, and `newton_iterations`. `*DYNAMIC, NLGEOM` (or a nonlinear material / contact) routes through the per-step Newton loop.
+- **`*MODAL DYNAMIC`** — transient response by modal superposition over the mass-normalized eigenbasis (each decoupled modal SDOF integrated with the exact Nigam-Jennings piecewise-linear-load recurrence). Returns `time` + the `displacement` history.
+- **`*STEADY STATE DYNAMICS`** — harmonic response over a frequency sweep via the complex modal transfer function. Returns `frequency` + per-node `amplitude`/`phase` sweep arrays.
+
+Damping: `*DAMPING, ALPHA=, BETA=` sets Rayleigh `C = αM + βK` (mapped to modal ratios `ζ_k = (α/ω_k + βω_k)/2`); `*MODAL DAMPING` overrides per mode.
+
+```python
+import calculixpp
+
+# A single-DOF oscillator: grounded spring k on x + point mass m -> ω = sqrt(k/m).
+# Suddenly-applied unit load -> u(t) = (F/k)(1 - cos ω t) (undamped, HHT α=0).
+deck = """
+*NODE
+1, 0., 0., 0.
+*ELEMENT,TYPE=SPRING1,ELSET=SP
+1,1
+*ELEMENT,TYPE=MASS,ELSET=MS
+2,1
+*SPRING,ELSET=SP
+1
+100.0
+*MASS,ELSET=MS
+1.0
+*BOUNDARY
+1,2,3
+*STEP
+*DYNAMIC
+0.01,2.0
+*CLOAD
+1,1,1.0
+*END STEP
+"""
+
+res = calculixpp.solve_text(deck)
+print(res["procedure"])          # -> "dynamic"
+t  = res["time"]                 # (n_step,) time stations
+ux = res["displacement"][:, 0, 0]  # node 0, x-displacement history
+print(res["hht_alpha"], res["energy_drift"])  # numerical-damping knob + energy drift
+```
+
+Swap the step body for `*MODAL DYNAMIC\n0.01,2.0` (same modal step response) or `*STEADY STATE DYNAMICS\n0.1,5.0,200` (a 200-point sweep from 0.1 to 5 Hz whose `amplitude` peaks at the natural frequency). All three are validated analytically (SDOF step response `(F/k)(1-cos ωt)`, α=0 energy conservation over 20 periods to < 1e-10, resonant peak `(F/k)·Q` with the correct half-power bandwidth) and, for steady-state, end-to-end on the real `beam8f` C3D8 mesh. Explicit central-difference `*DYNAMIC, EXPLICIT` and the `*GREEN` step are deferred.
+
 ### C++
 
 ```cpp
@@ -367,7 +477,7 @@ timeline
 | **1 — Foundation** | Build system, NumPP/SciPP, CPU backend, linear-static slice, Python bindings | ✅ complete |
 | **2 — Nonlinear** | Newton-Raphson, plasticity, user material, hex/wedge & load breadth, constraints | ✅ complete |
 | **3 — Thermal & contact** | Heat transfer, coupled thermomechanics, model change, node-to-surface contact (mortar S2S deferred) | ✅ complete |
-| **4 — Dynamics** | Frequency, buckling, direct/modal dynamics, substructures | 📋 specified |
+| **4 — Dynamics** | Frequency, direct/modal/steady-state dynamics, Craig-Bampton substructures (buckling/complex/cyclic deferred) | 🚧 in progress |
 | **5 — Advanced** | CFD/networks, electromagnetics, crack propagation, optimization | 📋 specified |
 
 ## Spec-driven development

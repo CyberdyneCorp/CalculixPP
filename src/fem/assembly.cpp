@@ -256,6 +256,46 @@ LinearSystem assemble_linear_static(const Model& model) {
   return sys;
 }
 
+LinearSystem assemble_mass(const Model& model, bool lumped) {
+  const Mesh& mesh = model.mesh;
+  LinearSystem sys;
+  build_dof_map(model, sys);
+  const Index n_free = sys.n_free;
+
+  const std::vector<Real> density = model.element_density();
+  const std::vector<bool> active = model.element_active_mask();
+  std::unordered_map<std::int64_t, Real> mmap;
+  std::vector<Index> nidx;
+  std::vector<Vec3> coords, ue;
+  std::vector<Real> dummy_rhs(static_cast<std::size_t>(n_free), 0.0);
+
+  for (std::size_t e = 0; e < mesh.num_elements(); ++e) {
+    if (!active[e]) continue;  // *MODEL CHANGE, REMOVE: element carries no mass
+    const Element& elem = mesh.elements()[e];
+    const int n = nodes_per_element(elem.type);
+    gather(mesh, elem, n, nullptr, nidx, coords, ue);
+    const std::vector<Real> Me =
+        lumped ? element_mass_lumped(elem.type, coords, density[e])
+               : element_mass(elem.type, coords, density[e]);
+    // Scatter through the same congruence transform as the stiffness; the RHS side
+    // effect (eliminated-constant columns) is discarded — mass never drives a load.
+    scatter_tangent(Me, n * kDofsPerNode, nidx, sys, n_free, mmap, dummy_rhs);
+  }
+
+  // *MASS point-mass connectors: a diagonal nodal mass on the 3 translational DOFs.
+  for (const PointMass& pm : model.point_masses) {
+    if (pm.mass == 0.0) continue;
+    for (int c = 0; c < kDofsPerNode; ++c) {
+      const std::size_t g = spring_global_dof(mesh, pm.node, c + 1);
+      const std::vector<std::size_t> gd{g};
+      scatter_block({pm.mass}, 1, gd, sys, n_free, mmap, dummy_rhs);
+    }
+  }
+
+  flush_coo(mmap, n_free, sys);
+  return sys;
+}
+
 // Build the MaterialModel for element `e` from the resolved per-element material data,
 // dispatching by constitutive kind (user material > plastic > hyperelastic > elastic).
 // `ndepvar` is set to the *DEPVAR count so the caller can size the state vectors.

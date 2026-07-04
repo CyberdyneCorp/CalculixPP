@@ -265,6 +265,31 @@ class Parser {
       begin_static();
     } else if (card_ == "*HEATTRANSFER") {
       begin_heat_transfer(line);
+    } else if (card_ == "*FREQUENCY") {
+      begin_frequency(line);
+    } else if (card_ == "*DYNAMIC") {
+      begin_dynamic(line);
+    } else if (card_ == "*MODALDYNAMIC") {
+      begin_modal_dynamic(line);
+    } else if (card_ == "*STEADYSTATEDYNAMICS") {
+      begin_steady_state_dynamics(line);
+    } else if (card_ == "*DAMPING") {
+      begin_damping(line);
+    } else if (card_ == "*MODALDAMPING") {
+      begin_modal_damping(line);
+    } else if (card_ == "*BASEMOTION") {
+      begin_base_motion(line);
+    } else if (card_ == "*SUBSTRUCTUREGENERATE") {
+      begin_substructure_generate(line);
+    } else if (card_ == "*RETAINEDNODALDOFS") {
+      // Data lines carry "nset_or_node, dof1, dof2" — parsed by retained_nodal_dofs_data.
+    } else if (card_ == "*SUBSTRUCTUREMATRIXOUTPUT") {
+      begin_substructure_matrix_output(line);
+    } else if (card_ == "*MATRIXASSEMBLE") {
+      // *MATRIX ASSEMBLE requests export of the assembled GLOBAL K/M (STIFFNESS=/MASS=).
+      // The reduced-substructure path already exposes the assembled operators; the flags
+      // are accepted and recorded on the substructure output request. Data lines (none).
+      begin_matrix_assemble(line);
     } else if (card_ == "*CONDUCTIVITY") {
       begin_conductivity(line);
     } else if (card_ == "*SPECIFICHEAT") {
@@ -419,6 +444,25 @@ class Parser {
          "the *VIEWFACTOR read/write-to-file control is not implemented; cavity "
          "radiation itself (*RADIATE ...,CR) IS supported — the view factors are "
          "computed internally, so drop *VIEWFACTOR (tasks 3.4)"},
+        // Phase-4 procedure cards blocked on a missing enabler (documented in
+        // openspec/BACKLOG.md Phase-4). The eigensolution/dynamics engines they
+        // would consume are in place; each names the enabler it waits on.
+        {"*BUCKLE",
+         "linear buckling — deferred; needs the geometric stiffness K_geo "
+         "(geometric nonlinearity / NLGEOM). The eigensolution engine it consumes "
+         "is in place (Phase-4 tasks 2.2)"},
+        {"*COMPLEXFREQUENCY",
+         "complex / damped modes — deferred; needs a complex eigensolve plus the "
+         "damping/friction operator assembly (Phase-4 tasks 1.6 / 2.3)"},
+        {"*CYCLICSYMMETRYMODEL",
+         "cyclic-symmetry sector eigenproblem — deferred; needs complex "
+         "cyclic-symmetry constraints and the complex eigensolve (Phase-4 tasks 6.1)"},
+        {"*SELECTCYCLICSYMMETRYMODES",
+         "nodal-diameter mode selection — deferred with *CYCLIC SYMMETRY MODEL "
+         "(Phase-4 tasks 6.2)"},
+        {"*GREEN",
+         "Green-function step — deferred; builds on the shipped modal engine but "
+         "needs the unit-excitation response basis (Phase-4 tasks 4.4)"},
     };
     const auto it = deferred.find(card_);
     if (it != deferred.end())
@@ -492,6 +536,170 @@ class Parser {
     model_.procedure = (params_.count("STEADYSTATE") != 0)
                            ? Procedure::HeatTransferSteady
                            : Procedure::HeatTransferTransient;
+  }
+
+  // *FREQUENCY: natural-frequency extraction (spec: modal-and-buckling — *FREQUENCY).
+  // Selects the eigen procedure; the data line gives the number of eigenvalues
+  // requested (first field). The optional second field (a frequency lower bound in
+  // CalculiX) is parsed and ignored in this slice — the dense engine returns the
+  // lowest N modes regardless. STORAGE/other params are accepted and ignored. `line`
+  // keeps the handler signature uniform.
+  // A *FREQUENCY card INSIDE a *SUBSTRUCTURE GENERATE step requests the number of
+  // fixed-interface normal modes retained by the Craig-Bampton reduction (not a
+  // standalone frequency analysis) — keep the Substructure procedure in that case.
+  void begin_frequency(int /*line*/) {
+    if (model_.procedure != Procedure::Substructure)
+      model_.procedure = Procedure::Frequency;
+  }
+
+  // *FREQUENCY data line: "N[, ...]" — number of eigenvalues requested. Defaults to 1
+  // when the line is blank (CalculiX requires N; we default defensively). Inside a
+  // substructure step the count is the number of fixed-interface modes.
+  void frequency_data(const std::vector<std::string>& f, int line) {
+    const int n = (f.empty() || f[0].empty())
+                      ? 1
+                      : std::max(1, static_cast<int>(to_double(f[0], line)));
+    if (model_.procedure == Procedure::Substructure)
+      model_.substructure_modes = n;
+    else
+      model_.num_eigenvalues = n;
+  }
+
+  // *DYNAMIC[, DIRECT][, ALPHA=][, NLGEOM]: direct time integration of the equations of
+  // motion by the implicit HHT-α scheme (spec: dynamic-analysis — direct dynamics). The
+  // data line is "dt, t_end" (shared with *MODAL DYNAMIC). ALPHA= sets the HHT numerical
+  // damping (α ∈ [-1/3, 0]); NLGEOM (or a nonlinear material / contact in the model)
+  // routes the per-step Newton path. EXPLICIT is accepted but the implicit scheme is used
+  // (the stable-implicit default); the parser records it without changing the scheme.
+  void begin_dynamic(int line) {
+    model_.procedure = Procedure::Dynamic;
+    if (params_.count("ALPHA") != 0)
+      model_.dynamic_alpha = to_double(param("ALPHA"), line);
+    if (params_.count("NLGEOM") != 0) model_.dynamic_nonlinear = true;
+    if (params_.count("DIRECT") != 0) model_.increment.direct = true;
+  }
+
+  // *MODAL DYNAMIC: transient response by modal superposition over a preceding
+  // *FREQUENCY basis (spec: dynamic-analysis — modal dynamic). The data line is
+  // "dt, t_end"; both default to a single unit step when blank. SOLVER= is accepted and
+  // ignored (modal superposition has no linear factorization). `line` keeps the handler
+  // signature uniform.
+  void begin_modal_dynamic(int /*line*/) {
+    model_.procedure = Procedure::ModalDynamic;
+  }
+  void modal_dynamic_data(const std::vector<std::string>& f, int line) {
+    if (!f.empty() && !f[0].empty()) model_.dynamic_dt = to_double(f[0], line);
+    if (f.size() > 1 && !f[1].empty()) model_.dynamic_t_end = to_double(f[1], line);
+  }
+
+  // *STEADY STATE DYNAMICS: harmonic response over a frequency sweep by modal
+  // superposition (spec: dynamic-analysis — steady-state dynamics). The data line is
+  // "f_lo, f_hi, num_points[, bias]"; num_points defaults to 20. `line` uniform.
+  void begin_steady_state_dynamics(int /*line*/) {
+    model_.procedure = Procedure::SteadyStateDynamics;
+  }
+  void steady_state_data(const std::vector<std::string>& f, int line) {
+    if (!f.empty() && !f[0].empty()) model_.steady_f_lo = to_double(f[0], line);
+    if (f.size() > 1 && !f[1].empty()) model_.steady_f_hi = to_double(f[1], line);
+    if (f.size() > 2 && !f[2].empty())
+      model_.steady_num_points = static_cast<int>(to_double(f[2], line));
+    if (model_.steady_num_points <= 0) model_.steady_num_points = 20;
+  }
+
+  // *DAMPING, ALPHA=, BETA=: Rayleigh (proportional) damping C = alpha M + beta K
+  // (spec: dynamic-analysis — Rayleigh damping). Coefficients on the card params; a data
+  // line (if present) is ignored.
+  void begin_damping(int line) {
+    model_.rayleigh.active = true;
+    if (params_.count("ALPHA") != 0)
+      model_.rayleigh.alpha = to_double(param("ALPHA"), line);
+    if (params_.count("BETA") != 0)
+      model_.rayleigh.beta = to_double(param("BETA"), line);
+  }
+
+  // *MODAL DAMPING: explicit per-mode damping ratios (spec: dynamic-analysis — modal
+  // damping). Data lines are "mode_lo, mode_hi, zeta" ranges (CalculiX form); each row
+  // sets zeta on modes [mode_lo, mode_hi] (1-based). `line` uniform.
+  void begin_modal_damping(int /*line*/) {}
+  void modal_damping_data(const std::vector<std::string>& f, int line) {
+    if (f.size() < 3) return;
+    const int lo = static_cast<int>(to_double(f[0], line));
+    const int hi = static_cast<int>(to_double(f[1], line));
+    const Real zeta = to_double(f[2], line);
+    if (lo < 1 || hi < lo) return;
+    if (static_cast<int>(model_.modal_damping.size()) < hi)
+      model_.modal_damping.resize(static_cast<std::size_t>(hi), 0.0);
+    for (int mdx = lo; mdx <= hi; ++mdx)
+      model_.modal_damping[static_cast<std::size_t>(mdx - 1)] = zeta;
+  }
+
+  // *BASE MOTION, DOF=, AMPLITUDE=: prescribed support excitation for a modal procedure
+  // (spec: dynamic-analysis — base motion). DOF= is the excitation direction (1..3); the
+  // data line (or MAGNITUDE) gives the amplitude. `line` uniform.
+  void begin_base_motion(int line) {
+    model_.base_motion.active = true;
+    if (params_.count("DOF") != 0)
+      model_.base_motion.dof = static_cast<int>(to_double(param("DOF"), line));
+  }
+  void base_motion_data(const std::vector<std::string>& f, int line) {
+    if (!f.empty() && !f[0].empty())
+      model_.base_motion.magnitude = to_double(f[0], line);
+  }
+
+  // *SUBSTRUCTURE GENERATE: select the substructure (superelement) procedure (spec:
+  // substructure-generation — tasks 5.1-5.3). The retained (master) DOFs come from a
+  // following *RETAINED NODAL DOFS card; the reduction is Guyan (static) unless a mass
+  // matrix and fixed-interface modes are requested (Craig-Bampton). No data line.
+  void begin_substructure_generate(int /*line*/) {
+    model_.procedure = Procedure::Substructure;
+  }
+
+  // *RETAINED NODAL DOFS data: "node_or_nset, first_dof, last_dof" — every DOF in
+  // [first, last] (clamped to 1..3 translational) of each node in the set is retained,
+  // in declaration order (SORTED=NO). Duplicates are dropped so a node listed twice is
+  // retained once. (spec: substructure-generation — retained nodal DOFs definition.)
+  void retained_nodal_dofs_data(const std::vector<std::string>& f, int line) {
+    if (f.empty() || f[0].empty())
+      throw ParseError(line, "*RETAINED NODAL DOFS needs node/nset, first_dof[, last_dof]");
+    const int d1 = f.size() > 1 && !f[1].empty()
+                       ? static_cast<int>(to_index(f[1], line))
+                       : 1;
+    const int d2 = f.size() > 2 && !f[2].empty()
+                       ? static_cast<int>(to_index(f[2], line))
+                       : d1;
+    for (const Index nd : node_refs(f[0], line))
+      for (int c = std::max(1, d1); c <= std::min(d2, kDofsPerNode); ++c) {
+        const bool dup = std::any_of(
+            model_.retained_dofs.begin(), model_.retained_dofs.end(),
+            [&](const Model::RetainedDof& r) { return r.node_id == nd && r.comp == c; });
+        if (!dup) model_.retained_dofs.push_back(Model::RetainedDof{nd, c});
+      }
+  }
+
+  // *SUBSTRUCTURE MATRIX OUTPUT, STIFFNESS=YES|NO, MASS=YES|NO: select which reduced
+  // matrices the superelement exports (spec: substructure-generation — reduced matrix
+  // export). MASS=YES (or a nonzero fixed-interface mode count) triggers Craig-Bampton;
+  // stiffness defaults to YES. OUTPUT FILE / FILE NAME params are accepted and ignored
+  // (the export path is chosen by the driver / bindings). No data line.
+  void begin_substructure_matrix_output(int /*line*/) {
+    const auto yes = [&](const char* key, bool dflt) {
+      if (params_.count(key) == 0) return dflt;
+      const std::string& v = params_.at(key);
+      return v.empty() || v == "YES";
+    };
+    model_.substructure_stiffness = yes("STIFFNESS", true);
+    model_.substructure_mass = yes("MASS", false);
+  }
+
+  // *MATRIX ASSEMBLE, STIFFNESS=YES, MASS=YES: request export of the assembled global
+  // operators. In this slice we record the mass request (so a *MATRIX ASSEMBLE, MASS=YES
+  // forms the reduced mass too); the assembled global K/M are reachable via the
+  // fem::assemble_* API and the substructure export. No data line.
+  void begin_matrix_assemble(int /*line*/) {
+    if (params_.count("MASS") != 0) {
+      const std::string& v = params_.at("MASS");
+      if (v.empty() || v == "YES") model_.substructure_mass = true;
+    }
   }
 
   // *CONDUCTIVITY: isotropic scalar conductivity on the current material. The data
@@ -1188,6 +1396,10 @@ class Parser {
         // Thermal (Phase 3) data cards.
         "*HEATTRANSFER", "*CONDUCTIVITY", "*SPECIFICHEAT", "*EXPANSION", "*CFLUX",
         "*DFLUX", "*TEMPERATURE", "*FILM", "*RADIATE", "*INITIALCONDITIONS",
+        "*FREQUENCY",
+        // Dynamics (Phase 4) data cards with a data line.
+        "*DYNAMIC", "*MODALDYNAMIC", "*STEADYSTATEDYNAMICS", "*MODALDAMPING",
+        "*BASEMOTION", "*RETAINEDNODALDOFS",
         "*COUPLEDTEMPERATURE-DISPLACEMENT", "*COUPLEDTEMPERATUREDISPLACEMENT"};
     return std::find(data_cards.begin(), data_cards.end(), card_) != data_cards.end();
   }
@@ -1217,6 +1429,13 @@ class Parser {
     if (card_ == "*CONTACTPAIR") return contact_pair_data(f, line);
     if (card_ == "*STATIC") return static_data(f, line);
     if (card_ == "*HEATTRANSFER") return static_data(f, line);  // same inc data line
+    if (card_ == "*FREQUENCY") return frequency_data(f, line);
+    if (card_ == "*DYNAMIC") return modal_dynamic_data(f, line);  // "dt, t_end"
+    if (card_ == "*MODALDYNAMIC") return modal_dynamic_data(f, line);
+    if (card_ == "*STEADYSTATEDYNAMICS") return steady_state_data(f, line);
+    if (card_ == "*MODALDAMPING") return modal_damping_data(f, line);
+    if (card_ == "*BASEMOTION") return base_motion_data(f, line);
+    if (card_ == "*RETAINEDNODALDOFS") return retained_nodal_dofs_data(f, line);
     if (card_ == "*COUPLEDTEMPERATURE-DISPLACEMENT" ||
         card_ == "*COUPLEDTEMPERATUREDISPLACEMENT")
       return static_data(f, line);  // same increment data line as *STATIC
@@ -1800,6 +2019,21 @@ std::vector<Model> parse_inp_steps_file(const std::string& path) {
   std::stringstream ss;
   ss << in.rdbuf();
   return parse_inp_steps(ss.str());
+}
+
+void validate_preceding_frequency(const std::vector<Model>& steps) {
+  bool saw_frequency = false;
+  for (std::size_t i = 0; i < steps.size(); ++i) {
+    const Procedure p = steps[i].procedure;
+    const bool needs_basis = p == Procedure::ModalDynamic ||
+                             p == Procedure::SteadyStateDynamics;
+    if (needs_basis && !saw_frequency)
+      throw std::runtime_error(
+          "step " + std::to_string(i + 1) +
+          " (*MODAL DYNAMIC / *STEADY STATE DYNAMICS) requires a preceding *FREQUENCY "
+          "step in the same job that produced the eigenmodes (none found)");
+    if (p == Procedure::Frequency) saw_frequency = true;
+  }
 }
 
 }  // namespace cxpp::io

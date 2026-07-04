@@ -41,6 +41,19 @@ struct LinearSystem {
 // static condensation of the single-point constraints.
 LinearSystem assemble_linear_static(const Model& model);
 
+// Assemble the global mass matrix on the SAME free-DOF numbering as
+// assemble_linear_static (spec: modal-and-buckling-analysis — *FREQUENCY). Each
+// element's consistent (or lumped) mass M_e = ∫rho Nᵀ N dV is scattered through the
+// constraint transform exactly like the stiffness, so the returned COO triplets and
+// the free-DOF count match the stiffness system produced by assemble_linear_static
+// for the SAME model — the generalized eigenproblem K x = λ M x is well-posed on the
+// shared numbering. `*MASS` point-mass connectors add a diagonal nodal mass on their
+// three translational DOFs. The returned LinearSystem carries the same dof_eq /
+// prescribed / transform data as the stiffness system; rhs is unused (left zero).
+// `lumped` selects row-sum lumped element mass instead of the consistent matrix.
+// (Deactivated elements — *MODEL CHANGE, REMOVE — carry no mass, mirroring K.)
+LinearSystem assemble_mass(const Model& model, bool lumped = false);
+
 // Per-element material models and their per-integration-point state, aligned with
 // mesh.elements(). Built once by make_material_points and advanced across Newton
 // iterations by the nonlinear driver. `state[e]` has one MaterialState per Gauss

@@ -2,16 +2,21 @@
 //   ccxpp <model.inp> [-o <basename>] [--solver direct|cg]
 // Parses an Abaqus-style deck, solves K u = f, and writes <basename>.frd/.dat.
 #include <cmath>
+#include <complex>
 #include <cstdio>
 #include <optional>
 #include <string>
 
 #include "calculixpp/io/inp_parser.hpp"
 #include "calculixpp/io/results_writer.hpp"
+#include "calculixpp/numerics/direct_dynamics.hpp"
+#include "calculixpp/numerics/eigensolution.hpp"
 #include "calculixpp/numerics/heat_transfer.hpp"
 #include "calculixpp/numerics/linear_static.hpp"
+#include "calculixpp/numerics/modal_dynamics.hpp"
 #include "calculixpp/numerics/multistep.hpp"
 #include "calculixpp/numerics/nonlinear_static.hpp"
+#include "calculixpp/numerics/substructure.hpp"
 
 namespace {
 
@@ -115,6 +120,127 @@ int main(int argc, char** argv) {
       std::printf("  max |u|        = %.6g\n", umax);
       std::printf("  max von Mises  = %.6g\n", svm_max);
       std::printf("  wrote %s.frd, %s.dat\n", out.c_str(), out.c_str());
+      return 0;
+    }
+
+    // A *FREQUENCY deck extracts the lowest N natural frequencies + mode shapes of
+    // the generalized eigenproblem K x = λ M x (spec: modal-and-buckling — *FREQUENCY).
+    if (model.procedure == Procedure::Frequency) {
+      const std::size_t nreq = model.num_eigenvalues > 0
+                                   ? static_cast<std::size_t>(model.num_eigenvalues)
+                                   : 1;
+      const numerics::EigenBasis basis = numerics::extract_modes(model, nreq);
+      std::printf("CalculiX++  %s  (frequency: %zu modes)\n", input.c_str(),
+                  basis.modes.size());
+      std::printf("  nodes=%zu  elements=%zu\n", model.mesh.num_nodes(),
+                  model.mesh.num_elements());
+      std::printf("  MODE   EIGENVALUE        FREQUENCY(cycles/time)\n");
+      for (std::size_t i = 0; i < basis.modes.size(); ++i)
+        std::printf("  %4zu   %.7e   %.7e\n", i + 1, basis.modes[i].eigenvalue,
+                    basis.modes[i].frequency);
+      return 0;
+    }
+
+    // A *MODAL DYNAMIC / *STEADY STATE DYNAMICS deck runs modal superposition over the
+    // *FREQUENCY basis extracted from the same model (spec: dynamic-analysis). The CLI
+    // prints a summary of the transient peak / resonance; the Python bindings expose the
+    // full displacement history / amplitude+phase sweep arrays.
+    if (model.procedure == Procedure::ModalDynamic ||
+        model.procedure == Procedure::SteadyStateDynamics) {
+      const std::size_t nreq =
+          model.num_eigenvalues > 0 ? static_cast<std::size_t>(model.num_eigenvalues)
+                                    : 1;
+      const fem::LinearSystem K = fem::assemble_linear_static(model);
+      const fem::LinearSystem M = fem::assemble_mass(model, /*lumped=*/false);
+      const numerics::EigenBasis basis = numerics::extract_modes(K, M, nreq);
+      numerics::Damping damp;
+      damp.alpha = model.rayleigh.alpha;
+      damp.beta = model.rayleigh.beta;
+      damp.modal_ratios = model.modal_damping;
+      const numerics::ModalSystem sys = numerics::project_modal_system(basis, damp);
+      if (model.procedure == Procedure::ModalDynamic) {
+        numerics::ModalLoad load;
+        load.pattern = K.rhs;
+        const Real dt = model.dynamic_dt > 0.0 ? model.dynamic_dt : 1.0;
+        const Real t_end = model.dynamic_t_end > 0.0 ? model.dynamic_t_end : dt;
+        const std::vector<numerics::ModalTimePoint> hist =
+            numerics::modal_dynamic(sys, load, dt, t_end);
+        Real umax = 0.0;
+        for (const numerics::ModalTimePoint& fp : hist)
+          for (const Vec3& u : fp.displacement)
+            umax = std::max(umax,
+                            std::sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]));
+        std::printf("CalculiX++  %s  (modal dynamic: %zu modes, %zu steps)\n",
+                    input.c_str(), sys.n_modes, hist.size());
+        std::printf("  max |u| over history = %.6g\n", umax);
+      } else {
+        const Real f_lo = model.steady_f_lo;
+        const Real f_hi = model.steady_f_hi > 0.0 ? model.steady_f_hi : f_lo;
+        const std::size_t npts = model.steady_num_points > 0
+                                     ? static_cast<std::size_t>(model.steady_num_points)
+                                     : 20;
+        const std::vector<numerics::HarmonicResponse> sweep =
+            numerics::steady_state_sweep(sys, K.rhs, f_lo, f_hi, npts);
+        Real amax = 0.0, fpeak = 0.0;
+        for (const numerics::HarmonicResponse& r : sweep)
+          for (const std::complex<Real>& a : r.amplitude)
+            if (std::abs(a) > amax) {
+              amax = std::abs(a);
+              fpeak = r.frequency;
+            }
+        std::printf(
+            "CalculiX++  %s  (steady-state dynamics: %zu modes, %zu freqs)\n",
+            input.c_str(), sys.n_modes, sweep.size());
+        std::printf("  peak amplitude = %.6g at f = %.6g\n", amax, fpeak);
+      }
+      std::printf("  nodes=%zu  elements=%zu\n", model.mesh.num_nodes(),
+                  model.mesh.num_elements());
+      return 0;
+    }
+
+    // A *DYNAMIC deck runs direct HHT-α time integration of M a + C v + K u = f(t) in
+    // physical coordinates (spec: dynamic-analysis — direct dynamics). The CLI prints the
+    // transient peak displacement and the energy drift over the run; the Python bindings
+    // expose the full displacement/velocity/acceleration + energy history.
+    if (model.procedure == Procedure::Dynamic) {
+      numerics::DirectOptions opts;
+      opts.hht = numerics::HhtParams::from_alpha(model.dynamic_alpha);
+      opts.damping.alpha = model.rayleigh.alpha;
+      opts.damping.beta = model.rayleigh.beta;
+      opts.nonlinear = model.dynamic_nonlinear;
+      const Real dt = model.dynamic_dt > 0.0 ? model.dynamic_dt : 1.0;
+      const Real t_end = model.dynamic_t_end > 0.0 ? model.dynamic_t_end : dt;
+      numerics::DirectReport rep;
+      const std::vector<numerics::DirectTimePoint> hist =
+          numerics::direct_dynamic(model, dt, t_end, opts, nullptr, &rep);
+      Real umax = 0.0;
+      for (const numerics::DirectTimePoint& fp : hist)
+        for (const Vec3& u : fp.displacement)
+          umax = std::max(umax,
+                          std::sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]));
+      std::printf("CalculiX++  %s  (dynamic: HHT-alpha=%.3g, %d steps)\n",
+                  input.c_str(), opts.hht.alpha, rep.steps);
+      std::printf("  nodes=%zu  elements=%zu\n", model.mesh.num_nodes(),
+                  model.mesh.num_elements());
+      std::printf("  max |u| over history = %.6g\n", umax);
+      std::printf("  energy drift         = %.3e\n", rep.energy_drift);
+      return 0;
+    }
+
+    // A *SUBSTRUCTURE GENERATE deck condenses the model onto the retained (master) DOFs
+    // and writes the reduced stiffness (+ mass, Craig-Bampton) in the reference
+    // *MATRIX TYPE= lower-triangular format to <out>.mtx (spec: substructure-generation).
+    if (model.procedure == Procedure::Substructure) {
+      const numerics::Superelement se = numerics::generate_substructure(model);
+      const std::string mpath = out + ".mtx";
+      numerics::write_substructure_matrix(mpath, se);
+      std::printf("CalculiX++  %s  (substructure generate)\n", input.c_str());
+      std::printf("  nodes=%zu  elements=%zu\n", model.mesh.num_nodes(),
+                  model.mesh.num_elements());
+      std::printf("  retained DOFs = %zu  fixed-interface modes = %zu  (reduced order %zu)\n",
+                  se.n_retained, se.n_modes, se.dim());
+      std::printf("  wrote %s%s\n", mpath.c_str(),
+                  se.m_reduced.empty() ? " (stiffness)" : " (stiffness + mass)");
       return 0;
     }
 

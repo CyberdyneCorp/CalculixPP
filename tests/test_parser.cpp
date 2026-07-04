@@ -363,6 +363,31 @@ void test_deferred_cards_reject_clearly() {
                        "unsupported card"));
 }
 
+// (7.1) Phase-4 procedure cards that are BLOCKED on a missing enabler must fail
+// with a clear, actionable ParseError naming the deferral — not a generic
+// "unsupported card" and never a silent no-op. The eigensolution/dynamics engines
+// they would consume are in place; each names the enabler it waits on (see
+// openspec/BACKLOG.md Phase-4).
+void test_blocked_phase4_cards_reject_clearly() {
+  const char* sect = "*SOLID SECTION, ELSET=EALL, MATERIAL=M\n";
+  struct Case {
+    std::string block;
+    std::string needle;
+  };
+  const Case cases[] = {
+      {"*STEP\n*BUCKLE\n5\n*END STEP\n", "linear buckling"},
+      {"*STEP\n*COMPLEX FREQUENCY\n5\n*END STEP\n", "complex"},
+      {"*CYCLIC SYMMETRY MODEL, N=8\n1,2\n", "cyclic-symmetry"},
+      {"*SELECT CYCLIC SYMMETRY MODES\n0,4\n", "nodal-diameter"},
+      {"*STEP\n*GREEN\n*END STEP\n", "Green-function"},
+  };
+  for (const Case& c : cases) {
+    const std::string deck = std::string(kMatHeader) + sect + c.block;
+    CX_CHECK(throws_with(deck, c.needle));
+    CX_CHECK(throws_with(deck, "deferred"));
+  }
+}
+
 // (6.1) The full Phase-2 IMPLEMENTED card set parses without crashing: connectors,
 // hex/wedge element types, amplitudes, body loads, controls/time points, changes,
 // and NLGEOM (accepted/ignored). One deck exercising the breadth.
@@ -431,6 +456,63 @@ EALL, GRAV, 9810., 0., 0., -1.
   CX_CHECK(m.cloads[0].amplitude == "RAMP");
 }
 
+// *SUBSTRUCTURE GENERATE / *RETAINED NODAL DOFS / *SUBSTRUCTURE MATRIX OUTPUT parse into
+// the substructure procedure + retained-DOF set (spec: substructure-generation).
+void test_substructure_cards() {
+  const char* deck = R"(
+*NODE
+1, 0., 0., 0.
+2, 1., 0., 0.
+*ELEMENT,TYPE=C3D8,ELSET=EALL
+*NSET,NSET=RET
+1,2
+*MATERIAL,NAME=EL
+*ELASTIC
+210000.,0.3
+*DENSITY
+7.8e-9
+*STEP
+*SUBSTRUCTURE GENERATE
+*RETAINED NODAL DOFS,SORTED=NO
+RET,1,3
+*SUBSTRUCTURE MATRIX OUTPUT,STIFFNESS=YES,MASS=YES
+*END STEP
+)";
+  const Model m = io::parse_inp(deck);
+  CX_CHECK(m.procedure == Procedure::Substructure);
+  CX_CHECK(m.retained_dofs.size() == 6);  // 2 nodes x 3 DOFs
+  CX_CHECK(m.retained_dofs[0].node_id == 1 && m.retained_dofs[0].comp == 1);
+  CX_CHECK(m.retained_dofs[2].node_id == 1 && m.retained_dofs[2].comp == 3);
+  CX_CHECK(m.retained_dofs[3].node_id == 2 && m.retained_dofs[3].comp == 1);
+  CX_CHECK(m.substructure_stiffness);
+  CX_CHECK(m.substructure_mass);  // MASS=YES
+}
+
+// validate_preceding_frequency: a *MODAL DYNAMIC step with no preceding *FREQUENCY step
+// throws; one preceded by *FREQUENCY passes (spec: modal-and-buckling — task 2.4).
+void test_preceding_frequency_required() {
+  Model freq;
+  freq.procedure = Procedure::Frequency;
+  Model modal;
+  modal.procedure = Procedure::ModalDynamic;
+  // Missing: modal alone -> throws.
+  bool threw = false;
+  try {
+    io::validate_preceding_frequency({modal});
+  } catch (const std::exception&) {
+    threw = true;
+  }
+  CX_CHECK(threw);
+  // Satisfied: *FREQUENCY then *MODAL DYNAMIC -> passes.
+  bool ok = true;
+  try {
+    io::validate_preceding_frequency({freq, modal});
+  } catch (const std::exception&) {
+    ok = false;
+  }
+  CX_CHECK(ok);
+}
+
 }  // namespace
 
 int main() {
@@ -442,7 +524,10 @@ int main() {
   test_user_and_hyperelastic_cards();
   test_constraint_cards();
   test_deferred_cards_reject_clearly();
+  test_blocked_phase4_cards_reject_clearly();
   test_phase2_card_sweep_parses();
+  test_substructure_cards();
+  test_preceding_frequency_required();
   if (cxtest::g_failures == 0) std::printf("test_parser: OK\n");
   CX_MAIN_RETURN();
 }

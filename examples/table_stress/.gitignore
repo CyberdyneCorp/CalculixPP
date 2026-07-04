@@ -1,0 +1,3 @@
+*.vtk
+__pycache__/
+fbx_table_mesh.png

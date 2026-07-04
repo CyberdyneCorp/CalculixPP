@@ -8,6 +8,8 @@
 #include <pybind11/stl.h>
 
 #include <algorithm>
+#include <cmath>
+#include <complex>
 #include <string>
 #include <vector>
 
@@ -15,12 +17,17 @@
 
 #include "calculixpp/compute/backend.hpp"
 #include "calculixpp/core/element.hpp"
+#include "calculixpp/fem/assembly.hpp"
 #include "calculixpp/io/inp_parser.hpp"
 #include "calculixpp/io/results_writer.hpp"
+#include "calculixpp/numerics/eigensolution.hpp"
 #include "calculixpp/numerics/heat_transfer.hpp"
+#include "calculixpp/numerics/direct_dynamics.hpp"
+#include "calculixpp/numerics/modal_dynamics.hpp"
 #include "calculixpp/numerics/linear_static.hpp"
 #include "calculixpp/numerics/multistep.hpp"
 #include "calculixpp/numerics/nonlinear_static.hpp"
+#include "calculixpp/numerics/substructure.hpp"
 
 namespace py = pybind11;
 using namespace cxpp;
@@ -115,6 +122,11 @@ py::dict summary_dict(const Model& m) {
       m.procedure == Procedure::HeatTransferSteady      ? "heat transfer steady state"
       : m.procedure == Procedure::HeatTransferTransient ? "heat transfer transient"
       : m.procedure == Procedure::Coupled ? "coupled temperature-displacement"
+      : m.procedure == Procedure::Frequency ? "frequency"
+      : m.procedure == Procedure::ModalDynamic ? "modal dynamic"
+      : m.procedure == Procedure::SteadyStateDynamics ? "steady state dynamics"
+      : m.procedure == Procedure::Dynamic ? "dynamic"
+      : m.procedure == Procedure::Substructure ? "substructure generate"
                                                         : "static";
 
   // Phase-2 introspection.
@@ -228,11 +240,339 @@ py::dict thermal_result_dict(const Model& m, const ThermalFields& t) {
   return d;
 }
 
+// A *FREQUENCY result as NumPy arrays: eigenvalues (λ = ω²), natural angular
+// frequencies (ω) and cyclic frequencies (f = ω/2π), the mass-normalized mode shapes
+// (n_modes x n_nodes x 3), and the modal participation factors / effective mass for
+// the three translational excitation directions. (spec: eigensolution, modal-and-
+// buckling — *FREQUENCY.)
+py::dict frequency_result_dict(const Model& m, const numerics::EigenBasis& basis,
+                               const fem::LinearSystem& M) {
+  const std::size_t nm = basis.modes.size();
+  const std::size_t nn = m.mesh.num_nodes();
+  py::array_t<double> eigv(static_cast<py::ssize_t>(nm));
+  py::array_t<double> omega(static_cast<py::ssize_t>(nm));
+  py::array_t<double> freq(static_cast<py::ssize_t>(nm));
+  py::array_t<double> shapes({static_cast<py::ssize_t>(nm),
+                              static_cast<py::ssize_t>(nn), py::ssize_t{3}});
+  auto re = eigv.mutable_unchecked<1>();
+  auto ro = omega.mutable_unchecked<1>();
+  auto rf = freq.mutable_unchecked<1>();
+  auto rs = shapes.mutable_unchecked<3>();
+  for (std::size_t k = 0; k < nm; ++k) {
+    re(static_cast<py::ssize_t>(k)) = basis.modes[k].eigenvalue;
+    ro(static_cast<py::ssize_t>(k)) = basis.modes[k].omega;
+    rf(static_cast<py::ssize_t>(k)) = basis.modes[k].frequency;
+    for (std::size_t i = 0; i < nn; ++i)
+      for (py::ssize_t j = 0; j < 3; ++j)
+        rs(static_cast<py::ssize_t>(k), static_cast<py::ssize_t>(i), j) =
+            basis.modes[k].shape[i][static_cast<std::size_t>(j)];
+  }
+  // Participation factors / effective mass (n_modes x 3) and totals per direction.
+  py::array_t<double> part({static_cast<py::ssize_t>(nm), py::ssize_t{3}});
+  py::array_t<double> effmass({static_cast<py::ssize_t>(nm), py::ssize_t{3}});
+  py::array_t<double> total_eff(py::ssize_t{3});
+  auto rp = part.mutable_unchecked<2>();
+  auto rem = effmass.mutable_unchecked<2>();
+  auto rte = total_eff.mutable_unchecked<1>();
+  for (int dir = 0; dir < 3; ++dir) {
+    const numerics::Participation p = numerics::participation(basis, M, dir);
+    for (std::size_t k = 0; k < nm; ++k) {
+      rp(static_cast<py::ssize_t>(k), dir) = p.factor[k];
+      rem(static_cast<py::ssize_t>(k), dir) = p.effective_mass[k];
+    }
+    rte(dir) = p.total_effective_mass;
+  }
+  py::dict d;
+  d["procedure"] = "frequency";
+  d["num_modes"] = nm;
+  d["num_nodes"] = nn;
+  d["num_elements"] = m.mesh.num_elements();
+  d["eigenvalue"] = eigv;
+  d["omega"] = omega;
+  d["frequency"] = freq;
+  d["mode_shape"] = shapes;
+  d["participation"] = part;
+  d["effective_mass"] = effmass;
+  d["total_effective_mass"] = total_eff;
+  return d;
+}
+
+// A *SUBSTRUCTURE GENERATE deck condenses onto the retained DOFs (Craig-Bampton /
+// Guyan) and returns the reduced operators + their labels. `k_reduced`/`m_reduced` are
+// dim×dim arrays (dim = retained DOFs + fixed-interface modes); `retained_node` /
+// `retained_comp` name the leading retained block; `modal_omega` the appended modal
+// block's frequencies. (spec: substructure-generation — reachable from Python.)
+py::dict substructure_result_dict(const Model& m) {
+  const numerics::Superelement se = numerics::generate_substructure(m);
+  const std::size_t dim = se.dim();
+  py::array_t<double> K({static_cast<py::ssize_t>(dim),
+                         static_cast<py::ssize_t>(dim)});
+  auto rk = K.mutable_unchecked<2>();
+  for (std::size_t i = 0; i < dim; ++i)
+    for (std::size_t j = 0; j < dim; ++j)
+      rk(static_cast<py::ssize_t>(i), static_cast<py::ssize_t>(j)) =
+          se.k_reduced[i * dim + j];
+  py::dict d;
+  d["procedure"] = "substructure generate";
+  d["num_retained"] = se.n_retained;
+  d["num_modes"] = se.n_modes;
+  d["dim"] = dim;
+  d["k_reduced"] = K;
+  if (!se.m_reduced.empty()) {
+    py::array_t<double> M({static_cast<py::ssize_t>(dim),
+                           static_cast<py::ssize_t>(dim)});
+    auto rm = M.mutable_unchecked<2>();
+    for (std::size_t i = 0; i < dim; ++i)
+      for (std::size_t j = 0; j < dim; ++j)
+        rm(static_cast<py::ssize_t>(i), static_cast<py::ssize_t>(j)) =
+            se.m_reduced[i * dim + j];
+    d["m_reduced"] = M;
+  }
+  d["retained_node"] = se.retained_node;
+  d["retained_comp"] = se.retained_comp;
+  d["modal_omega"] = se.modal_omega;
+  return d;
+}
+
+// Build the modal system (eigenbasis + damping projection) shared by *MODAL DYNAMIC and
+// *STEADY STATE DYNAMICS. Extracts the requested number of modes, applies the deck's
+// Rayleigh / modal damping, and returns the reduced modal operators plus the free-DOF
+// load pattern (K.rhs — the reduced concentrated-load vector) for superposition. The
+// eigenbasis is returned by value into `basis_out` because ModalSystem borrows it.
+numerics::ModalSystem build_modal_system(const Model& m,
+                                         numerics::EigenBasis& basis_out,
+                                         std::vector<Real>& load_out,
+                                         const fem::LinearSystem& K,
+                                         const fem::LinearSystem& M) {
+  const std::size_t nreq = m.num_eigenvalues > 0
+                               ? static_cast<std::size_t>(m.num_eigenvalues)
+                               : static_cast<std::size_t>(K.n_free);
+  basis_out = numerics::extract_modes(K, M, nreq);
+  numerics::Damping damp;
+  damp.alpha = m.rayleigh.alpha;
+  damp.beta = m.rayleigh.beta;
+  damp.modal_ratios = m.modal_damping;
+  load_out = K.rhs;  // reduced free-DOF concentrated-load pattern
+  return numerics::project_modal_system(basis_out, damp);
+}
+
+// A *MODAL DYNAMIC result: the transient nodal displacement history (n_steps x n_nodes
+// x 3) sampled at the step times, plus the modal frequencies/damping used. (spec:
+// dynamic-analysis — modal dynamic.)
+py::dict modal_dynamic_result_dict(const Model& m) {
+  const fem::LinearSystem K = fem::assemble_linear_static(m);
+  const fem::LinearSystem M = fem::assemble_mass(m, /*lumped=*/false);
+  numerics::EigenBasis basis;
+  std::vector<Real> pattern;
+  const numerics::ModalSystem sys = build_modal_system(m, basis, pattern, K, M);
+
+  numerics::ModalLoad load;
+  load.pattern = pattern;
+  const Real dt = m.dynamic_dt > 0.0 ? m.dynamic_dt : 1.0;
+  const Real t_end = m.dynamic_t_end > 0.0 ? m.dynamic_t_end : dt;
+  const std::vector<numerics::ModalTimePoint> hist =
+      numerics::modal_dynamic(sys, load, dt, t_end);
+
+  const std::size_t nt = hist.size(), nn = m.mesh.num_nodes();
+  py::array_t<double> times(static_cast<py::ssize_t>(nt));
+  py::array_t<double> disp({static_cast<py::ssize_t>(nt),
+                            static_cast<py::ssize_t>(nn), py::ssize_t{3}});
+  auto rt = times.mutable_unchecked<1>();
+  auto rd = disp.mutable_unchecked<3>();
+  for (std::size_t s = 0; s < nt; ++s) {
+    rt(static_cast<py::ssize_t>(s)) = hist[s].time;
+    for (std::size_t i = 0; i < nn; ++i)
+      for (py::ssize_t j = 0; j < 3; ++j)
+        rd(static_cast<py::ssize_t>(s), static_cast<py::ssize_t>(i), j) =
+            hist[s].displacement[i][static_cast<std::size_t>(j)];
+  }
+  py::array_t<double> zeta(static_cast<py::ssize_t>(sys.n_modes));
+  py::array_t<double> omega(static_cast<py::ssize_t>(sys.n_modes));
+  auto rz = zeta.mutable_unchecked<1>();
+  auto ro = omega.mutable_unchecked<1>();
+  for (std::size_t k = 0; k < sys.n_modes; ++k) {
+    rz(static_cast<py::ssize_t>(k)) = sys.zeta[k];
+    ro(static_cast<py::ssize_t>(k)) = sys.omega[k];
+  }
+  py::dict d;
+  d["procedure"] = "modal dynamic";
+  d["num_modes"] = sys.n_modes;
+  d["num_nodes"] = nn;
+  d["num_steps"] = nt;
+  d["time"] = times;
+  d["displacement"] = disp;  // (n_steps, n_nodes, 3)
+  d["omega"] = omega;
+  d["zeta"] = zeta;
+  return d;
+}
+
+// A *STEADY STATE DYNAMICS result: the harmonic response amplitude and phase per node
+// over the frequency sweep (n_freq x n_nodes x 3 each), plus the swept frequencies.
+// (spec: dynamic-analysis — steady-state dynamics.)
+py::dict steady_state_result_dict(const Model& m) {
+  const fem::LinearSystem K = fem::assemble_linear_static(m);
+  const fem::LinearSystem M = fem::assemble_mass(m, /*lumped=*/false);
+  numerics::EigenBasis basis;
+  std::vector<Real> pattern;
+  const numerics::ModalSystem sys = build_modal_system(m, basis, pattern, K, M);
+
+  const Real f_lo = m.steady_f_lo;
+  const Real f_hi = m.steady_f_hi > 0.0 ? m.steady_f_hi : f_lo;
+  const std::size_t npts =
+      m.steady_num_points > 0 ? static_cast<std::size_t>(m.steady_num_points) : 20;
+  const std::vector<numerics::HarmonicResponse> sweep =
+      numerics::steady_state_sweep(sys, pattern, f_lo, f_hi, npts);
+
+  const std::size_t nf = sweep.size(), nn = m.mesh.num_nodes();
+  py::array_t<double> freqs(static_cast<py::ssize_t>(nf));
+  py::array_t<double> ampl({static_cast<py::ssize_t>(nf),
+                            static_cast<py::ssize_t>(nn), py::ssize_t{3}});
+  py::array_t<double> phase({static_cast<py::ssize_t>(nf),
+                            static_cast<py::ssize_t>(nn), py::ssize_t{3}});
+  auto rff = freqs.mutable_unchecked<1>();
+  auto ra = ampl.mutable_unchecked<3>();
+  auto rp = phase.mutable_unchecked<3>();
+  // The complex free-DOF amplitude is expanded to full nodal components through the
+  // constraint transform (SPC value 0 — a harmonic response has no prescribed
+  // displacement), separately for the real and imaginary parts, then converted to
+  // magnitude/phase per node component.
+  const std::vector<Real> zero_prescribed(K.prescribed.size(), 0.0);
+  for (std::size_t s = 0; s < nf; ++s) {
+    rff(static_cast<py::ssize_t>(s)) = sweep[s].frequency;
+    std::vector<Real> re(sweep[s].amplitude.size()), im(sweep[s].amplitude.size());
+    for (std::size_t i = 0; i < re.size(); ++i) {
+      re[i] = sweep[s].amplitude[i].real();
+      im[i] = sweep[s].amplitude[i].imag();
+    }
+    for (std::size_t i = 0; i < nn; ++i)
+      for (int c = 0; c < 3; ++c) {
+        const std::size_t g = i * static_cast<std::size_t>(kDofsPerNode) +
+                              static_cast<std::size_t>(c);
+        const Real ur = K.transform.displacement(g, re, zero_prescribed);
+        const Real ui = K.transform.displacement(g, im, zero_prescribed);
+        ra(static_cast<py::ssize_t>(s), static_cast<py::ssize_t>(i), c) =
+            std::sqrt(ur * ur + ui * ui);
+        rp(static_cast<py::ssize_t>(s), static_cast<py::ssize_t>(i), c) =
+            std::atan2(ui, ur);
+      }
+  }
+  py::dict d;
+  d["procedure"] = "steady state dynamics";
+  d["num_modes"] = sys.n_modes;
+  d["num_nodes"] = nn;
+  d["num_frequencies"] = nf;
+  d["frequency"] = freqs;
+  d["amplitude"] = ampl;  // (n_freq, n_nodes, 3)
+  d["phase"] = phase;     // (n_freq, n_nodes, 3) radians
+  return d;
+}
+
+// A *DYNAMIC result: the direct HHT-α time integration of M a + C v + K u = f(t). Returns
+// the full displacement/velocity/acceleration history (n_steps x n_nodes x 3) plus the
+// per-step energy (kinetic/strain/total) and the energy drift over the run. (spec:
+// dynamic-analysis — direct-integration dynamics.)
+py::dict dynamic_result_dict(const Model& m) {
+  numerics::DirectOptions opts;
+  opts.hht = numerics::HhtParams::from_alpha(m.dynamic_alpha);
+  opts.damping.alpha = m.rayleigh.alpha;
+  opts.damping.beta = m.rayleigh.beta;
+  opts.nonlinear = m.dynamic_nonlinear;
+  const Real dt = m.dynamic_dt > 0.0 ? m.dynamic_dt : 1.0;
+  const Real t_end = m.dynamic_t_end > 0.0 ? m.dynamic_t_end : dt;
+  numerics::DirectReport rep;
+  const std::vector<numerics::DirectTimePoint> hist =
+      numerics::direct_dynamic(m, dt, t_end, opts, nullptr, &rep);
+
+  const std::size_t nt = hist.size(), nn = m.mesh.num_nodes();
+  py::array_t<double> times(static_cast<py::ssize_t>(nt));
+  py::array_t<double> disp({static_cast<py::ssize_t>(nt),
+                            static_cast<py::ssize_t>(nn), py::ssize_t{3}});
+  py::array_t<double> vel({static_cast<py::ssize_t>(nt),
+                           static_cast<py::ssize_t>(nn), py::ssize_t{3}});
+  py::array_t<double> acc({static_cast<py::ssize_t>(nt),
+                           static_cast<py::ssize_t>(nn), py::ssize_t{3}});
+  py::array_t<double> energy(static_cast<py::ssize_t>(nt));
+  auto rt = times.mutable_unchecked<1>();
+  auto rd = disp.mutable_unchecked<3>();
+  auto rv = vel.mutable_unchecked<3>();
+  auto ra = acc.mutable_unchecked<3>();
+  auto re = energy.mutable_unchecked<1>();
+  for (std::size_t s = 0; s < nt; ++s) {
+    const auto ss = static_cast<py::ssize_t>(s);
+    rt(ss) = hist[s].time;
+    re(ss) = hist[s].total_energy;
+    for (std::size_t i = 0; i < nn; ++i)
+      for (py::ssize_t j = 0; j < 3; ++j) {
+        const auto jj = static_cast<std::size_t>(j);
+        const auto ii = static_cast<py::ssize_t>(i);
+        rd(ss, ii, j) = hist[s].displacement[i][jj];
+        rv(ss, ii, j) = hist[s].velocity[i][jj];
+        ra(ss, ii, j) = hist[s].acceleration[i][jj];
+      }
+  }
+  py::dict d;
+  d["procedure"] = "dynamic";
+  d["num_nodes"] = nn;
+  d["num_steps"] = nt;
+  d["hht_alpha"] = opts.hht.alpha;
+  d["nonlinear"] = rep.nonlinear;
+  d["newton_iterations"] = rep.iterations;
+  d["energy_drift"] = rep.energy_drift;
+  d["time"] = times;
+  d["displacement"] = disp;    // (n_steps, n_nodes, 3)
+  d["velocity"] = vel;         // (n_steps, n_nodes, 3)
+  d["acceleration"] = acc;     // (n_steps, n_nodes, 3)
+  d["total_energy"] = energy;  // (n_steps,)
+  return d;
+}
+
 py::dict solve_model(const Model& m, const std::string& solver,
                      const std::string& backend) {
   // Validate/select the backend first (may raise on an unknown name) and record
   // the one that actually ran. Phase 1 routes every solve through the CPU path.
   const std::string used = resolve_backend(backend);
+  // A *FREQUENCY deck extracts the lowest N natural frequencies / mode shapes of the
+  // generalized eigenproblem K x = λ M x. (spec: modal-and-buckling — *FREQUENCY.)
+  if (m.procedure == Procedure::Frequency) {
+    const std::size_t nreq = m.num_eigenvalues > 0
+                                 ? static_cast<std::size_t>(m.num_eigenvalues)
+                                 : 1;
+    const fem::LinearSystem K = fem::assemble_linear_static(m);
+    const fem::LinearSystem M = fem::assemble_mass(m, /*lumped=*/false);
+    const numerics::EigenBasis basis = numerics::extract_modes(K, M, nreq);
+    py::dict d = frequency_result_dict(m, basis, M);
+    d["backend"] = used;
+    return d;
+  }
+  // A *MODAL DYNAMIC deck integrates the decoupled modal SDOFs over the *FREQUENCY basis
+  // and returns the transient displacement history. (spec: dynamic-analysis.)
+  if (m.procedure == Procedure::ModalDynamic) {
+    py::dict d = modal_dynamic_result_dict(m);
+    d["backend"] = used;
+    return d;
+  }
+  // A *STEADY STATE DYNAMICS deck sweeps the harmonic response over the requested
+  // frequency band by modal superposition. (spec: dynamic-analysis.)
+  if (m.procedure == Procedure::SteadyStateDynamics) {
+    py::dict d = steady_state_result_dict(m);
+    d["backend"] = used;
+    return d;
+  }
+  // A *DYNAMIC deck runs direct HHT-α time integration in physical coordinates and
+  // returns the displacement/velocity/acceleration + energy history. (spec:
+  // dynamic-analysis — direct-integration dynamics.)
+  if (m.procedure == Procedure::Dynamic) {
+    py::dict d = dynamic_result_dict(m);
+    d["backend"] = used;
+    return d;
+  }
+  // A *SUBSTRUCTURE GENERATE deck condenses the model onto the retained DOFs and returns
+  // the reduced stiffness (+ mass, Craig-Bampton). (spec: substructure-generation.)
+  if (m.procedure == Procedure::Substructure) {
+    py::dict d = substructure_result_dict(m);
+    d["backend"] = used;
+    return d;
+  }
   // A *COUPLED TEMPERATURE-DISPLACEMENT deck solves the thermal field, applies the
   // resulting thermal strain, then the mechanical field (one-way coupling). The
   // result dict carries the mechanical fields plus the temperature/flux_reaction.

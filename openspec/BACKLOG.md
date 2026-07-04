@@ -166,3 +166,133 @@ summation rule, the known cube view factors (Hottel), the two-plate gray-body
 net flux `q = sigma(T1^4-T2^4)/(1/e1+1/e2-1)`, and a Python end-to-end
 parallel-plate energy balance. See task 3.4 (`fem::build_cavity` /
 `cavity_heat_flow`, `numerics::add_cavity_radiation`).
+
+## From Phase 4 (`phase-4-dynamics-and-eigenproblems`)
+
+| Item | What's missing | Enabler needed | Baseline spec |
+|---|---|---|---|
+| **1.3 Sturm-sequence count check** | Missed/starved-mode verification via the inertia (Sturm sequence) of the shifted factorization — relevant now that the sparse Lanczos path (1.1) has landed and only extracts the lowest k modes. | An inertia/negative-eigenvalue count exposed from SciPP's sparse factorization (the eigsh robustness work in [SciPP#15](https://github.com/CyberdyneCorp/SciPP/issues/15) landed thick-restart + relative breakdown but not an inertia count — this needs a separate upstream ask). | `eigensolution` |
+| **1.6 / 2.3 Complex / damped modes** | The complex eigenproblem for `*COMPLEX FREQUENCY` (damping / friction-induced instability). | Complex eigensolve + damping/friction operator assembly. | `eigensolution`, `modal-and-buckling-analysis` |
+| **2.2 `*BUCKLE`** | Two-step prestress + geometric-stiffness eigenproblem `(K + λ K_geo) x = 0`. The eigensolution engine it consumes is in place. | Geometric stiffness `K_geo` (see the NLGEOM cross-cutting enabler). | `modal-and-buckling-analysis` |
+| **3.x `*DYNAMIC, EXPLICIT` + `*GREEN`** | Explicit central-difference direct dynamics (element wave-speed critical time step) and the `*GREEN` Green-function step. (IMPLICIT direct HHT-α dynamics — 3.1 / 3.2 / 3.3 — are shipped, see the resolved note below.) | Element critical-time-step estimate (explicit); unit-excitation response basis (`*GREEN`). | `dynamic-analysis` |
+| **4.3 Base-motion time histories / 4.4 `*GREEN`** | Full `*BASE MOTION` support-excitation TIME HISTORIES driving the transient (the effective-load builder `base_motion_load` and its `p_k = -Γ_k` projection are shipped; wiring a prescribed base-acceleration amplitude into the modal-dynamic march lands with a follow-up) and the `*GREEN` step. | — (builds on the shipped modal engine). | `dynamic-analysis` |
+| **6.x Cyclic symmetry** | Cyclic-symmetry sector complex eigenproblem (`*CYCLIC SYMMETRY MODEL`) + nodal-diameter mode selection (`*SELECT CYCLIC SYMMETRY MODES`). | Complex cyclic-symmetry constraints (a deferred `constraints` capability) + the complex eigensolve (1.6 / 2.3). | `constraints`, `modal-and-buckling-analysis` |
+| **2.4 Preceding-frequency-step chaining** | The RUNTIME requirement that a `*MODAL DYNAMIC` / `*STEADY STATE DYNAMICS` step reuse the eigenbasis of a PRECEDING `*FREQUENCY` step across steps. Enforced today for the single-deck case (the modal procedures assemble K/M and extract the basis from the same model, so the preceding extraction is implicit); a cross-step "consume the previous step's stored basis" requires the multi-step dynamics driver. | Multi-step dynamics driver that stores + hands the extracted basis to the following step. | `dynamic-analysis`, `modal-and-buckling-analysis` |
+
+Resolved (2026-07): **Phase-4 LEAD slice — mechanical mass matrix + eigensolution
+engine + `*FREQUENCY`.** `fem::element_mass` (consistent `M_e = ∫ρ Nᵀ N dV`, the
+mechanical analog of `element_capacitance`) + `element_mass_lumped` (row-sum) reuse
+the shared shape functions / Gauss rules; `fem::assemble_mass` assembles the global
+mass on the SAME free-DOF numbering / constraint transform as `K` (`*MASS` point
+masses add a diagonal nodal mass). `numerics::extract_modes` solves the generalized
+symmetric eigenproblem `K x = λ M x` for the lowest N modes by the DENSE path
+(Cholesky `M = L Lᵀ` -> standard symmetric `A = L⁻¹ K L⁻ᵀ` -> `numpp::linalg::eigh`
+-> back-transform + mass-normalize + ascending sort), with a spectral shift for
+rigid-body handling and `numerics::participation` for participation factors / modal
+effective mass. `*FREQUENCY` parses (number of eigenvalues), auto-dispatches from the
+CLI and Python, and reports `f = sqrt(λ)/(2π)` + mode shapes. Validated against the
+stock CalculiX `beam8f` `.dat.ref` (10 eigenvalues, natural frequencies, participation
+factors, effective + total mass — all < 1e-4 rel) AND an analytical 2-DOF spring-mass
+chain (exact). See tasks 1.1-1.4 / 2.1.
+
+Resolved (2026-07): **Scalable sparse shift-invert Lanczos (was Phase-4 row 1.1).**
+`numerics::extract_modes` now drives **`scipp::sparse::eigsh`** (SciPP#12, shift-invert
+Lanczos on the sparse factorization) as the PRIMARY path — beam8f matches stock CalculiX
+to `3.75e-7` in **0.07s** (dense was 5.88s after NumPP#138, 111s before) and a chunky
+3-D block scales to **14703 DOF in 3.4s**. Runs directly on the unscaled pencil:
+**[SciPP#15](https://github.com/CyberdyneCorp/SciPP/issues/15)** (SciPP **1.4.0** —
+thick-restart Lanczos + relative breakdown threshold) RESOLVED the stiff-pencil spurious
+breakdown and the clustered-spectrum stall, so the earlier `M' = trace(K)/trace(M)·M`
+rescaling workaround was **removed**. The dense `O(n_free³)` M-Cholesky reduction (fixed
+to O(n³) by **NumPP#138** / v1.6.0) is retained as a small-problem fallback for the one
+case shift-invert cannot factor: a singular (K−σM) at σ=0 with rigid-body modes. The
+beam8f eigen-validation tests are no longer `slow` — they run in the default gate.
+Remaining eigen follow-ups: 1.3 (Sturm count) and 1.6/2.3 (complex modes).
+
+Resolved (2026-07): **Phase-4 modal superposition dynamics — `*MODAL DYNAMIC` +
+`*STEADY STATE DYNAMICS` + damping (tasks 1.5 / 4.1 / 4.2 / 4.3).**
+`numerics/modal_dynamics.{hpp,cpp}` projects the mass-normalized eigenbasis into the
+decoupled modal SDOFs (`project_modal_system` — per-mode ω_k, ω_k², ζ_k;
+`ModalSystem::project_load` maps a physical load to `p_k = φ_kᵀ f`). `*MODAL DYNAMIC`
+(`modal_dynamic`) integrates each SDOF `q̈_k + 2ζ_kω_k q̇_k + ω_k² q_k = p_k(t)` with the
+EXACT piecewise-linear-load recurrence (Nigam-Jennings — zero algorithmic damping, the
+natural period `2π/ω` reproduced exactly) and recombines `u = Σ q_k φ_k`. `*STEADY STATE
+DYNAMICS` (`steady_state_response`/`_sweep`) evaluates the complex modal transfer function
+`q_k = p_k/(ω_k²-Ω²+2iζ_kω_kΩ)` over a frequency sweep -> per-node amplitude/phase.
+Damping: Rayleigh `C = αM + βK` -> `ζ_k = (α/ω_k + βω_k)/2`, `*MODAL DAMPING` per-mode
+ratios override; `base_motion_load` builds the support-excitation effective load
+`f_eff = -M r` (modal forcing `p_k = -Γ_k`). Parser adds `*MODAL DYNAMIC`, `*STEADY STATE
+DYNAMICS`, `*DAMPING`, `*MODAL DAMPING`, `*BASE MOTION`; CLI + Python auto-dispatch (modal
+dynamic returns the displacement time history, steady-state the amplitude/phase sweep).
+Validated ANALYTICALLY (no clean in-scope reference deck — the stock modal-dynamic decks
+use coupling reference nodes / reduced-integration beams out of scope): undamped step
+response `(F/k)(1-cos ωt)` to < 1e-7 over many periods, damped step matches the closed-form
+under-damped solution, steady-state resonant peak `(F/k)·Q` with `Q=1/(2ζ)` and correct
+half-power bandwidth `Δω ≈ 2ζω`; plus an end-to-end check that a steady-state sweep on the
+real `beam8f` C3D8 mesh resonates at a natural frequency of the full model. `*GREEN` and
+base-motion time histories remain deferred (rows above).
+
+Resolved (2026-07): **Phase-4 direct-integration dynamics — `*DYNAMIC` implicit HHT-α
+(tasks 3.1 / 3.2 / 3.3).** `numerics/direct_dynamics.{hpp,cpp}` (`direct_dynamic`)
+integrates `M a + C v + K u = f(t)` in PHYSICAL coordinates by the implicit HHT-α
+(Hilber-Hughes-Taylor) generalization of Newmark-β. Solving for `a_{n+1}` directly
+(Newmark correctors substituted into the HHT equilibrium at `t_{n+1+α}`), the effective
+dynamic operator is `A_eff = M + (1+α)γΔt C + (1+α)βΔt² K`; the LINEAR path forms it once
+and re-solves each step through `numerics::solve_reduced` (ComputeBackend/SciPP — no GPU),
+the NONLINEAR path (`step_nonlinear`, task 3.2) runs a per-step Newton on `a_{n+1}`,
+folding the material-point tangent (`fem::assemble_material_tangent` + `fem::add_contact`)
+into the effective tangent so inertia + nonlinear material/contact are solved together.
+`HhtParams::from_alpha` maps the α knob (`α ∈ [-1/3, 0]`) to `β=(1-α)²/4, γ=½-α`; each
+frame carries kinetic `½vᵀMv` / strain `½uᵀKu` / total energy and `DirectReport.energy_drift`
+(task 3.3). Parser adds `*DYNAMIC[, ALPHA=][, NLGEOM][, DIRECT]` (data line `dt, t_end`);
+CLI + Python auto-dispatch (returns the displacement/velocity/acceleration/total-energy
+history + `hht_alpha`/`energy_drift`/`newton_iterations`). Validated ANALYTICALLY (no clean
+in-scope reference deck — the stock `*DYNAMIC` decks preload a static step / use out-of-scope
+elements): step response `(F/k)(1-cos ωt)` to < 2e-4, free vibration `u0 cos ωt` (natural
+period `2π/ω`) to < 5e-6, UNDAMPED α=0 free vibration CONSERVES total energy over 20 periods
+(drift < 1e-10), HHT α=-0.3 DISSIPATES energy, Rayleigh damping decays the amplitude, and the
+nonlinear path reproduces the linear path to < 1e-9 (`test_direct_dynamics`, 6 cases; pytest
+`test_dynamic_*`, deck path). `*DYNAMIC, EXPLICIT` (central difference) and `*GREEN` remain
+deferred (rows above).
+
+Resolved (2026-07): **Phase-4 substructure / superelement generation — `*SUBSTRUCTURE
+GENERATE` Craig-Bampton / Guyan reduction (tasks 5.1 / 5.2 / 5.3).**
+`numerics/substructure.{hpp,cpp}` (`generate_substructure` / `reduce_substructure`)
+partitions the free DOFs into boundary `b` (the retained/master DOFs of `*RETAINED NODAL
+DOFS`) and interior `i` (condensed). Static (Guyan) reduction forms the reduced stiffness
+as the Schur complement `K̂ = K_bb − K_bi K_ii⁻¹ K_ib`; when a mass matrix is requested
+(`*SUBSTRUCTURE MATRIX OUTPUT, MASS=YES` / `*MATRIX ASSEMBLE, MASS=YES` / a nonzero mode
+count) Craig-Bampton builds the constraint modes `Ψ = −K_ii⁻¹ K_ib` and the fixed-interface
+normal modes `Φ` (from the eigensolution engine on the interior-restricted `K_ii x = λ M_ii
+x`), then projects K/M onto `T = [[I,0],[Ψ,Φ]]` giving the reduced operators (leading b×b
+Guyan block + diagonal `ω_k²` / unit-mass modal block + the retained/modal mass coupling).
+The interior condensation `K_ii⁻¹` routes through NumPP dense solve on the ComputeBackend
+(no GPU). Parser adds `*SUBSTRUCTURE GENERATE`, `*RETAINED NODAL DOFS` (node/nset, dof
+range), `*SUBSTRUCTURE MATRIX OUTPUT` (STIFFNESS=/MASS=), `*MATRIX ASSEMBLE`; CLI writes the
+reduced matrices in the reference `*MATRIX TYPE=STIFFNESS/MASS` lower-triangular row format
+(`<out>.mtx`), Python `solve()` returns `k_reduced`/`m_reduced` + retained-DOF labels +
+`modal_omega`. An empty retained-DOF set / an SPC'd-or-slave retained DOF raises a clear
+error (spec scenarios). Validated against the stock CalculiX `substructure.inp` reduced
+stiffness — its `.dat.ref` `*MATRIX TYPE=STIFFNESS` block (60 retained DOFs, Guyan) matches
+to < 1e-6 rel (C++ `test_substructure`, pytest `test_substructure_reduced_stiffness_matches_calculix`) —
+and, for Craig-Bampton, the reduced model's lowest eigenfrequencies approximate the FULL
+model's `*FREQUENCY` to < 2% on a cantilever column (`test_craig_bampton_approximates_full`,
+pytest `test_substructure_craig_bampton_reduces_full_model`). The DENSE interior condensation
+is `O(n_interior³)` (same scalability note as the eigensolution engine — a sparse
+Schur-complement path is a SciPP follow-up). Only cyclic symmetry (6.x) and the complex /
+buckling paths remain deferred (rows above).
+
+Resolved (2026-07): **Phase-4 FINALIZE — parser blocked-card actionable errors + API
+parity + docs (tasks 7.1 / 7.2 / 7.4 / 7.5).** The deferred Phase-4 procedure cards
+(`*BUCKLE`, `*COMPLEX FREQUENCY`, `*CYCLIC SYMMETRY MODEL`, `*SELECT CYCLIC SYMMETRY
+MODES`, `*GREEN`) now raise a clear, ACTIONABLE `ParseError` naming the deferral and the
+enabler each waits on (reject_card deferred-map in src/io/inp_parser.cpp) instead of a
+generic "unsupported card" — a deck using them fails loudly rather than silently
+mis-solving (regression: test_parser `test_blocked_phase4_cards_reject_clearly` + pytest
+`test_api_parity_phase4` blocked-card sweep). A Phase-4 API-parity coverage test
+(`test_api_parity_phase4`) asserts every one of the five shipped procedures
+(`*FREQUENCY` / `*DYNAMIC` / `*MODAL DYNAMIC` / `*STEADY STATE DYNAMICS` /
+`*SUBSTRUCTURE GENERATE`) exposes its documented result payload and that `summary()`
+reports each without solving. README gains a "Python — dynamics (Phase 4)" walkthrough
+(runnable HHT-α `*DYNAMIC` SDOF example + the modal/steady-state/damping variants) and a
+Phase-4 header status blurb. The rows below remain the only outstanding Phase-4 work.
