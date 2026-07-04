@@ -188,6 +188,10 @@ class Parser {
   std::string cur_interaction_;
   int cur_contact_pair_ = -1;  // index into model_.contact_pairs, or -1
 
+  // *DESIGN RESPONSE / *OBJECTIVE (spec: design-optimization). The name from the
+  // current *DESIGN RESPONSE NAME= (attached to the response its data line defines).
+  std::string cur_design_response_;
+
   // Connector (discrete) elements: SPRINGA/SPRING1/SPRING2, MASS, DASHPOTA/1/2.
   // These are not isoparametric solids, so they live outside the Mesh. We keep
   // their connectivity keyed by element id and by elset so a following *SPRING /
@@ -304,6 +308,14 @@ class Parser {
       // The reduced-substructure path already exposes the assembled operators; the flags
       // are accepted and recorded on the substructure output request. Data lines (none).
       begin_matrix_assemble(line);
+    } else if (card_ == "*SENSITIVITY") {
+      model_.procedure = Procedure::Sensitivity;
+    } else if (card_ == "*DESIGNVARIABLES") {
+      begin_design_variables(line);
+    } else if (card_ == "*DESIGNRESPONSE" || card_ == "*OBJECTIVE") {
+      // NAME= labels the response; its type (STRAIN ENERGY / nodal displacement) and
+      // scope come on the data line. *OBJECTIVE is the Abaqus spelling of the same.
+      cur_design_response_ = param("NAME");
     } else if (card_ == "*CONDUCTIVITY") {
       begin_conductivity(line);
     } else if (card_ == "*SPECIFICHEAT") {
@@ -470,6 +482,25 @@ class Parser {
         {"*GREEN",
          "Green-function step — deferred; builds on the shipped modal engine but "
          "needs the unit-excitation response basis (Phase-4 tasks 4.4)"},
+        // Design-optimization layers on top of the shipped sensitivity core, deferred
+        // in this slice (openspec add-design-optimization tasks 1.6 / 2.5 / 4.x).
+        {"*FILTER",
+         "sensitivity filtering — deferred; the raw adjoint gradient (*SENSITIVITY) "
+         "IS supported (add-design-optimization tasks 2.5)"},
+        {"*FEASIBLEDIRECTION",
+         "feasible-direction optimization loop — deferred; consumes the shipped "
+         "sensitivity gradient (add-design-optimization tasks 4.1)"},
+        {"*ROBUSTDESIGN",
+         "robust design — deferred; needs a random-field decomposition "
+         "(add-design-optimization tasks 4.2)"},
+        {"*RANDOMFIELD",
+         "random field — deferred with *ROBUST DESIGN (add-design-optimization tasks 4.2)"},
+        {"*CORRELATIONLENGTH",
+         "correlation length — deferred with *ROBUST DESIGN (add-design-optimization "
+         "tasks 4.2)"},
+        {"*GEOMETRICCONSTRAINT",
+         "geometric constraint — deferred; part of the optimization loop "
+         "(add-design-optimization tasks 4.1)"},
     };
     const auto it = deferred.find(card_);
     if (it != deferred.end())
@@ -622,6 +653,68 @@ class Parser {
     sn.a = to_double(f[0], line);
     sn.b = to_double(f[1], line);
     model_.materials[cur_material_].sn_curve = sn;
+  }
+  // *DESIGN VARIABLES, TYPE=COORDINATE: declare the design field for a *SENSITIVITY
+  // step (spec: design-optimization). Only TYPE=COORDINATE (shape) variables are
+  // implemented; TYPE=ORIENTATION (sensi_orien) is deferred and rejected here so a deck
+  // using it fails loudly rather than being silently mis-solved. The referenced nodes
+  // come on the data line(s) as an nset name or node ids.
+  void begin_design_variables(int line) {
+    const std::string type = param("TYPE");
+    if (!type.empty() && type != "COORDINATE")
+      throw ParseError(line,
+                       "*DESIGN VARIABLES, TYPE=" + type +
+                           " is not implemented (only TYPE=COORDINATE shape variables "
+                           "are supported this slice); TYPE=ORIENTATION is deferred.");
+  }
+
+  // *DESIGN VARIABLES data: an nset name or node id per field. Each referenced node
+  // contributes three coordinate design variables (x, y, z), in node-then-component
+  // order. Duplicate nodes are de-duplicated so a node listed twice is one variable set.
+  void design_variables_data(const std::vector<std::string>& f, int line) {
+    for (const std::string& tok : f) {
+      if (tok.empty()) continue;
+      for (const Index nid : node_refs(tok, line)) {
+        bool seen = false;
+        for (const DesignVariable& dv : model_.design_variables)
+          if (dv.node_id == nid) { seen = true; break; }
+        if (seen) continue;
+        for (int c = 1; c <= 3; ++c)
+          model_.design_variables.push_back(DesignVariable{nid, c});
+      }
+    }
+  }
+
+  // *DESIGN RESPONSE / *OBJECTIVE data: "<type>[, scope]". Supported types:
+  //   STRAIN ENERGY / ENERGY / COMPLIANCE  -> the self-adjoint compliance g = fᵀu
+  //     (the scope elset, e.g. EALL, is accepted; the response is the whole-model
+  //     external work in this slice).
+  //   ALL-DISP / U / DISPLACEMENT, <node>, <comp> -> a single nodal displacement DOF.
+  // Mass / stress / eigenfrequency responses are out of this slice and rejected.
+  void design_response_data(const std::vector<std::string>& f, int line) {
+    if (f.empty() || f[0].empty())
+      throw ParseError(line, "*DESIGN RESPONSE needs a response type");
+    DesignResponse resp;
+    resp.name = cur_design_response_;
+    const std::string type = normalize(f[0]);  // uppercase, spaces stripped
+    if (type == "STRAINENERGY" || type == "ENERGY" || type == "COMPLIANCE") {
+      resp.kind = DesignResponse::Kind::Compliance;
+    } else if (type == "ALL-DISP" || type == "ALLDISP" || type == "U" ||
+               type == "DISPLACEMENT") {
+      resp.kind = DesignResponse::Kind::Displacement;
+      if (f.size() < 3)
+        throw ParseError(line,
+                         "*DESIGN RESPONSE displacement needs '<type>, node, comp'");
+      resp.node_id = to_index(f[1], line);
+      resp.comp = static_cast<int>(to_index(f[2], line));
+      if (resp.comp < 1 || resp.comp > 3)
+        throw ParseError(line, "*DESIGN RESPONSE displacement comp must be 1..3");
+    } else {
+      throw ParseError(line, "*DESIGN RESPONSE type '" + type +
+                                 "' is not implemented (supported: STRAIN ENERGY, "
+                                 "DISPLACEMENT); mass/stress/frequency are deferred.");
+    }
+    model_.design_responses.push_back(std::move(resp));
   }
 
   // *DYNAMIC[, DIRECT][, ALPHA=][, NLGEOM]: direct time integration of the equations of
@@ -1571,6 +1664,9 @@ class Parser {
     if (card_ == "*BASEMOTION") return base_motion_data(f, line);
     if (card_ == "*RETAINEDNODALDOFS") return retained_nodal_dofs_data(f, line);
     if (card_ == "*SUBMODEL") return submodel_data(f, line);
+    if (card_ == "*DESIGNVARIABLES") return design_variables_data(f, line);
+    if (card_ == "*DESIGNRESPONSE" || card_ == "*OBJECTIVE")
+      return design_response_data(f, line);
     if (card_ == "*COUPLEDTEMPERATURE-DISPLACEMENT" ||
         card_ == "*COUPLEDTEMPERATUREDISPLACEMENT")
       return static_data(f, line);  // same increment data line as *STATIC

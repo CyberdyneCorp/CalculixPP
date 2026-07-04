@@ -40,6 +40,13 @@ class Mesh {
   Index node_index(Index id) const;
   Index element_index(Index id) const;
 
+  // Add `delta` to component `comp` (0=x,1=y,2=z) of the node at internal `index`.
+  // Used by the design-sensitivity driver to form semi-analytic coordinate
+  // derivatives on a model copy (spec: design-optimization — coordinate variables).
+  void perturb_node_coord(Index index, int comp, Real delta) {
+    nodes_[static_cast<std::size_t>(index)].x[static_cast<std::size_t>(comp)] += delta;
+  }
+
   void add_nset(const std::string& name, std::vector<Index> ids);
   void add_elset(const std::string& name, std::vector<Index> ids);
   const std::vector<Index>* nset(const std::string& name) const;
