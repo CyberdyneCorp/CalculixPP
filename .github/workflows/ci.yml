@@ -30,12 +30,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: CyberdyneCorp/NumPP
+          ref: v1.6.0  # dense eigh/solve O(n³) (NumPP#138) + linalg::eig (complex modes)
           path: NumPP
           token: ${{ secrets.DEPS_TOKEN || github.token }}
       - uses: actions/checkout@v4
         with:
           repository: CyberdyneCorp/SciPP
-          ref: v1.2.0  # sparse direct (Cholesky/LU) + preconditioned CG (SciPP#10)
+          ref: v1.5.0  # sparse eigsh (#12) + thick-restart (#15) + eigsh_buckling (#18)
           path: SciPP
           token: ${{ secrets.DEPS_TOKEN || github.token }}
 
