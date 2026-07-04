@@ -6,7 +6,7 @@
 
 Numerics come from in-house libraries — **[NumPP](https://github.com/CyberdyneCorp/NumPP)** (NumPy-equivalent arrays + dense linear algebra) and **[SciPP](https://github.com/CyberdyneCorp/SciPP)** (SciPy-equivalent; sparse matrices and solvers) — with **[CyberCadKernel](https://github.com/CyberdyneCorp/CyberCadKernel)** for CAD/meshing. The whole design is spec-driven: the specification and phased roadmap live in [`openspec/`](openspec/).
 
-> **Phases 1–4 are complete and validated; Phase 5 (advanced physics) is next.** The solver covers linear + nonlinear statics, thermal & contact, and dynamics/eigenproblems — each phase validated against stock CalculiX. Per-phase detail below.
+> **Phases 1–4 are complete and validated; Phase 5's non-blocked capabilities have landed.** The solver covers linear + nonlinear statics, thermal & contact, dynamics/eigenproblems, and the structural-completion set (design optimization, submodeling, high-cycle fatigue) — each validated against stock CalculiX or an analytic reference. Only two CyberCadKernel-gated Phase-5 items remain (crack propagation, adaptive mesh refinement). Per-phase detail below.
 >
 > **Phase 1 (Foundation) — COMPLETE and validated.** The linear-static pipeline solves the reference `beam10p.inp` cantilever and its nodal displacements match **stock CalculiX to a relative L2 of 5.4 × 10⁻⁸**. A larger 8,268-DOF model solves in **0.34 s** (sparse Cholesky).
 >
@@ -15,6 +15,8 @@ Numerics come from in-house libraries — **[NumPP](https://github.com/Cyberdyne
 > **Phase 3 (Thermal & contact) — COMPLETE and validated.** A scalar 1-DOF/node temperature field runs in parallel to the mechanical path, reusing the same mesh, shape functions/Gauss rules, and sparse solve: steady-state and transient (backward-Euler) conduction, `*CFLUX`/`*DFLUX` heat loads, convective `*FILM`, linearized surface and gray-body cavity `*RADIATE`, monolithic + staggered `*COUPLED TEMPERATURE-DISPLACEMENT` thermal stress (`*EXPANSION`), and element/contact-pair `*MODEL CHANGE` on a multi-step engine. **Contact** is a nonlinear constraint contributing to the Newton tangent/residual: node-to-surface **penalty** contact with a spatial contact-search engine (uniform-grid broad phase + closest-point projection), `*SURFACE BEHAVIOR` (hard/linear/exponential), Coulomb `*FRICTION` (stick↔slip), thermal contact (`*GAP CONDUCTANCE` / `*GAP HEAT GENERATION`), `*CLEARANCE`, and CSTR contact output (status/pressure/gap/traction). `solve()` auto-dispatches `*HEAT TRANSFER` (returning `NT`/`RFL`) and `*CONTACT PAIR` (returning the mechanical fields plus a per-node `contact` list). Validated against stock CalculiX heat decks (`oneel20cf`/`df`/`fi` steady conduction to ~1e-9, `oneel20fi2` transient film relaxation to ~1e-4) and the `beamt` thermal-stress deck (rel-L2 ~2.4 × 10⁻⁶); contact and thermal contact against analytical two-block references (global equilibrium, penalty penetration `F/(4κ)`, series-resistance gap flux — the stock contact decks use NLGEOM + CalculiX's exact exponential law + MPCs and are not gated). **Surface-to-surface mortar contact is deferred** — a `TYPE=SURFACE TO SURFACE` pair is rejected with an actionable error rather than silently mis-solved.
 >
 > **Phase 4 (Dynamics & eigenproblems) — COMPLETE and validated.** A mechanical **mass matrix** `M_e = ∫ρ NᵀN dV` (consistent + lumped, the mechanical analog of the thermal capacitance) and an **eigensolution engine** for the generalized symmetric problem `K φ = λ M φ` (**SciPP sparse thick-restart shift-invert Lanczos** `eigsh`, scalable to large FE meshes, with a dense NumPP `eigh` fallback for small / rigid-body pencils; mass-normalized ascending basis, participation factors / effective mass) underpin the frequency-domain and transient procedures: `*FREQUENCY` (natural frequencies + mode shapes), `*MODAL DYNAMIC` (modal superposition, exact Nigam-Jennings recurrence), `*STEADY STATE DYNAMICS` (harmonic sweep), `*DYNAMIC` (implicit HHT-α direct integration, linear + nonlinear), Rayleigh / modal `*DAMPING`, `*COMPLEX FREQUENCY` (damped complex modes by proportional-damping reduction onto the `*FREQUENCY` basis), `*SUBSTRUCTURE GENERATE` Craig-Bampton / Guyan reduction, and `*BUCKLE` (linear buckling — geometric stiffness `K_geo` + two-step prestress → `(K + λ K_geo) φ = 0`, solved by SciPP's sparse `eigsh_buckling` with a dense fallback, scalable to ~18k DOF). Validated against stock CalculiX `beam8f` (`*FREQUENCY` — 10 eigenvalues/frequencies/participation to **< 1e-4 rel**), `beamb` (`*BUCKLE` C3D20R Euler column — all 10 load factors to **6 digits**, λ₁ = 48.15), and `substructure` (Guyan, 60 retained DOFs, **< 1e-6 rel**), plus analytical references (SDOF step response, α=0 energy conservation, resonant peak/bandwidth, and the exact damped-SDOF closed form `λ = -ζω ± iω√(1-ζ²)`). Remaining deferred: the gyroscopic **`*COMPLEX FREQUENCY, CORIOLIS` / `FLUTTER`** paths (a different eigenproblem needing a rotor-speed body load / complex applied force — rejected at parse time), **cyclic symmetry**, finite-strain **NLGEOM** / `*STATIC, PERTURBATION`, explicit `*DYNAMIC, EXPLICIT`, and `*GREEN`; each blocked card fails with an actionable parse error naming its enabler.
+>
+> **Phase 5 (Structural completion) — unblocked capabilities COMPLETE and validated.** Three design/assessment procedures build on the Phase 1–4 spine: **submodeling** (`*SUBMODEL` / `*BOUNDARY, SUBMODEL` — drives a refined local model by interpolating the stored global displacement field onto its boundary; global-vs-submodel field to **rel-L2 8.1 × 10⁻⁵**), **high-cycle fatigue** (`*HCF` / `*FATIGUE` — inverts a Basquin S-N curve over a recovered stress field for the worst-case location and cycles-to-failure; exact analytic match), and **design optimization** (`*SENSITIVITY` / `*DESIGN VARIABLES` / `*DESIGN RESPONSE` — adjoint coordinate-shape gradients `dObjective/dx` reusing the primal factorization; adjoint-vs-finite-difference agreement to **~10⁻⁶**). The two remaining Phase-5 items — **crack propagation** and **adaptive mesh refinement** — are deferred pending CyberCadKernel remeshing (each blocked card fails with an actionable parse error). With CFD/EM/networks out of scope, the solver is feature-complete for its structural / mechanical / civil domain.
 
 ---
 
@@ -419,6 +421,26 @@ print(res["hht_alpha"], res["energy_drift"])  # numerical-damping knob + energy 
 
 Swap the step body for `*MODAL DYNAMIC\n0.01,2.0` (same modal step response) or `*STEADY STATE DYNAMICS\n0.1,5.0,200` (a 200-point sweep from 0.1 to 5 Hz whose `amplitude` peaks at the natural frequency). All three are validated analytically (SDOF step response `(F/k)(1-cos ωt)`, α=0 energy conservation over 20 periods to < 1e-10, resonant peak `(F/k)·Q` with the correct half-power bandwidth) and, for steady-state, end-to-end on the real `beam8f` C3D8 mesh. Explicit central-difference `*DYNAMIC, EXPLICIT` and the `*GREEN` step are deferred.
 
+### Python — optimization, submodeling & fatigue (Phase 5)
+
+Three structural-completion procedures reuse the linear-static spine and auto-dispatch from `solve()` / `solve_text()`:
+
+- **`*SENSITIVITY`** — adjoint design-sensitivity gradients `dObjective/dx` of a `*DESIGN RESPONSE` (compliance / strain energy, or a nodal displacement) with respect to `*DESIGN VARIABLES, TYPE=COORDINATE` shape variables, reusing the primal factorization. Returns each response's `objective` + per-variable `gradient`. Validated against finite differences to **~10⁻⁶** (compliance 3.1×10⁻⁷, displacement 1.7×10⁻⁶).
+- **`*SUBMODEL`** — drives a refined local model from a coarse global solution: `*BOUNDARY, SUBMODEL` boundary nodes are driven by interpolating the stored global displacement field. Reproduces the global field on the shared boundary to **rel-L2 8.1×10⁻⁵**.
+- **`*HCF` / `*FATIGUE`** — stress-life high-cycle fatigue: inverts the material Basquin S-N curve (`S_a = a·Nᵇ`) over a recovered stress field for the worst-case location and cycles-to-failure. Returns per-node `life` / `amplitude` plus the critical node. Exact analytic Basquin match.
+
+```python
+import calculixpp
+
+# Compliance sensitivity dC/dx of a loaded bar w.r.t. its coordinate design variables.
+r = calculixpp.solve_text(sensitivity_deck)     # *SENSITIVITY step
+print(r["procedure"])                            # -> "sensitivity"
+for resp in r["responses"]:
+    print(resp["name"], resp["objective"], resp["gradient"])   # dObjective/dx per variable
+```
+
+Crack propagation and adaptive mesh refinement — the remaining Phase-5 items — are deferred pending CyberCadKernel remeshing; their cards raise an actionable parse error naming the enabler.
+
 ### C++
 
 ```cpp
@@ -470,7 +492,7 @@ Direct is fastest and exact for small/medium systems; IC0-CG keeps memory linear
 
 ## Roadmap
 
-Each phase implements physics from the baseline specs **and** adds one reusable *engine* capability. Phases 1–4 are done; Phase 5 completes the **structural / mechanical / civil** capability set.
+Each phase implements physics from the baseline specs **and** adds one reusable *engine* capability. Phases 1–4 are done and Phase 5's non-blocked capabilities have landed, completing the **structural / mechanical / civil** capability set bar two CyberCadKernel-gated items.
 
 > **Scope.** CalculiX++ targets structural, mechanical, and civil-engineering FE. **CFD and 1-D fluid networks are delegated to the separate [Cyberfluids](https://github.com/CyberdyneCorp/Cyberfluids) library, and electromagnetics is out of scope** — so those capabilities (and the multi-physics field-coupling engine that only served them) are intentionally not part of this solver.
 
@@ -480,8 +502,8 @@ timeline
   Phase 1 (done) : Foundation and linear-static slice : engine build-and-tooling
   Phase 2 (done) : Nonlinear statics and materials : engine nonlinear-solution-control
   Phase 3 (done) : Thermal and contact : engine contact-search
-  Phase 4 : Dynamics and eigenproblems : engine eigensolution
-  Phase 5 : Structural completion : optimization / submodeling / fatigue
+  Phase 4 (done) : Dynamics and eigenproblems : engine eigensolution
+  Phase 5 (in progress) : optimization / submodeling / fatigue done : crack / mesh-refinement blocked
 ```
 
 | Phase | Scope | Status |
@@ -490,7 +512,7 @@ timeline
 | **2 — Nonlinear** | Newton-Raphson, plasticity, user material, hex/wedge & load breadth, constraints | ✅ complete |
 | **3 — Thermal & contact** | Heat transfer, coupled thermomechanics, model change, node-to-surface contact (mortar S2S deferred) | ✅ complete |
 | **4 — Dynamics** | Frequency, direct/modal/steady-state dynamics, Craig-Bampton substructures, `*BUCKLE` + proportional-damping `*COMPLEX FREQUENCY` (gyroscopic complex / cyclic symmetry deferred) | ✅ complete |
-| **5 — Structural completion** | Design optimization (adjoint), submodeling, high-cycle fatigue; crack propagation + adaptive mesh refinement deferred on CyberCadKernel (CFD/EM/networks out of scope → Cyberfluids) | 📋 remaining |
+| **5 — Structural completion** | Design optimization (adjoint), submodeling, high-cycle fatigue ✅; crack propagation + adaptive mesh refinement deferred on CyberCadKernel (CFD/EM/networks out of scope → Cyberfluids) | 🟡 unblocked items done |
 
 ## Spec-driven development
 
