@@ -55,17 +55,6 @@ preparation SHALL reuse the meshing pipeline (see mesh-processing, CyberCadKerne
 - WHEN the thermal step runs
 - THEN view factors between the surfaces SHALL be computed and used to exchange radiative heat
 
-### Requirement: Convective film coupling to networks
-Forced-convection `*FILM` conditions SHALL be able to reference network (fluid)
-elements so that the film temperature is taken from the coupled gas/liquid network
-solution (see cfd-and-network-analysis). The solid thermal field and the network
-SHALL be solved consistently within the coupled step.
-
-#### Scenario: Conjugate heat with a network
-- GIVEN a coupled step with `*FILM` referencing a fluid network
-- WHEN the step runs
-- THEN the solid thermal field and the network flow/temperature SHALL be solved consistently
-
 ### Requirement: Reference fidelity
 Thermal and coupled results SHALL match the reference CalculiX output for the
 corresponding `test/` deck within the documented numerical tolerance, on the CPU

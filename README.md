@@ -470,7 +470,9 @@ Direct is fastest and exact for small/medium systems; IC0-CG keeps memory linear
 
 ## Roadmap
 
-Each phase implements physics from the baseline specs **and** adds one reusable *engine* capability. Phases 1–4 are done; Phase 5 is fully specified and queued.
+Each phase implements physics from the baseline specs **and** adds one reusable *engine* capability. Phases 1–4 are done; Phase 5 completes the **structural / mechanical / civil** capability set.
+
+> **Scope.** CalculiX++ targets structural, mechanical, and civil-engineering FE. **CFD and 1-D fluid networks are delegated to the separate [Cyberfluids](https://github.com/CyberdyneCorp/Cyberfluids) library, and electromagnetics is out of scope** — so those capabilities (and the multi-physics field-coupling engine that only served them) are intentionally not part of this solver.
 
 ```mermaid
 timeline
@@ -479,7 +481,7 @@ timeline
   Phase 2 (done) : Nonlinear statics and materials : engine nonlinear-solution-control
   Phase 3 (done) : Thermal and contact : engine contact-search
   Phase 4 : Dynamics and eigenproblems : engine eigensolution
-  Phase 5 : Advanced physics : engine field-coupling
+  Phase 5 : Structural completion : optimization / submodeling / fatigue
 ```
 
 | Phase | Scope | Status |
@@ -488,11 +490,11 @@ timeline
 | **2 — Nonlinear** | Newton-Raphson, plasticity, user material, hex/wedge & load breadth, constraints | ✅ complete |
 | **3 — Thermal & contact** | Heat transfer, coupled thermomechanics, model change, node-to-surface contact (mortar S2S deferred) | ✅ complete |
 | **4 — Dynamics** | Frequency, direct/modal/steady-state dynamics, Craig-Bampton substructures, `*BUCKLE` + proportional-damping `*COMPLEX FREQUENCY` (gyroscopic complex / cyclic symmetry deferred) | ✅ complete |
-| **5 — Advanced** | CFD/networks, electromagnetics, crack propagation, optimization | 📋 specified |
+| **5 — Structural completion** | Design optimization (adjoint), submodeling, high-cycle fatigue; crack propagation + adaptive mesh refinement deferred on CyberCadKernel (CFD/EM/networks out of scope → Cyberfluids) | 📋 remaining |
 
 ## Spec-driven development
 
-CalculiX++ is developed with [OpenSpec](https://openspec.dev). [`openspec/specs/`](openspec/specs/) holds 30 capability specs describing target behavior (grounded in the reference CalculiX and its keyword set); [`openspec/changes/`](openspec/changes/) holds the phased change proposals. CI gates on `openspec validate --all --strict`.
+CalculiX++ is developed with [OpenSpec](https://openspec.dev). [`openspec/specs/`](openspec/specs/) holds 28 capability specs describing target behavior (grounded in the reference CalculiX and its keyword set); [`openspec/changes/`](openspec/changes/) holds the phased change proposals. CI gates on `openspec validate --all --strict`.
 
 ```bash
 openspec list                 # active change proposals
