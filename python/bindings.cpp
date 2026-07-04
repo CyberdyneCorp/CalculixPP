@@ -28,6 +28,7 @@
 #include "calculixpp/numerics/linear_static.hpp"
 #include "calculixpp/numerics/multistep.hpp"
 #include "calculixpp/numerics/nonlinear_static.hpp"
+#include "calculixpp/numerics/submodel.hpp"
 #include "calculixpp/numerics/substructure.hpp"
 
 namespace py = pybind11;
@@ -740,6 +741,64 @@ py::dict solve_file(const std::string& path, const std::string& solver,
   return solve_model(io::parse_inp_file(path), solver, backend);
 }
 
+// Build a GlobalSolution from NumPy arrays: node coordinates (n,3), nodal displacement
+// (n,3), a per-element connectivity list of 0-based node indices, and a matching list of
+// element-type names ("C3D8", "C3D10", ...). (spec: submodeling — global result source;
+// the in-memory carrier the interpolation kernel consumes.)
+GlobalSolution build_global(py::array_t<double> coords, py::array_t<double> disp,
+                            const std::vector<std::vector<int>>& conn,
+                            const std::vector<std::string>& types) {
+  if (coords.ndim() != 2 || coords.shape(1) != 3)
+    throw std::runtime_error("global coords must be an (n,3) array");
+  if (disp.ndim() != 2 || disp.shape(1) != 3 || disp.shape(0) != coords.shape(0))
+    throw std::runtime_error("global displacement must be an (n,3) array matching coords");
+  if (conn.size() != types.size())
+    throw std::runtime_error("global connectivity and element-type lists must be the same length");
+  GlobalSolution g;
+  auto rc = coords.unchecked<2>();
+  auto rd = disp.unchecked<2>();
+  const auto n = static_cast<std::size_t>(coords.shape(0));
+  for (std::size_t i = 0; i < n; ++i) {
+    g.node_ids.push_back(static_cast<Index>(i));
+    g.coords.push_back({rc(static_cast<py::ssize_t>(i), 0),
+                        rc(static_cast<py::ssize_t>(i), 1),
+                        rc(static_cast<py::ssize_t>(i), 2)});
+    g.displacement.push_back({rd(static_cast<py::ssize_t>(i), 0),
+                              rd(static_cast<py::ssize_t>(i), 1),
+                              rd(static_cast<py::ssize_t>(i), 2)});
+  }
+  for (std::size_t e = 0; e < conn.size(); ++e) {
+    ElementType et{};
+    if (!parse_element_type(types[e], et))
+      throw std::runtime_error("unknown global element type '" + types[e] + "'");
+    g.elem_type.push_back(et);
+    std::vector<Index> c;
+    for (int idx : conn[e]) c.push_back(static_cast<Index>(idx));
+    g.elem_conn.push_back(std::move(c));
+  }
+  return g;
+}
+
+// Solve a submodel deck driven by an in-memory global solution (spec: submodeling).
+// Parses the submodel deck (which carries *SUBMODEL + *BOUNDARY, SUBMODEL), fills the
+// driven boundary DOFs from the global displacement interpolated at each node, solves
+// the local static step, and returns the standard displacement/stress/reaction dict.
+py::dict solve_submodel_text(const std::string& sub_text,
+                             py::array_t<double> global_coords,
+                             py::array_t<double> global_disp,
+                             const std::vector<std::vector<int>>& global_conn,
+                             const std::vector<std::string>& global_types,
+                             const std::string& solver, const std::string& backend) {
+  const std::string used = resolve_backend(backend);
+  const Model m = io::parse_inp(sub_text);
+  const GlobalSolution g =
+      build_global(global_coords, global_disp, global_conn, global_types);
+  py::dict d = result_dict(m, numerics::solve_submodel(m, g, kind_of(solver)));
+  d["backend"] = used;
+  d["procedure"] = "submodel";
+  return d;
+}
+
 py::dict solve_text(const std::string& text, const std::string& solver,
                     const std::string& backend) {
   return solve_model(io::parse_inp(text), solver, backend);
@@ -864,6 +923,20 @@ PYBIND11_MODULE(calculixpp, mod) {
           py::arg("solver") = "", py::arg("backend") = "",
           py::arg("line_search") = false,
           "Like solve_nonlinear() but takes the deck contents as a string.");
+
+  mod.def("solve_submodel", &solve_submodel_text, py::arg("text"),
+          py::arg("global_coords"), py::arg("global_disp"), py::arg("global_conn"),
+          py::arg("global_types"), py::arg("solver") = "", py::arg("backend") = "",
+          "Solve a submodel deck driven by an in-memory global solution (spec: "
+          "submodeling). 'text' is the submodel deck (with *SUBMODEL, TYPE=NODE and "
+          "*BOUNDARY, SUBMODEL). The global solution is passed as global_coords (n,3), "
+          "global_disp (n,3), global_conn (list of per-element 0-based node-index "
+          "lists), and global_types (list of element-type names, e.g. 'C3D8'). Each "
+          "driven boundary DOF is prescribed to the global displacement interpolated at "
+          "the node's location via the host element shape functions, then the local "
+          "static step is solved. Returns the same fields as solve() with "
+          "procedure='submodel'. Raises RuntimeError if a driven node lies outside the "
+          "global element set.");
 
   mod.def("summary", &summary_file, py::arg("path"),
           "Parse an .inp deck without solving and return a dict describing it. "

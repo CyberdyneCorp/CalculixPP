@@ -2567,3 +2567,144 @@ def test_api_parity_phase4():
         msg = str(ei.value).lower()
         assert needle in msg and "deferred" in msg, \
             f"blocked card '{step_card}' -> unclear error: {ei.value}"
+
+
+def _bar_grid(nx, ny, nz, Lx, Ly, Lz, x0=0.0, y0=0.0, z0=0.0):
+    """Structured C3D8 hex grid: returns (node_id(i,j,k), coords list, C3D8
+    connectivity list of 0-based node indices)."""
+    def nid(i, j, k):
+        return i + (nx + 1) * (j + (ny + 1) * k)
+
+    coords = []
+    for k in range(nz + 1):
+        for j in range(ny + 1):
+            for i in range(nx + 1):
+                coords.append([x0 + Lx * i / nx, y0 + Ly * j / ny, z0 + Lz * k / nz])
+    conn = []
+    for k in range(nz):
+        for j in range(ny):
+            for i in range(nx):
+                conn.append([
+                    nid(i, j, k), nid(i + 1, j, k), nid(i + 1, j + 1, k),
+                    nid(i, j + 1, k), nid(i, j, k + 1), nid(i + 1, j, k + 1),
+                    nid(i + 1, j + 1, k + 1), nid(i, j + 1, k + 1)])
+    return nid, coords, conn
+
+
+def test_submodel_reproduces_global_field():
+    """(submodeling) A finer SUBMODEL cut from a solved GLOBAL bar and driven on its
+    full cut boundary by the interpolated global displacement reproduces the global
+    displacement field inside the region to a tight relative-L2 tolerance."""
+    import numpy as np
+    import calculixpp as cx
+
+    # GLOBAL: a coarse bar along x, fixed at x=0, pulled at x=L. Build its deck, solve
+    # it, and capture the mesh + displacement as the global solution.
+    E, nu = 210000.0, 0.3
+    gnx, gny, gnz, Lx, Ly, Lz = 6, 2, 2, 6.0, 2.0, 2.0
+    gnid, gcoords, gconn = _bar_grid(gnx, gny, gnz, Lx, Ly, Lz)
+
+    lines = ["*NODE"]
+    for idx, (x, y, z) in enumerate(gcoords):
+        lines.append(f"{idx + 1}, {x}, {y}, {z}")
+    lines.append("*ELEMENT, TYPE=C3D8, ELSET=EALL")
+    for e, c in enumerate(gconn):
+        lines.append(", ".join(str(v) for v in [e + 1] + [n + 1 for n in c]))
+    lines += ["*MATERIAL, NAME=MAT", "*ELASTIC", f"{E}, {nu}",
+              "*SOLID SECTION, ELSET=EALL, MATERIAL=MAT", "*STEP", "*STATIC"]
+    lines.append("*BOUNDARY")
+    for k in range(gnz + 1):
+        for j in range(gny + 1):
+            lines.append(f"{gnid(0, j, k) + 1}, 1, 3, 0.0")
+    lines.append("*CLOAD")
+    for k in range(gnz + 1):
+        for j in range(gny + 1):
+            lines.append(f"{gnid(gnx, j, k) + 1}, 1, 500.0")
+    lines += ["*END STEP"]
+    gres = cx.solve_text("\n".join(lines))
+    gdisp = np.asarray(gres["displacement"], dtype=float)
+    gcoords_np = np.asarray(gcoords, dtype=float)
+
+    # SUBMODEL: a finer mesh over the interior sub-box [2,4]x[0.5,1.5]x[0.5,1.5]. Its
+    # full outer boundary is driven from the global solution.
+    x0, x1, y0, y1, z0, z1 = 2.0, 4.0, 0.5, 1.5, 0.5, 1.5
+    snx, sny, snz = 4, 3, 3
+    snid, scoords, sconn = _bar_grid(snx, sny, snz, x1 - x0, y1 - y0, z1 - z0, x0, y0, z0)
+
+    slines = ["*NODE"]
+    for idx, (x, y, z) in enumerate(scoords):
+        slines.append(f"{idx + 1}, {x}, {y}, {z}")
+    slines.append("*ELEMENT, TYPE=C3D8, ELSET=EALL")
+    for e, c in enumerate(sconn):
+        slines.append(", ".join(str(v) for v in [e + 1] + [n + 1 for n in c]))
+
+    def on_surface(p):
+        t = 1e-9
+        return (abs(p[0] - x0) < t or abs(p[0] - x1) < t or abs(p[1] - y0) < t or
+                abs(p[1] - y1) < t or abs(p[2] - z0) < t or abs(p[2] - z1) < t)
+
+    bnd = [idx + 1 for idx, p in enumerate(scoords) if on_surface(p)]
+    slines.append("*NSET, NSET=BND")
+    slines += [", ".join(str(b) for b in bnd[i:i + 8]) for i in range(0, len(bnd), 8)]
+    slines += ["*MATERIAL, NAME=MAT", "*ELASTIC", f"{E}, {nu}",
+               "*SOLID SECTION, ELSET=EALL, MATERIAL=MAT",
+               "*SUBMODEL, TYPE=NODE, GLOBAL ELSET=EALL", "BND",
+               "*STEP", "*STATIC", "*BOUNDARY, SUBMODEL", "BND, 1, 3", "*END STEP"]
+
+    sub = cx.solve_submodel("\n".join(slines), gcoords_np, gdisp, gconn,
+                            ["C3D8"] * len(gconn))
+    assert sub["procedure"] == "submodel"
+    sdisp = np.asarray(sub["displacement"], dtype=float)
+    scoords_np = np.asarray(sub["node_coords"], dtype=float)
+
+    # Truth: the global displacement field evaluated at each submodel node's location.
+    # The global mesh is an axis-aligned structured C3D8 grid, so a trilinear
+    # interpolation over the containing cell reproduces the FE field exactly (C3D8 shape
+    # functions ARE trilinear) — the same field the submodel driver interpolates.
+    def global_at(p):
+        fx = (p[0] - 0.0) / (Lx / gnx)
+        fy = (p[1] - 0.0) / (Ly / gny)
+        fz = (p[2] - 0.0) / (Lz / gnz)
+        i, j, k = int(np.clip(fx, 0, gnx - 1)), int(np.clip(fy, 0, gny - 1)), \
+            int(np.clip(fz, 0, gnz - 1))
+        u, v, w = fx - i, fy - j, fz - k
+        out = np.zeros(3)
+        for dk in (0, 1):
+            for dj in (0, 1):
+                for di in (0, 1):
+                    wgt = (di * u + (1 - di) * (1 - u)) * \
+                          (dj * v + (1 - dj) * (1 - v)) * \
+                          (dk * w + (1 - dk) * (1 - w))
+                    out += wgt * gdisp[gnid(i + di, j + dj, k + dk)]
+        return out
+
+    truth = np.array([global_at(p) for p in scoords_np])
+    num = np.linalg.norm(sdisp - truth)
+    den = np.linalg.norm(truth)
+    rel_l2 = num / den if den > 0 else num
+    assert rel_l2 < 1e-3, f"submodel rel-L2 {rel_l2:.3e} >= 1e-3"
+
+
+def test_submodel_node_outside_global_raises():
+    """(submodeling) A driven boundary node that falls outside every global element
+    raises a clear 'no host global element' error."""
+    import numpy as np
+    import calculixpp as cx
+
+    gnid, gcoords, gconn = _bar_grid(1, 1, 1, 1.0, 1.0, 1.0)
+    gdisp = np.zeros((len(gcoords), 3), dtype=float)
+    # A submodel node sitting far outside the single global element.
+    deck = "\n".join([
+        "*NODE", "1, 10.0, 10.0, 10.0", "2, 11.0, 10.0, 10.0", "3, 11.0, 11.0, 10.0",
+        "4, 10.0, 11.0, 10.0", "5, 10.0, 10.0, 11.0", "6, 11.0, 10.0, 11.0",
+        "7, 11.0, 11.0, 11.0", "8, 10.0, 11.0, 11.0",
+        "*ELEMENT, TYPE=C3D8, ELSET=EALL", "1, 1, 2, 3, 4, 5, 6, 7, 8",
+        "*NSET, NSET=BND", "1, 2, 3, 4, 5, 6, 7, 8",
+        "*MATERIAL, NAME=MAT", "*ELASTIC", "210000.0, 0.3",
+        "*SOLID SECTION, ELSET=EALL, MATERIAL=MAT",
+        "*SUBMODEL, TYPE=NODE, GLOBAL ELSET=EALL", "BND",
+        "*STEP", "*STATIC", "*BOUNDARY, SUBMODEL", "BND, 1, 3", "*END STEP"])
+    with pytest.raises(RuntimeError) as ei:
+        cx.solve_submodel(deck, np.asarray(gcoords, dtype=float), gdisp, gconn,
+                          ["C3D8"] * len(gconn))
+    assert "host" in str(ei.value).lower()

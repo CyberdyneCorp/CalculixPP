@@ -13,6 +13,7 @@
 #include "calculixpp/core/mesh.hpp"
 #include "calculixpp/core/section.hpp"
 #include "calculixpp/core/solution_control.hpp"
+#include "calculixpp/core/submodel.hpp"
 
 namespace cxpp {
 
@@ -30,6 +31,12 @@ struct Spc {
   // no prior deformation so FIXED reduces to value 0 (the DOF's start state), i.e. the
   // single-step path is unchanged. (spec: multi-step analysis — FIXED boundary.)
   bool fixed{false};
+  // *BOUNDARY, SUBMODEL: this DOF is DRIVEN from a global solution (spec: submodeling).
+  // `value` is a placeholder — the submodel driver overwrites it with the global
+  // displacement interpolated at the node's location before the local solve. A non-driven
+  // SPC (the default) is a literal prescribed value, so the ordinary path is unchanged.
+  // Declared AFTER `fixed` so the existing `Spc{...,fixed}` aggregate inits stay valid.
+  bool driven{false};
 };
 
 // Concentrated load on a nodal DOF (*CLOAD). `amplitude` scales the value over
@@ -250,6 +257,10 @@ class Model {
   std::unordered_map<std::string, Material> materials;
   std::vector<SolidSection> sections;
   std::vector<Spc> spcs;
+  // *SUBMODEL cards (spec: submodeling). Non-empty routes a *STATIC deck through the
+  // submodel driver, which fills the driven SPCs from a supplied global solution before
+  // the local solve. Empty -> ordinary analysis (byte-for-byte the pre-submodel path).
+  std::vector<SubmodelSpec> submodels;
   std::vector<Cload> cloads;
   std::vector<Dload> dloads;
   std::vector<BodyLoad> body_loads;

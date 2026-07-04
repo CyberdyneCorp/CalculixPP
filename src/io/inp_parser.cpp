@@ -221,6 +221,10 @@ class Parser {
   ModelChangeType mc_type_ = ModelChangeType::Element;
   bool mc_add_ = true;  // true = ADD (activate), false = REMOVE (deactivate)
 
+  // *SUBMODEL (spec: submodeling): the GLOBAL ELSET= carried from the card onto its data
+  // lines (each data line names a driven boundary node set). Empty outside the card.
+  std::string submodel_global_elset_;
+
   std::string param(const std::string& key) const {
     const auto it = params_.find(key);
     return it == params_.end() ? std::string{} : it->second;
@@ -283,6 +287,8 @@ class Parser {
       begin_modal_damping(line);
     } else if (card_ == "*BASEMOTION") {
       begin_base_motion(line);
+    } else if (card_ == "*SUBMODEL") {
+      begin_submodel(line);
     } else if (card_ == "*SUBSTRUCTUREGENERATE") {
       begin_substructure_generate(line);
     } else if (card_ == "*RETAINEDNODALDOFS") {
@@ -704,6 +710,38 @@ class Parser {
   // matrix and fixed-interface modes are requested (Craig-Bampton). No data line.
   void begin_substructure_generate(int /*line*/) {
     model_.procedure = Procedure::Substructure;
+  }
+
+  // *SUBMODEL, TYPE=NODE[, GLOBAL ELSET=<name>][, INPUT=<file>]: declare a driven
+  // boundary sourced from a prior global analysis (spec: submodeling). Only TYPE=NODE is
+  // implemented; TYPE=SURFACE is deferred and rejected. GLOBAL ELSET= (the global element
+  // set searched for host elements) is recorded and carried onto the data lines, each of
+  // which names a driven boundary node set. INPUT= (the global result file) is accepted
+  // and ignored here — the displacement-driven slice supplies the global solution through
+  // the API. (ref: src/submodels.f.)
+  void begin_submodel(int line) {
+    const std::string type = param("TYPE");
+    if (type == "SURFACE" || type == "T")
+      throw ParseError(line,
+                       "*SUBMODEL, TYPE=SURFACE is deferred (tasks 3.3): only "
+                       "TYPE=NODE is implemented; use a boundary node set");
+    if (!type.empty() && type != "NODE" && type != "N")
+      throw ParseError(line, "*SUBMODEL: unknown TYPE=" + type + " (expected NODE)");
+    // GLOBAL ELSET= may be written "GLOBAL ELSET" (space stripped by normalize) or
+    // "GLOBALELSET"; params_ is keyed on the normalized (space-free) name.
+    submodel_global_elset_ = param("GLOBALELSET");
+  }
+
+  // *SUBMODEL data line: a driven boundary node set name (one per line / field). Each
+  // registers a SubmodelSpec bound to the card's GLOBAL ELSET=. (spec: submodeling.)
+  void submodel_data(const std::vector<std::string>& f, int /*line*/) {
+    for (const std::string& tok : f) {
+      if (tok.empty()) continue;
+      SubmodelSpec spec;
+      spec.boundary_nset = upper(trim(tok));
+      spec.global_elset = submodel_global_elset_;
+      model_.submodels.push_back(std::move(spec));
+    }
   }
 
   // *RETAINED NODAL DOFS data: "node_or_nset, first_dof, last_dof" — every DOF in
@@ -1452,7 +1490,9 @@ class Parser {
         // Dynamics (Phase 4) data cards with a data line.
         "*DYNAMIC", "*MODALDYNAMIC", "*STEADYSTATEDYNAMICS", "*COMPLEXFREQUENCY",
         "*MODALDAMPING", "*BASEMOTION", "*RETAINEDNODALDOFS",
-        "*COUPLEDTEMPERATURE-DISPLACEMENT", "*COUPLEDTEMPERATUREDISPLACEMENT"};
+        "*COUPLEDTEMPERATURE-DISPLACEMENT", "*COUPLEDTEMPERATUREDISPLACEMENT",
+        // Submodeling (Phase 5): the boundary node set(s) come on the data line.
+        "*SUBMODEL"};
     return std::find(data_cards.begin(), data_cards.end(), card_) != data_cards.end();
   }
 
@@ -1490,6 +1530,7 @@ class Parser {
     if (card_ == "*MODALDAMPING") return modal_damping_data(f, line);
     if (card_ == "*BASEMOTION") return base_motion_data(f, line);
     if (card_ == "*RETAINEDNODALDOFS") return retained_nodal_dofs_data(f, line);
+    if (card_ == "*SUBMODEL") return submodel_data(f, line);
     if (card_ == "*COUPLEDTEMPERATURE-DISPLACEMENT" ||
         card_ == "*COUPLEDTEMPERATUREDISPLACEMENT")
       return static_data(f, line);  // same increment data line as *STATIC
@@ -1719,6 +1760,10 @@ class Parser {
     // *BOUNDARY, FIXED holds each listed DOF at its currently-attained (deformed)
     // value; the multi-step driver resolves that at solve time (see Spc::fixed).
     const bool fixed = params_.count("FIXED") != 0;
+    // *BOUNDARY, SUBMODEL: the listed DOFs are DRIVEN from a global solution (spec:
+    // submodeling). The value on the card is a placeholder; the submodel driver fills
+    // each DOF with the global displacement interpolated at the node before the solve.
+    const bool driven = params_.count("SUBMODEL") != 0;
     // Temperature DOF: CalculiX numbers the nodal temperature as DOF 11 (and accepts
     // 0 as the temperature DOF in *CFLUX). In a heat step, *BOUNDARY on DOF 11 (or 0)
     // prescribes a temperature; mechanical DOFs 1..3 still prescribe displacements.
@@ -1729,7 +1774,7 @@ class Parser {
         continue;
       }
       for (int c = d1; c <= d2 && c <= kDofsPerNode; ++c)
-        model_.spcs.push_back(Spc{nd, c, val, amp, fixed});
+        model_.spcs.push_back(Spc{nd, c, val, amp, fixed, driven});
     }
   }
 
