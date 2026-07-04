@@ -23,6 +23,7 @@
 #include "calculixpp/numerics/buckling.hpp"
 #include "calculixpp/numerics/eigensolution.hpp"
 #include "calculixpp/numerics/heat_transfer.hpp"
+#include "calculixpp/numerics/high_cycle_fatigue.hpp"
 #include "calculixpp/numerics/direct_dynamics.hpp"
 #include "calculixpp/numerics/modal_dynamics.hpp"
 #include "calculixpp/numerics/linear_static.hpp"
@@ -130,6 +131,7 @@ py::dict summary_dict(const Model& m) {
       : m.procedure == Procedure::ComplexFrequency ? "complex frequency"
       : m.procedure == Procedure::Dynamic ? "dynamic"
       : m.procedure == Procedure::Substructure ? "substructure generate"
+      : m.procedure == Procedure::HighCycleFatigue ? "high cycle fatigue"
                                                         : "static";
 
   // Phase-2 introspection.
@@ -378,6 +380,35 @@ py::dict buckling_result_dict(const Model& m, const numerics::BucklingReport& re
   d["num_elements"] = m.mesh.num_elements();
   d["factors"] = factors;
   d["mode_shape"] = shapes;
+  return d;
+}
+
+// A *HCF deck evaluates stress-based high-cycle fatigue over the recovered stress field
+// and returns per-node life/amplitude arrays plus the worst-case (critical) location and
+// its cycles-to-failure. (spec: high-cycle-fatigue — reachable from Python.)
+py::dict hcf_result_dict(const Model& m, const numerics::HcfReport& rep) {
+  const std::size_t nn = m.mesh.num_nodes();
+  py::array_t<double> life(static_cast<py::ssize_t>(nn));
+  py::array_t<double> amp(static_cast<py::ssize_t>(nn));
+  auto rl = life.mutable_unchecked<1>();
+  auto ra = amp.mutable_unchecked<1>();
+  for (std::size_t i = 0; i < nn; ++i) {
+    rl(static_cast<py::ssize_t>(i)) = rep.life[i];
+    ra(static_cast<py::ssize_t>(i)) = rep.amplitude[i];
+  }
+  py::dict d;
+  d["procedure"] = "high cycle fatigue";
+  d["num_nodes"] = nn;
+  d["num_elements"] = m.mesh.num_elements();
+  d["criterion"] = m.hcf_criterion == FatigueCriterion::VonMises ? "von-mises"
+                                                                 : "signed-von-mises";
+  d["life"] = life;            // (n_nodes,) cycles-to-failure N per node
+  d["amplitude"] = amp;        // (n_nodes,) scalar stress amplitude S_a per node
+  d["worst_node"] = rep.worst_node_id;
+  d["worst_location"] = std::vector<double>{rep.worst_location[0], rep.worst_location[1],
+                                            rep.worst_location[2]};
+  d["worst_amplitude"] = rep.worst_amplitude;
+  d["worst_life"] = rep.worst_life;
   return d;
 }
 
@@ -685,6 +716,14 @@ py::dict solve_model(const Model& m, const std::string& solver,
   // the reduced stiffness (+ mass, Craig-Bampton). (spec: substructure-generation.)
   if (m.procedure == Procedure::Substructure) {
     py::dict d = substructure_result_dict(m);
+    d["backend"] = used;
+    return d;
+  }
+  // A *HCF deck inverts the material S-N (Basquin) curve over the recovered stress field
+  // and returns per-node life/amplitude + the worst-case location. (spec: high-cycle-
+  // fatigue.)
+  if (m.procedure == Procedure::HighCycleFatigue) {
+    py::dict d = hcf_result_dict(m, numerics::evaluate_hcf(m));
     d["backend"] = used;
     return d;
   }

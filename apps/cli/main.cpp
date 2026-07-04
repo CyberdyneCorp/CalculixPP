@@ -13,6 +13,7 @@
 #include "calculixpp/numerics/direct_dynamics.hpp"
 #include "calculixpp/numerics/eigensolution.hpp"
 #include "calculixpp/numerics/heat_transfer.hpp"
+#include "calculixpp/numerics/high_cycle_fatigue.hpp"
 #include "calculixpp/numerics/linear_static.hpp"
 #include "calculixpp/numerics/modal_dynamics.hpp"
 #include "calculixpp/numerics/multistep.hpp"
@@ -294,6 +295,21 @@ int main(int argc, char** argv) {
                   se.n_retained, se.n_modes, se.dim());
       std::printf("  wrote %s%s\n", mpath.c_str(),
                   se.m_reduced.empty() ? " (stiffness)" : " (stiffness + mass)");
+      return 0;
+    }
+
+    // A *HCF deck evaluates stress-based high-cycle fatigue over the recovered stress
+    // field: it inverts the material S-N (Basquin) curve per node and reports the
+    // worst-case location + cycles-to-failure (spec: high-cycle-fatigue).
+    if (model.procedure == Procedure::HighCycleFatigue) {
+      const numerics::HcfReport rep = numerics::evaluate_hcf(model);
+      std::printf("CalculiX++  %s  (high-cycle fatigue)\n", input.c_str());
+      std::printf("  nodes=%zu  elements=%zu\n", model.mesh.num_nodes(),
+                  model.mesh.num_elements());
+      std::printf("  worst-case node = %lld\n",
+                  static_cast<long long>(rep.worst_node_id));
+      std::printf("  stress amplitude = %.6g\n", rep.worst_amplitude);
+      std::printf("  cycles-to-failure = %.6g\n", rep.worst_life);
       return 0;
     }
 

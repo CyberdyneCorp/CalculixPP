@@ -44,7 +44,8 @@ if(CALCULIXPP_WITH_SOLVER)
     numerics/buckling.cpp
     numerics/modal_dynamics.cpp
     numerics/direct_dynamics.cpp
-    numerics/substructure.cpp)
+    numerics/substructure.cpp
+    numerics/high_cycle_fatigue.cpp)
   target_link_libraries(calculixpp_numerics PUBLIC calculixpp_core scipp::scipp)
   target_link_libraries(calculixpp_numerics PRIVATE calculixpp_warnings)
   target_compile_features(calculixpp_numerics PUBLIC cxx_std_20)

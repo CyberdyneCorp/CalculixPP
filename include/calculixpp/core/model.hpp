@@ -187,7 +187,20 @@ enum class Procedure {
   // reduced matrices are exported by *SUBSTRUCTURE MATRIX OUTPUT / *MATRIX ASSEMBLE.
   // (spec: substructure-generation.) (numerics/substructure.)
   Substructure,
+  // *HCF: stress-based high-cycle-fatigue evaluation over a preceding stress-producing
+  // model (spec: high-cycle-fatigue). Recovers the stress field, forms a per-point
+  // uniaxial-equivalent stress amplitude, and inverts the material S-N (Basquin) curve
+  // N = (S_a/a)^(1/b) for the cycles-to-failure, reporting the worst-case location + life.
+  // This is a stress-life estimate, NOT the CalculiX crack-growth cumulative HCF path
+  // (hcfs.f/combilcfhcf.f), which is a documented follow-on. (numerics/high_cycle_fatigue.)
+  HighCycleFatigue,
 };
+
+// Scalar reduction of a stress tensor to a uniaxial-equivalent fatigue amplitude for the
+// *HCF evaluation (spec: high-cycle-fatigue — CRITERION=). SignedVonMises is the von Mises
+// equivalent carrying the sign of the hydrostatic (mean normal) stress, so tension and
+// compression are distinguished; VonMises is the plain (always non-negative) equivalent.
+enum class FatigueCriterion { SignedVonMises, VonMises };
 
 // Solution scheme for a *COUPLED TEMPERATURE-DISPLACEMENT step (spec: heat-transfer
 // — coupled). The two schemes solve the SAME coupled residual and agree to solver
@@ -462,6 +475,10 @@ class Model {
   bool substructure_stiffness{true};   // *SUBSTRUCTURE MATRIX OUTPUT, STIFFNESS=YES
   bool substructure_mass{false};       // *SUBSTRUCTURE MATRIX OUTPUT, MASS=YES
   int substructure_modes{0};           // fixed-interface modes (Craig-Bampton); 0 = Guyan
+
+  // Stress-amplitude reduction for a *HCF step (spec: high-cycle-fatigue — CRITERION=).
+  // Inert unless procedure == HighCycleFatigue. Signed von Mises is the default.
+  FatigueCriterion hcf_criterion{FatigueCriterion::SignedVonMises};
 
   // Nonlinear-solution controls, parsed from *CONTROLS / *STATIC / *TIME POINTS.
   // Unused by the default linear path; consumed by solve_nonlinear_static.

@@ -135,6 +135,18 @@ struct Expansion {
   bool empty() const { return alpha.empty(); }
 };
 
+// Basquin stress-life (S-N) endurance curve for high-cycle fatigue (spec:
+// high-cycle-fatigue — *FATIGUE). The curve relates a cyclic stress amplitude S_a to the
+// cycles-to-failure N by S_a = a * N^b, with coefficient `a > 0` and exponent `b < 0`
+// (life falls as amplitude rises). It inverts to N = (S_a / a)^(1/b). `a` and `b` come
+// from the two fields of the *FATIGUE data line. A degenerate curve (a <= 0 or b == 0)
+// cannot be inverted and is treated as absent.
+struct SNCurve {
+  Real a{0.0};  // Basquin coefficient (stress amplitude at N = 1 cycle)
+  Real b{0.0};  // Basquin exponent (< 0)
+  bool empty() const { return a <= 0.0 || b == 0.0; }
+};
+
 struct Material {
   std::string name;
   std::optional<ElasticIso> elastic;
@@ -144,6 +156,7 @@ struct Material {
   std::optional<UserMaterial> user;          // *USER MATERIAL / *DEPVAR (4.6)
   std::optional<Thermal> thermal;            // *CONDUCTIVITY / *SPECIFIC HEAT (Phase 3)
   std::optional<Expansion> expansion;        // *EXPANSION (thermal-strain coupling)
+  std::optional<SNCurve> sn_curve;           // *FATIGUE (Basquin S-N, Phase 5 HCF)
 
   // Effective isotropic elastic properties for the linear DOF-map / initial-tangent
   // assembly. Returns the *ELASTIC block if present; otherwise derives an equivalent
