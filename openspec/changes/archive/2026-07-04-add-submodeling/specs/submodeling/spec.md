@@ -38,7 +38,7 @@ shape-function machinery. (ref: src/submodels.f, src/interpolsubmodel.f, src/att
 - WHEN driven values are computed
 - THEN the program SHALL report an error that no host element was found for that node
 
-### Requirement: Driven boundary conditions
+### Requirement: Driven boundary conditions and loads
 `*BOUNDARY, SUBMODEL` SHALL apply the interpolated global displacements as prescribed DOF values on the submodel boundary, consistent with loads-and-boundary-conditions.
 
 Each `*BOUNDARY, SUBMODEL` DOF is prescribed to the interpolated global displacement component at the

@@ -45,7 +45,7 @@ The `*HCF` request SHALL require a valid stress-producing model and an S-N mater
 - THEN the solver SHALL raise a clear diagnostic error identifying the missing stress source
 - AND SHALL NOT emit fatigue results
 
-### Requirement: Analytical stress-life fidelity
+### Requirement: Reference-result fidelity
 The `*HCF` life estimate SHALL match the closed-form Basquin inversion `N = (S_a/a)^(1/b)` for a point of known stress amplitude within the documented numerical tolerance, on the CPU backend with no GPU present.
 
 This replaces the CalculiX crack-growth reference-fidelity requirement for the HCF procedure: the CalculiX `*HCF` output is a crack-growth cumulative-damage quantity (different physics) and would not match a stress-life estimate, so fidelity is asserted against the closed-form Basquin curve instead. (ref: Basquin S_a = a·N^b; src/hcfs.f as the contrasting crack-growth path)
