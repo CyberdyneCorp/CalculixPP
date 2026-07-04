@@ -54,6 +54,20 @@ LinearSystem assemble_linear_static(const Model& model);
 // (Deactivated elements — *MODEL CHANGE, REMOVE — carry no mass, mirroring K.)
 LinearSystem assemble_mass(const Model& model, bool lumped = false);
 
+// Assemble the geometric (initial-stress) stiffness K_geo on the SAME free-DOF
+// numbering / constraint transform as assemble_linear_static (spec: geometric-stiffness
+// — K_geo). `gp_stress[e][q]` is the per-element per-Gauss reference Cauchy stress
+// (Voigt6) from the prestress solve (see fem::recover_gauss_stress). Each element's
+// element_geometric_stiffness is scattered through the constraint transform exactly like
+// the stiffness, so the returned COO triplets and the free-DOF count match the stiffness
+// system for the SAME model — the buckling pencil (K + λ K_geo) φ = 0 is well-posed on
+// the shared numbering. The returned LinearSystem carries the same dof_eq / prescribed /
+// transform data as the stiffness system; rhs is unused (left zero). Deactivated elements
+// (*MODEL CHANGE, REMOVE) contribute nothing, and a zero stress field yields a zero
+// matrix — so the linear-static / Newton paths are unaffected.
+LinearSystem assemble_geometric_stiffness(
+    const Model& model, const std::vector<std::vector<Voigt6>>& gp_stress);
+
 // Per-element material models and their per-integration-point state, aligned with
 // mesh.elements(). Built once by make_material_points and advanced across Newton
 // iterations by the nonlinear driver. `state[e]` has one MaterialState per Gauss

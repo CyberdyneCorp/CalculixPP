@@ -225,6 +225,105 @@ EigenBasis extract_modes(const Model& model, std::size_t num_modes, Real shift) 
   return extract_modes(K, M, num_modes, shift);
 }
 
+EigenBasis extract_buckling_modes(const fem::LinearSystem& K,
+                                  const fem::LinearSystem& Kgeo,
+                                  std::size_t num_modes) {
+  if (K.n_free != Kgeo.n_free)
+    throw std::runtime_error(
+        "extract_buckling_modes: K and K_geo have different free-DOF counts "
+        "(assemble both from the same model)");
+  const std::int64_t n = static_cast<std::int64_t>(K.n_free);
+  if (n == 0) throw std::runtime_error("extract_buckling_modes: no free DOFs");
+
+  // Dense generalized reduction on the pencil (A = −K_geo, B = K), B = K SPD. The
+  // buckling condition (K + λ K_geo) φ = 0 is K φ = λ (−K_geo) φ, i.e.
+  //   (−K_geo) φ = θ K φ,   θ = 1/λ  ⇒  λ = 1/θ.
+  //   K = L Lᵀ ; Â = L⁻¹ (−K_geo) L⁻ᵀ ; Â z = θ z ; φ = L⁻ᵀ z.
+  // A physical (positive) buckling factor λ > 0 needs θ = 1/λ > 0, so the smallest
+  // positive λ (critical factor) is the LARGEST positive θ. Non-positive θ are rejected
+  // (they map to λ ≤ 0 — load reversal / rigid-body / near-null K_geo directions).
+  //
+  // TODO(SciPP#18): the scalable sparse path needs eigsh target-selection for the
+  // smallest POSITIVE λ = 1/θ of a K + λ K_geo buckling pencil (K is the SPD B-arg,
+  // −K_geo is indefinite, and the critical factor is the LARGEST positive θ, NOT the
+  // one "nearest σ=0"). Until SciPP#18 lands only this O(n³) dense path exists —
+  // correct and validatable at beamb scale.
+  const numpp::ndarray Kd = dense_from_system(K);
+  const numpp::ndarray Ag = dense_from_system(Kgeo);
+  numpp::ndarray NegKg = numpp::zeros({n, n}, numpp::kFloat64);
+  for (std::int64_t i = 0; i < n; ++i)
+    for (std::int64_t j = 0; j < n; ++j)
+      NegKg.set_item<double>({i, j}, -Ag.item<double>({i, j}));
+
+  numpp::ndarray L;
+  try {
+    L = numpp::linalg::cholesky(Kd);
+  } catch (const std::exception& e) {
+    throw std::runtime_error(
+        std::string("extract_buckling_modes: unloaded stiffness K is not positive "
+                    "definite (Cholesky failed) — the model must be fully constrained: ") +
+        e.what());
+  }
+  const numpp::ndarray Y = numpp::linalg::solve(L, NegKg);
+  const numpp::ndarray A = numpp::linalg::solve(L, Y.transpose()).transpose();
+  const numpp::linalg::EighResult eig = numpp::linalg::eigh(A);
+  const numpp::ndarray Z = eig.eigenvectors;
+
+  // Map θ → λ = 1/θ, keep only positive factors, sort ascending. Reject θ ≤ 0 (which
+  // gives λ ≤ 0) and θ → 0 rigid-body / near-null K_geo directions (λ → +∞).
+  struct Cand {
+    Real lambda;
+    std::int64_t col;
+  };
+  std::vector<Cand> cands;
+  cands.reserve(static_cast<std::size_t>(n));
+  // Scale of θ used to reject near-null directions relative to the spectrum.
+  Real theta_scale = 0.0;
+  for (std::int64_t i = 0; i < n; ++i)
+    theta_scale = std::max(theta_scale, std::fabs(eig.eigenvalues.item<double>({i})));
+  const Real theta_floor = theta_scale * 1e-12;
+  for (std::int64_t i = 0; i < n; ++i) {
+    const Real theta = eig.eigenvalues.item<double>({i});
+    if (theta <= theta_floor) continue;  // θ ≤ 0 (or ~0) → λ ≤ 0 / rigid body: skip
+    cands.push_back({1.0 / theta, i});    // θ > 0 → λ = 1/θ > 0
+  }
+  std::sort(cands.begin(), cands.end(),
+            [](const Cand& a, const Cand& b) { return a.lambda < b.lambda; });
+
+  EigenBasis basis;
+  basis.n_free = K.n_free;
+  basis.stiffness = K;
+  const std::size_t n_nodes = K.dof_eq.size() / static_cast<std::size_t>(kDofsPerNode);
+  const std::size_t take =
+      num_modes == 0 ? cands.size() : std::min(num_modes, cands.size());
+  for (std::size_t m = 0; m < take; ++m) {
+    const std::vector<Real> z = column(Z, cands[m].col, n);
+    // Back-transform φ = L⁻ᵀ z (a single column solve).
+    numpp::ndarray zc = numpp::zeros({n, std::int64_t{1}}, numpp::kFloat64);
+    for (std::int64_t i = 0; i < n; ++i)
+      zc.set_item<double>({i, 0}, z[static_cast<std::size_t>(i)]);
+    const numpp::ndarray phic = numpp::linalg::solve(L.transpose(), zc);
+    std::vector<Real> phi(static_cast<std::size_t>(n));
+    Real nrm = 0.0;
+    for (std::int64_t i = 0; i < n; ++i) {
+      phi[static_cast<std::size_t>(i)] = phic.item<double>({i, 0});
+      nrm += phi[static_cast<std::size_t>(i)] * phi[static_cast<std::size_t>(i)];
+    }
+    nrm = std::sqrt(nrm);
+    if (nrm > 0.0)
+      for (Real& v : phi) v /= nrm;  // unit-norm mode shape (no mass metric here)
+
+    Mode mode;
+    mode.eigenvalue = cands[m].lambda;  // buckling factor λ (positive, ascending)
+    mode.omega = 0.0;                   // not a frequency — leave 0 for buckling
+    mode.frequency = 0.0;
+    mode.shape = expand_shape(K, phi, n_nodes);
+    basis.modes.push_back(std::move(mode));
+    basis.mode_free.push_back(std::move(phi));
+  }
+  return basis;
+}
+
 Participation participation(const EigenBasis& basis, const fem::LinearSystem& M,
                             int dir) {
   Participation out;

@@ -23,7 +23,11 @@ them, under `openspec/changes/archive/`.
 their own work when picked up:
 - **Geometric nonlinearity (NLGEOM):** finite-strain kinematics + geometric
   stiffness `K_geo`. Unblocks 1.6 and 4.3, and is a prerequisite for Phase-4
-  linear buckling.
+  linear buckling. **Partial (2026-07):** the LINEAR geometric (initial-stress)
+  `K_geo` slice shipped with `add-geometric-nonlinearity` (resolving Phase-4 row
+  2.2 `*BUCKLE`); finite-strain kinematics (`F`, Green-Lagrange, PK2, push-forward)
+  for 1.6 (`*STATIC, PERTURBATION`) and 4.3 (large-strain hyperelasticity) is still
+  the outstanding follow-on.
 - **Multi-step analysis:** ✅ RESOLVED (2026-07). `io::parse_inp_steps` splits a
   deck into one `Model` per `*STEP...*END STEP` block (state/loads/BCs/procedure/
   active-mask carried forward; OP=NEW resets per step; `*CHANGE SOLID SECTION`/
@@ -173,7 +177,7 @@ parallel-plate energy balance. See task 3.4 (`fem::build_cavity` /
 |---|---|---|---|
 | **1.3 Sturm-sequence count check** | Missed/starved-mode verification via the inertia (Sturm sequence) of the shifted factorization — relevant now that the sparse Lanczos path (1.1) has landed and only extracts the lowest k modes. | An inertia/negative-eigenvalue count exposed from SciPP's sparse factorization (the eigsh robustness work in [SciPP#15](https://github.com/CyberdyneCorp/SciPP/issues/15) landed thick-restart + relative breakdown but not an inertia count — this needs a separate upstream ask). | `eigensolution` |
 | **1.6 / 2.3 Complex / damped modes** | The complex eigenproblem for `*COMPLEX FREQUENCY` (damping / friction-induced instability). | Complex eigensolve + damping/friction operator assembly. | `eigensolution`, `modal-and-buckling-analysis` |
-| **2.2 `*BUCKLE`** | Two-step prestress + geometric-stiffness eigenproblem `(K + λ K_geo) x = 0`. The eigensolution engine it consumes is in place. | Geometric stiffness `K_geo` (see the NLGEOM cross-cutting enabler). | `modal-and-buckling-analysis` |
+| **2.2 `*BUCKLE`** ✅ | RESOLVED (2026-07) by `add-geometric-nonlinearity` — the LINEAR geometric (initial-stress) stiffness `K_geo` (`element_geometric_stiffness` / `assemble_geometric_stiffness`, the `buckling=1` branch of `e_c3d.f`) + the two-step prestress driver (`numerics::solve_buckling`: linear static prestress → `recover_gauss_stress` → assemble `K`/`K_geo` → `extract_buckling_modes` on the pencil `(−K_geo, K)`, `λ = 1/θ`, positive ascending). The parser accepts `*BUCKLE`, and the CLI + Python bindings return the factors + mode shapes. Validated on stock `beamb`/`beamb2` (C3D20R Euler column, λ₁ = 48.15, λ₂ = 106.3 — all 10 factors match `beamb.dat.ref` to 6 digits). The SPARSE eigsh buckling path is gated on **SciPP#18** (target-selection for the smallest positive λ = 1/θ; dense path only until it lands); finite-strain NLGEOM (`F`/Green-Lagrange/PK2) + `*STATIC, PERTURBATION` (1.6) + large-strain (4.3) remain follow-on rows. | Geometric stiffness `K_geo` ✅ (linear slice) | `modal-and-buckling-analysis` |
 | **3.x `*DYNAMIC, EXPLICIT` + `*GREEN`** | Explicit central-difference direct dynamics (element wave-speed critical time step) and the `*GREEN` Green-function step. (IMPLICIT direct HHT-α dynamics — 3.1 / 3.2 / 3.3 — are shipped, see the resolved note below.) | Element critical-time-step estimate (explicit); unit-excitation response basis (`*GREEN`). | `dynamic-analysis` |
 | **4.3 Base-motion time histories / 4.4 `*GREEN`** | Full `*BASE MOTION` support-excitation TIME HISTORIES driving the transient (the effective-load builder `base_motion_load` and its `p_k = -Γ_k` projection are shipped; wiring a prescribed base-acceleration amplitude into the modal-dynamic march lands with a follow-up) and the `*GREEN` step. | — (builds on the shipped modal engine). | `dynamic-analysis` |
 | **6.x Cyclic symmetry** | Cyclic-symmetry sector complex eigenproblem (`*CYCLIC SYMMETRY MODEL`) + nodal-diameter mode selection (`*SELECT CYCLIC SYMMETRY MODES`). | Complex cyclic-symmetry constraints (a deferred `constraints` capability) + the complex eigensolve (1.6 / 2.3). | `constraints`, `modal-and-buckling-analysis` |

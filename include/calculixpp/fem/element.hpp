@@ -101,6 +101,23 @@ std::vector<Real> element_mass(ElementType type, std::span<const Vec3> coords,
 std::vector<Real> element_mass_lumped(ElementType type, std::span<const Vec3> coords,
                                       Real rho);
 
+// Dense geometric (initial-stress) element stiffness (3n x 3n, row-major), same
+// DOF order node-major [u1,v1,w1, ...] (spec: geometric-stiffness — K_geo). This is
+// the reference-configuration linear-buckling initial-stress matrix, the `buckling=1`
+// branch of CalculiX e_c3d.f. For each Gauss point q with physical shape-function
+// gradients g_a = ∇N_a and the reference Cauchy stress σ (Voigt6 {xx,yy,zz,xy,xz,yz}),
+// the block-diagonal contribution is
+//   K_geo[3a+i][3b+j] = δ_ij · Σ_q senergy(a,b) · det(J) · w,
+//   senergy(a,b) = g_a · σ · g_b
+//     = σxx·gax·gbx + σyy·gay·gby + σzz·gaz·gbz
+//       + σxy·(gax·gby+gay·gbx) + σxz·(gax·gbz+gaz·gbx) + σyz·(gay·gbz+gaz·gby).
+// `gp_stress` holds one Voigt6 per Gauss point (gauss_rule(type).size()), the same
+// Gauss rule as element_stiffness (required for consistency). Symmetric; no hourglass
+// term (only the stress-gradient product). A zero stress field yields a zero matrix.
+std::vector<Real> element_geometric_stiffness(ElementType type,
+                                              std::span<const Vec3> coords,
+                                              const std::vector<Voigt6>& gp_stress);
+
 // Thermal-strain equivalent nodal load (spec: heat-transfer — thermal expansion).
 // For a thermal strain eps_th = alpha (T - Tref) on the normal components (Voigt
 // xx,yy,zz), the mechanical residual gains f_th = ∫ Bᵀ D eps_th dV, so heating a

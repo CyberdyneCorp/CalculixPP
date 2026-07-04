@@ -41,6 +41,7 @@ if(CALCULIXPP_WITH_SOLVER)
     numerics/heat_transfer.cpp
     numerics/multistep.cpp
     numerics/eigensolution.cpp
+    numerics/buckling.cpp
     numerics/modal_dynamics.cpp
     numerics/direct_dynamics.cpp
     numerics/substructure.cpp)
