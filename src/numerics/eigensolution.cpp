@@ -309,29 +309,15 @@ std::vector<RawComplexMode> solve_companion(const ReducedQuadratic& op,
 
 }  // namespace
 
-EigenBasis extract_buckling_modes(const fem::LinearSystem& K,
-                                  const fem::LinearSystem& Kgeo,
-                                  std::size_t num_modes) {
-  if (K.n_free != Kgeo.n_free)
-    throw std::runtime_error(
-        "extract_buckling_modes: K and K_geo have different free-DOF counts "
-        "(assemble both from the same model)");
-  const std::int64_t n = static_cast<std::int64_t>(K.n_free);
-  if (n == 0) throw std::runtime_error("extract_buckling_modes: no free DOFs");
+namespace {
 
-  // Dense generalized reduction on the pencil (A = −K_geo, B = K), B = K SPD. The
-  // buckling condition (K + λ K_geo) φ = 0 is K φ = λ (−K_geo) φ, i.e.
-  //   (−K_geo) φ = θ K φ,   θ = 1/λ  ⇒  λ = 1/θ.
-  //   K = L Lᵀ ; Â = L⁻¹ (−K_geo) L⁻ᵀ ; Â z = θ z ; φ = L⁻ᵀ z.
-  // A physical (positive) buckling factor λ > 0 needs θ = 1/λ > 0, so the smallest
-  // positive λ (critical factor) is the LARGEST positive θ. Non-positive θ are rejected
-  // (they map to λ ≤ 0 — load reversal / rigid-body / near-null K_geo directions).
-  //
-  // TODO(SciPP#18): the scalable sparse path needs eigsh target-selection for the
-  // smallest POSITIVE λ = 1/θ of a K + λ K_geo buckling pencil (K is the SPD B-arg,
-  // −K_geo is indefinite, and the critical factor is the LARGEST positive θ, NOT the
-  // one "nearest σ=0"). Until SciPP#18 lands only this O(n³) dense path exists —
-  // correct and validatable at beamb scale.
+// Dense generalized buckling reduction on the pencil (A = −K_geo, B = K), B = K SPD:
+//   (−K_geo) φ = θ K φ,  θ = 1/λ  ⇒  λ = 1/θ (keep positive factors; the smallest
+// positive λ is the LARGEST positive θ). Small-problem fallback + validation oracle
+// for the sparse eigsh_buckling path.
+EigenBasis dense_buckling_modes(const fem::LinearSystem& K, const fem::LinearSystem& Kgeo,
+                                std::size_t num_modes) {
+  const std::int64_t n = static_cast<std::int64_t>(K.n_free);
   const numpp::ndarray Kd = dense_from_system(K);
   const numpp::ndarray Ag = dense_from_system(Kgeo);
   numpp::ndarray NegKg = numpp::zeros({n, n}, numpp::kFloat64);
@@ -406,6 +392,63 @@ EigenBasis extract_buckling_modes(const fem::LinearSystem& K,
     basis.mode_free.push_back(std::move(phi));
   }
   return basis;
+}
+
+}  // namespace
+
+// Linear-buckling factors: the num_modes smallest positive λ of (K + λ K_geo) φ = 0,
+// K (elastic) SPD, K_geo (geometric) symmetric-indefinite. PRIMARY path is SciPP's
+// sparse shift-invert buckling eigensolver (scipp::sparse::eigsh_buckling, SciPP#18) —
+// an adaptive-σ generalized Lanczos returning the smallest positive load factors and
+// K-normalized modes, scalable past the dense O(n³) reduction. The dense reduction is
+// the fallback for a non-converging small solve and for num_modes == 0 (all factors),
+// which has no sparse analogue.
+EigenBasis extract_buckling_modes(const fem::LinearSystem& K,
+                                  const fem::LinearSystem& Kgeo,
+                                  std::size_t num_modes) {
+  if (K.n_free != Kgeo.n_free)
+    throw std::runtime_error(
+        "extract_buckling_modes: K and K_geo have different free-DOF counts "
+        "(assemble both from the same model)");
+  const std::int64_t n = static_cast<std::int64_t>(K.n_free);
+  if (n == 0) throw std::runtime_error("extract_buckling_modes: no free DOFs");
+
+  if (num_modes > 0) {
+    const scipp::sparse::CsrMatrix Kc = csr_from_system(K);
+    const scipp::sparse::CsrMatrix Kgc = csr_from_system(Kgeo);
+    const scipp::sparse::BucklingResult res =
+        scipp::sparse::eigsh_buckling(Kc, Kgc, static_cast<int>(num_modes));
+    if (res.converged) {
+      EigenBasis basis;
+      basis.n_free = K.n_free;
+      basis.stiffness = K;
+      const std::size_t n_nodes =
+          K.dof_eq.size() / static_cast<std::size_t>(kDofsPerNode);
+      const std::int64_t got = res.load_factors.shape()[0];
+      for (std::int64_t m = 0; m < got; ++m) {
+        std::vector<Real> phi = column(res.modes, m, n);  // K-normalized buckling mode
+        Real nrm = 0.0;
+        for (Real v : phi) nrm += v * v;
+        nrm = std::sqrt(nrm);
+        if (nrm > 0.0)
+          for (Real& v : phi) v /= nrm;  // unit-norm shape (buckling shape scale is free)
+        Mode mode;
+        mode.eigenvalue = res.load_factors.item<double>({m});  // λ > 0, ascending
+        mode.omega = 0.0;
+        mode.frequency = 0.0;
+        mode.shape = expand_shape(K, phi, n_nodes);
+        basis.modes.push_back(std::move(mode));
+        basis.mode_free.push_back(std::move(phi));
+      }
+      return basis;
+    }
+    if (n > kDenseFallbackMaxDof)
+      throw std::runtime_error(
+          "extract_buckling_modes: eigsh_buckling did not converge and n_free=" +
+          std::to_string(n) + " exceeds the dense-fallback limit — the pencil may "
+          "carry no positive buckling factor, or K is not SPD");
+  }
+  return dense_buckling_modes(K, Kgeo, num_modes);
 }
 
 Participation participation(const EigenBasis& basis, const fem::LinearSystem& M,
