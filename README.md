@@ -6,13 +6,15 @@
 
 Numerics come from in-house libraries — **[NumPP](https://github.com/CyberdyneCorp/NumPP)** (NumPy-equivalent arrays + dense linear algebra) and **[SciPP](https://github.com/CyberdyneCorp/SciPP)** (SciPy-equivalent; sparse matrices and solvers) — with **[CyberCadKernel](https://github.com/CyberdyneCorp/CyberCadKernel)** for CAD/meshing. The whole design is spec-driven: the specification and phased roadmap live in [`openspec/`](openspec/).
 
-> **Phase 1 (Foundation) is complete and validated.** The linear-static pipeline solves the reference `beam10p.inp` cantilever and its nodal displacements match **stock CalculiX to a relative L2 of 5.4 × 10⁻⁸**. A larger 8,268-DOF model solves in **0.34 s** (sparse Cholesky).
+> **Phases 1–4 are complete and validated; Phase 5 (advanced physics) is next.** The solver covers linear + nonlinear statics, thermal & contact, and dynamics/eigenproblems — each phase validated against stock CalculiX. Per-phase detail below.
 >
-> **Phase 2 (Nonlinear statics & materials) is in progress.** A Newton-Raphson driver (`solve_nonlinear`) with automatic incrementation now drives J2 plasticity, a C++ user-material seam, and the full hex/wedge element family (`C3D8`/`C3D20`/`C3D6`/`C3D15` + reduced `C3D8R`/`C3D20R`), plus amplitudes, body loads (`GRAV`/`CENTRIF`), springs/masses, and constraints (`*EQUATION`/`*MPC`/`*RIGID BODY`/`*COUPLING`/`*TIE`). New reference decks validate: `beam8p` (C3D8) and `beam20p` (C3D20) match stock CalculiX to **rel-L2 ~5.7 × 10⁻⁸**, and the nonlinear driver reproduces the linear solve to **< 10⁻¹⁰** in one increment.
+> **Phase 1 (Foundation) — COMPLETE and validated.** The linear-static pipeline solves the reference `beam10p.inp` cantilever and its nodal displacements match **stock CalculiX to a relative L2 of 5.4 × 10⁻⁸**. A larger 8,268-DOF model solves in **0.34 s** (sparse Cholesky).
+>
+> **Phase 2 (Nonlinear statics & materials) — COMPLETE and validated.** A Newton-Raphson driver (`solve_nonlinear`) with automatic incrementation now drives J2 plasticity, a C++ user-material seam, and the full hex/wedge element family (`C3D8`/`C3D20`/`C3D6`/`C3D15` + reduced `C3D8R`/`C3D20R`), plus amplitudes, body loads (`GRAV`/`CENTRIF`), springs/masses, and constraints (`*EQUATION`/`*MPC`/`*RIGID BODY`/`*COUPLING`/`*TIE`). New reference decks validate: `beam8p` (C3D8) and `beam20p` (C3D20) match stock CalculiX to **rel-L2 ~5.7 × 10⁻⁸**, and the nonlinear driver reproduces the linear solve to **< 10⁻¹⁰** in one increment.
 >
 > **Phase 3 (Thermal & contact) — COMPLETE and validated.** A scalar 1-DOF/node temperature field runs in parallel to the mechanical path, reusing the same mesh, shape functions/Gauss rules, and sparse solve: steady-state and transient (backward-Euler) conduction, `*CFLUX`/`*DFLUX` heat loads, convective `*FILM`, linearized surface and gray-body cavity `*RADIATE`, monolithic + staggered `*COUPLED TEMPERATURE-DISPLACEMENT` thermal stress (`*EXPANSION`), and element/contact-pair `*MODEL CHANGE` on a multi-step engine. **Contact** is a nonlinear constraint contributing to the Newton tangent/residual: node-to-surface **penalty** contact with a spatial contact-search engine (uniform-grid broad phase + closest-point projection), `*SURFACE BEHAVIOR` (hard/linear/exponential), Coulomb `*FRICTION` (stick↔slip), thermal contact (`*GAP CONDUCTANCE` / `*GAP HEAT GENERATION`), `*CLEARANCE`, and CSTR contact output (status/pressure/gap/traction). `solve()` auto-dispatches `*HEAT TRANSFER` (returning `NT`/`RFL`) and `*CONTACT PAIR` (returning the mechanical fields plus a per-node `contact` list). Validated against stock CalculiX heat decks (`oneel20cf`/`df`/`fi` steady conduction to ~1e-9, `oneel20fi2` transient film relaxation to ~1e-4) and the `beamt` thermal-stress deck (rel-L2 ~2.4 × 10⁻⁶); contact and thermal contact against analytical two-block references (global equilibrium, penalty penetration `F/(4κ)`, series-resistance gap flux — the stock contact decks use NLGEOM + CalculiX's exact exponential law + MPCs and are not gated). **Surface-to-surface mortar contact is deferred** — a `TYPE=SURFACE TO SURFACE` pair is rejected with an actionable error rather than silently mis-solved.
 >
-> **Phase 4 (Dynamics & eigenproblems) — core in progress.** A mechanical **mass matrix** `M_e = ∫ρ NᵀN dV` (consistent + lumped, the mechanical analog of the thermal capacitance) and an **eigensolution engine** for the generalized symmetric problem `K φ = λ M φ` (dense Cholesky-reduction path on NumPP `eigh`, mass-normalized ascending basis, participation factors / effective mass) underpin the frequency-domain and transient procedures: `*FREQUENCY` (natural frequencies + mode shapes), `*MODAL DYNAMIC` (modal superposition, exact Nigam-Jennings recurrence), `*STEADY STATE DYNAMICS` (harmonic sweep), `*DYNAMIC` (implicit HHT-α direct integration, linear + nonlinear), Rayleigh / modal `*DAMPING`, `*COMPLEX FREQUENCY` (damped complex modes by proportional-damping reduction onto the `*FREQUENCY` basis), and `*SUBSTRUCTURE GENERATE` Craig-Bampton / Guyan reduction. Validated against stock CalculiX `beam8f` (`*FREQUENCY` C3D8 cantilever — 10 eigenvalues, frequencies, participation + effective mass to **< 1e-4 rel**) and `substructure` (Guyan reduced stiffness, 60 retained DOFs, **< 1e-6 rel**), plus analytical references (SDOF step response, α=0 energy conservation, resonant peak/bandwidth, and the exact damped-SDOF closed form `λ = -ζω ± iω√(1-ζ²)` for `*COMPLEX FREQUENCY`). **Buckling** (`*BUCKLE`, needs `K_geo` / NLGEOM), the gyroscopic **`*COMPLEX FREQUENCY, CORIOLIS` / `FLUTTER`** paths (a different eigenproblem needing a rotor-speed body load / complex applied force — rejected at parse time), **cyclic symmetry**, explicit `*DYNAMIC, EXPLICIT`, and `*GREEN` are deferred (a sparse shift-invert Lanczos awaits a sparse generalized eigensolver in NumPP/SciPP); each blocked card fails with an actionable parse error naming its enabler.
+> **Phase 4 (Dynamics & eigenproblems) — COMPLETE and validated.** A mechanical **mass matrix** `M_e = ∫ρ NᵀN dV` (consistent + lumped, the mechanical analog of the thermal capacitance) and an **eigensolution engine** for the generalized symmetric problem `K φ = λ M φ` (**SciPP sparse thick-restart shift-invert Lanczos** `eigsh`, scalable to large FE meshes, with a dense NumPP `eigh` fallback for small / rigid-body pencils; mass-normalized ascending basis, participation factors / effective mass) underpin the frequency-domain and transient procedures: `*FREQUENCY` (natural frequencies + mode shapes), `*MODAL DYNAMIC` (modal superposition, exact Nigam-Jennings recurrence), `*STEADY STATE DYNAMICS` (harmonic sweep), `*DYNAMIC` (implicit HHT-α direct integration, linear + nonlinear), Rayleigh / modal `*DAMPING`, `*COMPLEX FREQUENCY` (damped complex modes by proportional-damping reduction onto the `*FREQUENCY` basis), `*SUBSTRUCTURE GENERATE` Craig-Bampton / Guyan reduction, and `*BUCKLE` (linear buckling — geometric stiffness `K_geo` + two-step prestress → `(K + λ K_geo) φ = 0`, solved by SciPP's sparse `eigsh_buckling` with a dense fallback, scalable to ~18k DOF). Validated against stock CalculiX `beam8f` (`*FREQUENCY` — 10 eigenvalues/frequencies/participation to **< 1e-4 rel**), `beamb` (`*BUCKLE` C3D20R Euler column — all 10 load factors to **6 digits**, λ₁ = 48.15), and `substructure` (Guyan, 60 retained DOFs, **< 1e-6 rel**), plus analytical references (SDOF step response, α=0 energy conservation, resonant peak/bandwidth, and the exact damped-SDOF closed form `λ = -ζω ± iω√(1-ζ²)`). Remaining deferred: the gyroscopic **`*COMPLEX FREQUENCY, CORIOLIS` / `FLUTTER`** paths (a different eigenproblem needing a rotor-speed body load / complex applied force — rejected at parse time), **cyclic symmetry**, finite-strain **NLGEOM** / `*STATIC, PERTURBATION`, explicit `*DYNAMIC, EXPLICIT`, and `*GREEN`; each blocked card fails with an actionable parse error naming its enabler.
 
 ---
 
@@ -33,7 +35,9 @@ flowchart LR
 
 ## Features
 
-| Area | Phase 1 (shipped) | Phase 2 (in progress) |
+The table below traces the linear (Phase 1) → nonlinear (Phase 2) element/material/load/solver breadth. **Phases 3–4 add thermal & contact and dynamics/eigenproblems** on top — see the status summary above, the [Python examples](#python--heat-transfer-phase-3) below, and the [roadmap](#roadmap).
+
+| Area | Phase 1 | Phase 2 |
 |---|---|---|
 | **Elements** | Linear `C3D4` and quadratic `C3D10` tetrahedra, isotropic linear elasticity | Hex/wedge families `C3D8` / `C3D20` / `C3D6` / `C3D15` (full) + reduced `C3D8R` (hourglass control) / `C3D20R`; discrete `*SPRING` / `*MASS` / `*DASHPOT` |
 | **Materials** | Isotropic linear elasticity (`*ELASTIC`) | Rate-independent J2 plasticity (`*PLASTIC`, isotropic/kinematic/combined + `*CYCLIC HARDENING`) with consistent tangent; neo-Hookean `*HYPERELASTIC`; C++ `*USER MATERIAL` (`*DEPVAR`/`*RATEDEPENDENT`) |
@@ -75,9 +79,11 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-Requires a C++20 compiler and CMake ≥ 3.24. The numerics layer needs **NumPP** and **SciPP** (≥ v1.2.0); `scripts/bootstrap_deps.sh` builds/installs NumPP and points the build at a SciPP checkout. Python bindings additionally need `pip install pybind11 pytest numpy`. **No GPU toolkit is required.**
+Requires a C++20 compiler and CMake ≥ 3.24. The numerics layer needs **NumPP** and **SciPP** (≥ v1.5.0, for the sparse `eigsh` / `eigsh_buckling` eigensolvers); `scripts/bootstrap_deps.sh` builds/installs NumPP and points the build at a SciPP checkout. Python bindings additionally need `pip install pybind11 pytest numpy`. **No GPU toolkit is required.**
 
 ## Quick start
+
+> **Runnable end-to-end examples** live in [`examples/`](examples/): a steel table under a central load and a tapered cell-tower **antenna mast** under self-weight + a 200 km/h side wind — each turns a CAD/art asset (OBJ/FBX) into a solid FE mesh, solves, and renders the von Mises field (matplotlib + ParaView `.vtk`). See [`examples/README.md`](examples/README.md).
 
 ### Command line
 
@@ -303,7 +309,7 @@ Add `*FRICTION` (Coulomb, stick↔slip) for tangential traction, `*GAP CONDUCTAN
 
 ### Python — frequency & substructure (Phase 4)
 
-A `*FREQUENCY` deck extracts the lowest _N_ natural frequencies and mode shapes of the generalized eigenproblem `K φ = ω² M φ` (mechanical **mass matrix** `M_e = ∫ρ NᵀN dV` + a dense generalized eigensolve on NumPP); `solve()` returns `eigenvalue`/`omega`/`frequency`/`mode_shape` plus modal `participation`/`effective_mass`.
+A `*FREQUENCY` deck extracts the lowest _N_ natural frequencies and mode shapes of the generalized eigenproblem `K φ = ω² M φ` (mechanical **mass matrix** `M_e = ∫ρ NᵀN dV` + SciPP's sparse thick-restart shift-invert Lanczos `eigsh`, with a dense NumPP fallback for small / rigid-body pencils); `solve()` returns `eigenvalue`/`omega`/`frequency`/`mode_shape` plus modal `participation`/`effective_mass`.
 
 A `*SUBSTRUCTURE GENERATE` step condenses the model onto the **retained (master) DOFs** of `*RETAINED NODAL DOFS`, producing a superelement. Static **Guyan** reduction forms the reduced stiffness Schur complement `K̂ = K_bb − K_bi K_ii⁻¹ K_ib`; adding a mass request (`*SUBSTRUCTURE MATRIX OUTPUT, MASS=YES`) and fixed-interface modes (a `*FREQUENCY` card inside the step) switches to **Craig-Bampton** reduction (constraint modes + fixed-interface normal modes from the eigensolution engine). The reduced matrices export in the reference `*MATRIX TYPE=STIFFNESS/MASS` lower-triangular format; `solve()` returns `k_reduced` / `m_reduced` plus the retained-DOF labels and `modal_omega`:
 
@@ -361,7 +367,9 @@ M = s["m_reduced"]          # 18×18 reduced mass
 # The reduced model's low eigenfrequencies approximate the full model's (< 2%).
 ```
 
-The reduced stiffness of the stock `*SUBSTRUCTURE GENERATE` deck (Guyan, 60 retained DOFs) matches reference CalculiX to < 1e-6 relative. Linear **buckling** (`*BUCKLE`, needs the geometric stiffness `K_geo` / NLGEOM) and **cyclic symmetry** are specified and deferred (see `openspec/BACKLOG.md`). Each blocked card fails with an actionable parse error naming the enabler it waits on, rather than being silently mis-solved.
+The reduced stiffness of the stock `*SUBSTRUCTURE GENERATE` deck (Guyan, 60 retained DOFs) matches reference CalculiX to < 1e-6 relative.
+
+Linear **buckling** (`*BUCKLE`) is implemented: a two-step prestress driver assembles the elastic stiffness `K` and the geometric (initial-stress) stiffness `K_geo`, then solves the buckling pencil `(K + λ K_geo) φ = 0` for the smallest positive load factors via SciPP's sparse `eigsh_buckling` (adaptive-σ generalized Lanczos), with a dense reduction as the small-problem fallback. `solve()` returns the buckling `factors` (ascending positive) and `mode_shape`. Validated against stock CalculiX `beamb` (C3D20R Euler column — all 10 factors to 6 digits, λ₁ = 48.15); scales to ~18k DOF where the dense O(n³) path was infeasible. Finite-strain **NLGEOM** / `*STATIC, PERTURBATION` and **cyclic symmetry** remain deferred (see `openspec/BACKLOG.md`); each blocked card fails with an actionable parse error naming the enabler it waits on.
 
 A `*COMPLEX FREQUENCY` deck extracts **damped complex modes** for proportional (Rayleigh / modal) damping by reducing the quadratic eigenproblem `(λ²M + λC + K)x = 0` onto the mass-normalized `*FREQUENCY` basis Φ (`ΦᵀMΦ = I`, `ΦᵀKΦ = Λ`) and solving the small `2·nev` real companion pencil with a dense complex eigensolve. `solve()` returns `eigenvalues_real`/`eigenvalues_imag`, `damped_frequencies` (f_d), `damping_ratios` (ζ), `omega_n`, and real+imag complex `mode_shapes`. For proportional damping the reduced problem is diagonal, so each mode is exact: `λ = -ζω ± iω√(1-ζ²)`, `ζ = (α/ω + β·ω)/2`. This is the ABAQUS-style proportional-damping slice, deliberately **not** the CalculiX gyroscopic `*COMPLEX FREQUENCY, CORIOLIS` (skew rotor-whirl operator) or `FLUTTER` (complex applied force) — those need input this deck does not carry and are **rejected** at parse time with an actionable "not yet implemented" message rather than mis-solved.
 
@@ -462,7 +470,7 @@ Direct is fastest and exact for small/medium systems; IC0-CG keeps memory linear
 
 ## Roadmap
 
-Each phase implements physics from the baseline specs **and** adds one reusable *engine* capability. Phases 1–3 are done; the rest are fully specified and queued.
+Each phase implements physics from the baseline specs **and** adds one reusable *engine* capability. Phases 1–4 are done; Phase 5 is fully specified and queued.
 
 ```mermaid
 timeline
@@ -479,12 +487,12 @@ timeline
 | **1 — Foundation** | Build system, NumPP/SciPP, CPU backend, linear-static slice, Python bindings | ✅ complete |
 | **2 — Nonlinear** | Newton-Raphson, plasticity, user material, hex/wedge & load breadth, constraints | ✅ complete |
 | **3 — Thermal & contact** | Heat transfer, coupled thermomechanics, model change, node-to-surface contact (mortar S2S deferred) | ✅ complete |
-| **4 — Dynamics** | Frequency, direct/modal/steady-state dynamics, Craig-Bampton substructures (buckling/complex/cyclic deferred) | 🚧 in progress |
+| **4 — Dynamics** | Frequency, direct/modal/steady-state dynamics, Craig-Bampton substructures, `*BUCKLE` + proportional-damping `*COMPLEX FREQUENCY` (gyroscopic complex / cyclic symmetry deferred) | ✅ complete |
 | **5 — Advanced** | CFD/networks, electromagnetics, crack propagation, optimization | 📋 specified |
 
 ## Spec-driven development
 
-CalculiX++ is developed with [OpenSpec](https://openspec.dev). [`openspec/specs/`](openspec/specs/) holds 26 capability specs describing target behavior (grounded in the reference CalculiX and its keyword set); [`openspec/changes/`](openspec/changes/) holds the phased change proposals. CI gates on `openspec validate --all --strict`.
+CalculiX++ is developed with [OpenSpec](https://openspec.dev). [`openspec/specs/`](openspec/specs/) holds 30 capability specs describing target behavior (grounded in the reference CalculiX and its keyword set); [`openspec/changes/`](openspec/changes/) holds the phased change proposals. CI gates on `openspec validate --all --strict`.
 
 ```bash
 openspec list                 # active change proposals
@@ -497,7 +505,7 @@ openspec validate --all --strict
 | Library | Role | Required |
 |---|---|---|
 | [NumPP](https://github.com/CyberdyneCorp/NumPP) | N-D arrays, dense linear algebra, compute-backend runtime | yes (solver) |
-| [SciPP](https://github.com/CyberdyneCorp/SciPP) ≥ v1.2.0 | Sparse matrices, sparse direct + preconditioned iterative solvers | yes (solver) |
+| [SciPP](https://github.com/CyberdyneCorp/SciPP) ≥ v1.5.0 | Sparse matrices, sparse direct + preconditioned iterative solvers, generalized/buckling eigensolvers (`eigsh` / `eigsh_buckling`) | yes (solver) |
 | [pybind11](https://github.com/pybind/pybind11) | Python bindings | Python only |
 | [CyberCadKernel](https://github.com/CyberdyneCorp/CyberCadKernel) | CAD import & meshing | later phases |
 | CUDA / OpenCL / Metal | Optional GPU acceleration | never required |
