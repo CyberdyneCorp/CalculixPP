@@ -171,8 +171,7 @@ parallel-plate energy balance. See task 3.4 (`fem::build_cavity` /
 
 | Item | What's missing | Enabler needed | Baseline spec |
 |---|---|---|---|
-| **1.1 Sparse shift-invert Lanczos** | The scalable eigensolver: a shift-invert Lanczos / subspace iteration driving a SciPP sparse factorization `(K-σM)⁻¹` (via `scipp::sparse::spsolve`) as the Krylov operator, so `*FREQUENCY` scales past the dense `O(n_free³)` path. The DENSE generalized path (Cholesky of M -> `eigh`) is implemented and is the validated oracle; it is what `*FREQUENCY` uses today. | A **sparse GENERALIZED eigensolver** — filed as **[SciPP#12](https://github.com/CyberdyneCorp/SciPP/issues/12)** (`eigsh`, shift-invert Lanczos on the sparse factorization). Also **[NumPP#138](https://github.com/CyberdyneCorp/NumPP/issues/138)**: the DENSE `eigh`/`solve` the current path uses scale **O(n^4)** (measured 0.07s->95s over 132->972 DOF; a 1275-DOF `*FREQUENCY` takes 111s vs numpy's 0.19s) - the eigen analog of #10. Until fixed, the beam8f eigen-validation tests are marked `slow` and excluded from the default gate. | `eigensolution`, `linear-algebra-and-solvers` |
-| **1.3 Sturm-sequence count check** | Missed/starved-mode verification via the inertia (Sturm sequence) of the shifted factorization. Not needed for the dense path (`eigh` returns the exact, complete spectrum); required only once the sparse Lanczos path lands. | Sparse Lanczos path (1.1) + inertia from the sparse factorization. | `eigensolution` |
+| **1.3 Sturm-sequence count check** | Missed/starved-mode verification via the inertia (Sturm sequence) of the shifted factorization — relevant now that the sparse Lanczos path (1.1) has landed and only extracts the lowest k modes. | An inertia/negative-eigenvalue count exposed from SciPP's sparse factorization (the eigsh robustness work in [SciPP#15](https://github.com/CyberdyneCorp/SciPP/issues/15) landed thick-restart + relative breakdown but not an inertia count — this needs a separate upstream ask). | `eigensolution` |
 | **1.6 / 2.3 Complex / damped modes** | The complex eigenproblem for `*COMPLEX FREQUENCY` (damping / friction-induced instability). | Complex eigensolve + damping/friction operator assembly. | `eigensolution`, `modal-and-buckling-analysis` |
 | **2.2 `*BUCKLE`** | Two-step prestress + geometric-stiffness eigenproblem `(K + λ K_geo) x = 0`. The eigensolution engine it consumes is in place. | Geometric stiffness `K_geo` (see the NLGEOM cross-cutting enabler). | `modal-and-buckling-analysis` |
 | **3.x `*DYNAMIC, EXPLICIT` + `*GREEN`** | Explicit central-difference direct dynamics (element wave-speed critical time step) and the `*GREEN` Green-function step. (IMPLICIT direct HHT-α dynamics — 3.1 / 3.2 / 3.3 — are shipped, see the resolved note below.) | Element critical-time-step estimate (explicit); unit-excitation response basis (`*GREEN`). | `dynamic-analysis` |
@@ -194,8 +193,21 @@ effective mass. `*FREQUENCY` parses (number of eigenvalues), auto-dispatches fro
 CLI and Python, and reports `f = sqrt(λ)/(2π)` + mode shapes. Validated against the
 stock CalculiX `beam8f` `.dat.ref` (10 eigenvalues, natural frequencies, participation
 factors, effective + total mass — all < 1e-4 rel) AND an analytical 2-DOF spring-mass
-chain (exact). See tasks 1.1-1.4 / 2.1. The scalable sparse shift-invert Lanczos is
-deferred (row 1.1 above) pending a sparse generalized eigensolver in NumPP/SciPP.
+chain (exact). See tasks 1.1-1.4 / 2.1.
+
+Resolved (2026-07): **Scalable sparse shift-invert Lanczos (was Phase-4 row 1.1).**
+`numerics::extract_modes` now drives **`scipp::sparse::eigsh`** (SciPP#12, shift-invert
+Lanczos on the sparse factorization) as the PRIMARY path — beam8f matches stock CalculiX
+to `3.75e-7` in **0.07s** (dense was 5.88s after NumPP#138, 111s before) and a chunky
+3-D block scales to **14703 DOF in 3.4s**. Runs directly on the unscaled pencil:
+**[SciPP#15](https://github.com/CyberdyneCorp/SciPP/issues/15)** (SciPP **1.4.0** —
+thick-restart Lanczos + relative breakdown threshold) RESOLVED the stiff-pencil spurious
+breakdown and the clustered-spectrum stall, so the earlier `M' = trace(K)/trace(M)·M`
+rescaling workaround was **removed**. The dense `O(n_free³)` M-Cholesky reduction (fixed
+to O(n³) by **NumPP#138** / v1.6.0) is retained as a small-problem fallback for the one
+case shift-invert cannot factor: a singular (K−σM) at σ=0 with rigid-body modes. The
+beam8f eigen-validation tests are no longer `slow` — they run in the default gate.
+Remaining eigen follow-ups: 1.3 (Sturm count) and 1.6/2.3 (complex modes).
 
 Resolved (2026-07): **Phase-4 modal superposition dynamics — `*MODAL DYNAMIC` +
 `*STEADY STATE DYNAMICS` + damping (tasks 1.5 / 4.1 / 4.2 / 4.3).**

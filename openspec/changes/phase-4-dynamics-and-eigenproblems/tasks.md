@@ -13,10 +13,14 @@ Implements baseline dynamics/eigen/substructure physics plus the one new capabil
       (same free-DOF numbering / constraint transform as K). Validated: stock CalculiX
       *FREQUENCY deck beam8f (C3D8 cantilever) reproduces all 10 reference eigenvalues to
       < 1e-4 rel, AND an analytical 2-DOF spring-mass chain (λ = (k/m)(3∓√5)/2 exact).
-      [~] The SCALABLE shift-invert Lanczos on SciPP's sparse factorization
-      ((K-σM)⁻¹ via spsolve) is NOT implemented — NumPP/SciPP expose no sparse GENERALIZED
-      eigensolver, so it is a SciPP follow-up (like #10). The dense path is O(n_free³);
-      *FREQUENCY runs on it today. See openspec/BACKLOG.md Phase-4 row.
+      [x] The SCALABLE shift-invert Lanczos now runs on SciPP's sparse factorization
+      (scipp::sparse::eigsh, SciPP#12): (K-σM) is factored once and applied as the Krylov
+      operator, extracting only the k lowest modes. It is the PRIMARY path — beam8f matches
+      stock CalculiX to 3.75e-7 in 0.07s (dense was 5.88s) and a chunky 3-D block scales to
+      14703 DOF in 4.2s. The pencil is rescaled (M' = trace(K)/trace(M)·M) so eigenvalues
+      are O(1), avoiding a spurious absolute-threshold breakdown in eigsh (SciPP#15). The
+      dense O(n_free³) reduction is kept as a small-problem fallback for singular / rigid-body
+      pencils eigsh cannot factor. See openspec/BACKLOG.md Phase-4 row.
 - [x] 1.2 Mass normalization (φᵀ M φ = 1) and ascending-order modal basis. eigh returns
       ascending eigenvalues; each eigenvector is mass-normalized. Verified by the
       generalized-residual test (K φ = λ M φ) and φᵀ M φ = 1 to 1e-9.

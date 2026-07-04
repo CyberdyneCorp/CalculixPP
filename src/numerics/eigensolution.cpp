@@ -3,77 +3,66 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <numeric>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 #include "numpp/core/creation.hpp"
 #include "numpp/core/dtype.hpp"
 #include "numpp/core/ndarray.hpp"
 #include "numpp/linalg/linalg.hpp"
+#include "scipp/sparse/sparse.hpp"
 
-// Dense generalized symmetric eigensolution (spec: eigensolution). We solve
-// K x = λ M x for the lowest N modes via the standard reduction:
-//   M = L Lᵀ  (Cholesky, numpp::linalg::cholesky)
-//   A = L⁻¹ K L⁻ᵀ  (symmetric standard problem, via triangular solves)
-//   A z = μ z  (numpp::linalg::eigh — ascending eigenvalues)
-//   x = L⁻ᵀ z  (back-transform)  then mass-normalize (xᵀ M x = 1).
-// A spectral shift σ solves (K - σ M) so rigid-body / near-zero (and, for buckling,
-// non-positive) eigenvalues are handled; eigenvalues are returned un-shifted.
+// Generalized symmetric eigensolution (spec: eigensolution). Solves K x = λ M x for
+// the lowest N modes via SciPP's sparse thick-restart shift-invert Lanczos
+// (scipp::sparse::eigsh, SciPP#12): (K - σ M) is factored once (reusing SciPP's sparse
+// direct factorization) and applied as the Krylov operator, so only the k lowest modes
+// are extracted and the cost/memory stay sparse — scalable past the old dense O(n³)
+// path (which relied on NumPP's dense eigh, since fixed to O(n³) in NumPP#138). σ (shift)
+// selects the target: 0 for the lowest modes of an SPD pencil, a small negative shift to
+// move off a rigid-body / near-zero mode. Eigenvectors come back mass-normalized
+// (xᵀ M x = 1) and eigenvalues ascending.
 //
-// SCALABILITY [~]: this dense path is O(n_free³) — correct and the validation
-// oracle, but not for large meshes. The scalable target is a shift-invert Lanczos
-// driving SciPP's sparse factorization ((K - σ M)⁻¹ via scipp::sparse::spsolve) as
-// the Krylov operator; NumPP/SciPP expose no sparse GENERALIZED eigensolver yet, so
-// that path is a SciPP follow-up (SciPP#12; the dense eigh/solve it would replace
-// are O(n^4) — NumPP#138). The dense path below is what *FREQUENCY
-// uses today and is validated against a stock CalculiX .dat.ref.
+// SciPP#15 made eigsh robust for the two FE-pencil failure modes we hit: stiff pencils
+// (λ ~ 1e10..1e13 in consistent units, which used to trip an absolute breakdown test)
+// now use a breakdown test relative to the operator scale, and tightly clustered spectra
+// converge via thick restart — so no manual pencil rescaling is needed. A dense
+// M-Cholesky reduction is still kept as a fallback for the one case shift-invert cannot
+// handle: a singular (K − σ M) at σ = 0 with rigid-body modes (used when n_free is small
+// enough to afford the O(n³) reduction).
 namespace cxpp::numerics {
 namespace {
 
-// Build a dense symmetric ndarray (n x n, float64) from the free/free COO triplets
-// of a LinearSystem (duplicates summed, both triangles filled). The assembler emits
-// each entry once (upper OR lower via the transform), so we symmetrize by summing
-// (r,c) and (c,r) into both slots only when they are distinct keys — the COO already
-// carries the exact scattered values, so a plain scatter into a dense buffer with an
-// explicit lower/upper mirror reproduces the full symmetric matrix.
-numpp::ndarray dense_from_system(const fem::LinearSystem& sys) {
+// Build a SciPP CSR matrix from a LinearSystem's free/free COO triplets (the same
+// full-symmetric COO the sparse solve consumes).
+scipp::sparse::CsrMatrix csr_from_system(const fem::LinearSystem& sys) {
   const std::int64_t n = static_cast<std::int64_t>(sys.n_free);
-  numpp::ndarray A = numpp::zeros({n, n}, numpp::kFloat64);
-  for (std::size_t k = 0; k < sys.vals.size(); ++k) {
-    const std::int64_t r = static_cast<std::int64_t>(sys.rows[k]);
-    const std::int64_t c = static_cast<std::int64_t>(sys.cols[k]);
-    const Real v = sys.vals[k];
-    A.set_item<double>({r, c}, A.item<double>({r, c}) + v);
+  const std::int64_t nnz = static_cast<std::int64_t>(sys.vals.size());
+  scipp::sparse::CooMatrix coo;
+  coo.rows = n;
+  coo.cols = n;
+  coo.data = numpp::zeros({nnz}, numpp::kFloat64);
+  coo.row = numpp::zeros({nnz}, numpp::kInt64);
+  coo.col = numpp::zeros({nnz}, numpp::kInt64);
+  for (std::int64_t i = 0; i < nnz; ++i) {
+    const auto k = static_cast<std::size_t>(i);
+    coo.data.set_item<double>({i}, sys.vals[k]);
+    coo.row.set_item<std::int64_t>({i}, sys.rows[k]);
+    coo.col.set_item<std::int64_t>({i}, sys.cols[k]);
   }
-  // Mirror to guarantee exact symmetry (the congruence scatter can leave the matrix
-  // stored on one triangle for some entries). A_sym = (A + Aᵀ) - diag(A).
-  for (std::int64_t i = 0; i < n; ++i)
-    for (std::int64_t j = i + 1; j < n; ++j) {
-      const double s = A.item<double>({i, j}) + A.item<double>({j, i});
-      // If only one side was populated the other is 0, so the sum is the true value;
-      // if both were populated (shouldn't happen for a single-scatter) we'd double —
-      // guard by taking the larger-magnitude convention: prefer the nonzero side.
-      const double aij = A.item<double>({i, j}), aji = A.item<double>({j, i});
-      const double val = (aij != 0.0 && aji != 0.0) ? aij : s;
-      A.set_item<double>({i, j}, val);
-      A.set_item<double>({j, i}, val);
-    }
-  return A;
+  return scipp::sparse::CsrMatrix::from_coo(coo);
 }
 
-// K_shift = K - shift * M  (dense).
-numpp::ndarray shifted_stiffness(const numpp::ndarray& K, const numpp::ndarray& M,
-                                 Real shift, std::int64_t n) {
-  if (shift == 0.0) return K;
-  numpp::ndarray Ks = numpp::zeros({n, n}, numpp::kFloat64);
-  for (std::int64_t i = 0; i < n; ++i)
-    for (std::int64_t j = 0; j < n; ++j)
-      Ks.set_item<double>({i, j},
-                          K.item<double>({i, j}) - shift * M.item<double>({i, j}));
-  return Ks;
+// Sparse mat-vec y = A x over a LinearSystem's COO (for participation).
+std::vector<Real> sparse_matvec(const fem::LinearSystem& A, const std::vector<Real>& x) {
+  std::vector<Real> y(static_cast<std::size_t>(A.n_free), 0.0);
+  for (std::size_t k = 0; k < A.vals.size(); ++k)
+    y[static_cast<std::size_t>(A.rows[k])] +=
+        A.vals[k] * x[static_cast<std::size_t>(A.cols[k])];
+  return y;
 }
 
-// Read column j of a matrix (n rows) into a std::vector<Real>.
+// Column j of an (n, k) ndarray into a std::vector<Real>.
 std::vector<Real> column(const numpp::ndarray& A, std::int64_t j, std::int64_t n) {
   std::vector<Real> col(static_cast<std::size_t>(n));
   for (std::int64_t i = 0; i < n; ++i)
@@ -81,31 +70,11 @@ std::vector<Real> column(const numpp::ndarray& A, std::int64_t j, std::int64_t n
   return col;
 }
 
-// y = M * x  (dense mat-vec on the free DOFs), for mass normalization / participation.
-std::vector<Real> mass_matvec(const numpp::ndarray& M, const std::vector<Real>& x,
-                              std::int64_t n) {
-  std::vector<Real> y(static_cast<std::size_t>(n), 0.0);
-  for (std::int64_t i = 0; i < n; ++i) {
-    double s = 0.0;
-    for (std::int64_t j = 0; j < n; ++j)
-      s += M.item<double>({i, j}) * x[static_cast<std::size_t>(j)];
-    y[static_cast<std::size_t>(i)] = s;
-  }
-  return y;
-}
-
-Real dot(const std::vector<Real>& a, const std::vector<Real>& b) {
-  Real s = 0.0;
-  for (std::size_t i = 0; i < a.size(); ++i) s += a[i] * b[i];
-  return s;
-}
-
 // Expand a free-DOF eigenvector φ to a full nodal mode shape through the constraint
-// transform (SPC value 0 in a modal problem — a mode has no prescribed displacement;
-// MPC slaves reconstructed from masters). Mirrors StaticFields expansion.
+// transform (a mode has zero prescribed displacement; MPC slaves from masters).
 std::vector<Vec3> expand_shape(const fem::LinearSystem& sys,
                                const std::vector<Real>& phi, std::size_t n_nodes) {
-  std::vector<Real> zero_prescribed(sys.prescribed.size(), 0.0);
+  const std::vector<Real> zero_prescribed(sys.prescribed.size(), 0.0);
   std::vector<Vec3> shape(n_nodes, Vec3{0, 0, 0});
   for (std::size_t ni = 0; ni < n_nodes; ++ni)
     for (int c = 0; c < kDofsPerNode; ++c) {
@@ -114,6 +83,85 @@ std::vector<Vec3> expand_shape(const fem::LinearSystem& sys,
           sys.transform.displacement(g, phi, zero_prescribed);
     }
   return shape;
+}
+
+// Above this free-DOF count the dense fallback (O(n³) reduction) is too costly, so a
+// non-converging sparse eigensolve is reported instead of silently going dense.
+constexpr std::int64_t kDenseFallbackMaxDof = 1500;
+
+// Build a dense symmetric (n × n) ndarray from a LinearSystem's free/free COO triplets
+// (duplicates summed, both triangles mirrored — the congruence scatter stores some
+// entries on a single triangle).
+numpp::ndarray dense_from_system(const fem::LinearSystem& sys) {
+  const std::int64_t n = static_cast<std::int64_t>(sys.n_free);
+  numpp::ndarray A = numpp::zeros({n, n}, numpp::kFloat64);
+  for (std::size_t k = 0; k < sys.vals.size(); ++k)
+    A.set_item<double>({sys.rows[k], sys.cols[k]},
+                       A.item<double>({sys.rows[k], sys.cols[k]}) + sys.vals[k]);
+  for (std::int64_t i = 0; i < n; ++i)
+    for (std::int64_t j = i + 1; j < n; ++j) {
+      const double aij = A.item<double>({i, j}), aji = A.item<double>({j, i});
+      const double val = (aij != 0.0 && aji != 0.0) ? aij : aij + aji;
+      A.set_item<double>({i, j}, val);
+      A.set_item<double>({j, i}, val);
+    }
+  return A;
+}
+
+// Dense generalized symmetric eigensolution K x = λ M x for the lowest num_modes:
+//   M = L Lᵀ ; A = L⁻¹ (K − σ M) L⁻ᵀ ; A z = μ z (ascending) ; φ = L⁻ᵀ z.
+// M is always SPD, so this handles a singular / rigid-body K that shift-invert Lanczos
+// cannot factor. O(n³) — the small-problem fallback and validation oracle.
+EigenBasis dense_extract_modes(const fem::LinearSystem& K, const fem::LinearSystem& M,
+                               std::size_t num_modes, Real shift) {
+  const std::int64_t n = static_cast<std::int64_t>(K.n_free);
+  const numpp::ndarray Kd = dense_from_system(K);
+  const numpp::ndarray Md = dense_from_system(M);
+  numpp::ndarray Ks = Kd;
+  if (shift != 0.0)
+    for (std::int64_t i = 0; i < n; ++i)
+      for (std::int64_t j = 0; j < n; ++j)
+        Ks.set_item<double>({i, j},
+                            Kd.item<double>({i, j}) - shift * Md.item<double>({i, j}));
+
+  numpp::ndarray L;
+  try {
+    L = numpp::linalg::cholesky(Md);
+  } catch (const std::exception& e) {
+    throw std::runtime_error(std::string("extract_modes: mass matrix is not positive "
+                                         "definite (Cholesky failed): ") +
+                             e.what());
+  }
+  // A = L⁻¹ Ks L⁻ᵀ ; back-transform φ = L⁻ᵀ z.
+  const numpp::ndarray Y = numpp::linalg::solve(L, Ks);
+  const numpp::ndarray A = numpp::linalg::solve(L, Y.transpose()).transpose();
+  const numpp::linalg::EighResult eig = numpp::linalg::eigh(A);
+  const numpp::ndarray Phi = numpp::linalg::solve(L.transpose(), eig.eigenvectors);
+
+  EigenBasis basis;
+  basis.n_free = K.n_free;
+  basis.stiffness = K;
+  const std::size_t n_nodes = K.dof_eq.size() / static_cast<std::size_t>(kDofsPerNode);
+  for (std::size_t m = 0; m < num_modes; ++m) {
+    const std::int64_t j = static_cast<std::int64_t>(m);
+    std::vector<Real> phi = column(Phi, j, n);
+    const std::vector<Real> Mphi = sparse_matvec(M, phi);  // mass-normalize φᵀ M φ = 1
+    Real mm = 0.0;
+    for (std::size_t i = 0; i < phi.size(); ++i) mm += phi[i] * Mphi[i];
+    const Real mnorm = std::sqrt(std::max(mm, 0.0));
+    if (mnorm > 0.0)
+      for (Real& v : phi) v /= mnorm;
+
+    Mode mode;
+    mode.eigenvalue = eig.eigenvalues.item<double>({j}) + shift;  // un-shift
+    const Real lam = std::max(mode.eigenvalue, 0.0);
+    mode.omega = std::sqrt(lam);
+    mode.frequency = mode.omega / (2.0 * M_PI);
+    mode.shape = expand_shape(K, phi, n_nodes);
+    basis.modes.push_back(std::move(mode));
+    basis.mode_free.push_back(std::move(phi));
+  }
+  return basis;
 }
 
 }  // namespace
@@ -128,32 +176,28 @@ EigenBasis extract_modes(const fem::LinearSystem& K, const fem::LinearSystem& M,
   if (n == 0) throw std::runtime_error("extract_modes: no free DOFs");
   if (num_modes == 0 || static_cast<std::int64_t>(num_modes) > n)
     num_modes = static_cast<std::size_t>(n);
+  const int k = static_cast<int>(num_modes);
 
-  const numpp::ndarray Kd = dense_from_system(K);
-  const numpp::ndarray Md = dense_from_system(M);
-  const numpp::ndarray Ks = shifted_stiffness(Kd, Md, shift, n);
-
-  // M = L Lᵀ ; throws (via numpp) if M is not positive definite.
-  numpp::ndarray L;
-  try {
-    L = numpp::linalg::cholesky(Md);
-  } catch (const std::exception& e) {
-    throw std::runtime_error(std::string("extract_modes: mass matrix is not "
-                                         "positive definite (Cholesky failed): ") +
-                             e.what());
+  // Sparse thick-restart shift-invert Lanczos (SciPP eigsh): lowest k modes of
+  // K x = λ M x nearest σ = shift. SciPP#15 made eigsh robust for stiff FE pencils
+  // (breakdown test relative to the operator scale) and for tightly clustered spectra
+  // (thick restart), so it runs directly on the unscaled pencil — no manual rescaling.
+  // maxiter=0 takes SciPP's default restart-cycle budget (the Krylov subspace size is
+  // chosen internally); the thick restart converges the k wanted modes across cycles.
+  const scipp::sparse::CsrMatrix Kc = csr_from_system(K);
+  const scipp::sparse::CsrMatrix Mc = csr_from_system(M);
+  const scipp::sparse::EigshResult res =
+      scipp::sparse::eigsh(Kc, Mc, k, /*sigma=*/shift, /*tol=*/1e-6, /*maxiter=*/0);
+  // (K − σ M) is singular when σ = 0 meets rigid-body modes, which shift-invert cannot
+  // factor; fall back to the dense reduction (M is always SPD) for small such problems.
+  if (!res.converged) {
+    if (n <= kDenseFallbackMaxDof) return dense_extract_modes(K, M, num_modes, shift);
+    throw std::runtime_error(
+        "extract_modes: eigsh did not converge for the requested " + std::to_string(k) +
+        " modes (subspace " + std::to_string(res.iterations) + ") and n_free=" +
+        std::to_string(n) + " exceeds the dense-fallback limit; the pencil is likely "
+        "singular at this shift — use a shift near the target band");
   }
-  const numpp::ndarray Lt = L.transpose();
-
-  // A = L⁻¹ Ks L⁻ᵀ. Y = L⁻¹ Ks = solve(L, Ks); A = Y L⁻ᵀ = solve(L, Yᵀ)ᵀ (symmetric).
-  const numpp::ndarray Y = numpp::linalg::solve(L, Ks);
-  const numpp::ndarray A =
-      numpp::linalg::solve(L, Y.transpose()).transpose();
-
-  // Standard symmetric eigenproblem, eigenvalues ascending.
-  const numpp::linalg::EighResult eig = numpp::linalg::eigh(A);
-
-  // Back-transform all eigenvectors at once: Z columns z_k ; φ = L⁻ᵀ z = solve(Lᵀ, Z).
-  const numpp::ndarray Phi = numpp::linalg::solve(Lt, eig.eigenvectors);
 
   EigenBasis basis;
   basis.n_free = K.n_free;
@@ -161,22 +205,14 @@ EigenBasis extract_modes(const fem::LinearSystem& K, const fem::LinearSystem& M,
   const std::size_t n_nodes =
       K.dof_eq.size() / static_cast<std::size_t>(kDofsPerNode);
 
-  for (std::size_t m = 0; m < num_modes; ++m) {
-    const std::int64_t j = static_cast<std::int64_t>(m);
-    std::vector<Real> phi = column(Phi, j, n);
-    // Mass-normalize: φ <- φ / sqrt(φᵀ M φ). (Un-shifted M — normalization is scale.)
-    const std::vector<Real> Mphi = mass_matvec(Md, phi, n);
-    const Real mnorm = std::sqrt(std::max(dot(phi, Mphi), 0.0));
-    if (mnorm > 0.0)
-      for (Real& v : phi) v /= mnorm;
-
+  for (int m = 0; m < k; ++m) {
     Mode mode;
-    mode.eigenvalue = eig.eigenvalues.item<double>({j}) + shift;  // un-shift
-    const Real lam = std::max(mode.eigenvalue, 0.0);  // clamp tiny-negative rigid body
+    mode.eigenvalue = res.eigenvalues.item<double>({m});  // eigsh returns λ, ascending
+    const Real lam = std::max(mode.eigenvalue, 0.0);      // clamp tiny-negative rigid body
     mode.omega = std::sqrt(lam);
     mode.frequency = mode.omega / (2.0 * M_PI);
+    std::vector<Real> phi = column(res.eigenvectors, m, n);  // mass-normalized (φᵀMφ=1)
     mode.shape = expand_shape(K, phi, n_nodes);
-
     basis.modes.push_back(std::move(mode));
     basis.mode_free.push_back(std::move(phi));
   }
@@ -194,34 +230,21 @@ Participation participation(const EigenBasis& basis, const fem::LinearSystem& M,
   Participation out;
   out.direction = dir;
   const std::int64_t n = static_cast<std::int64_t>(basis.n_free);
-  const numpp::ndarray Md = dense_from_system(M);
-  const std::size_t n_nodes =
-      basis.stiffness.dof_eq.size() / static_cast<std::size_t>(kDofsPerNode);
 
-  // Influence vector r = free-DOF restriction of the rigid-body direction d (unit
-  // translation on `dir` at every node). Build d on the full DOF space, then project
-  // to the free DOFs via the transform's Tᵀ action: r_eq = Σ_g T[g][eq] d[g]. We
-  // realize this by expanding each free equation's unit basis and dotting with d —
-  // equivalently, r = restriction of d to the free numbering. For SPC/MPC-free DOFs
-  // that is just d[g] at the DOF's own equation; MPC masters accumulate slave terms.
+  // Influence vector r: restriction of the rigid-body unit translation on `dir` (at
+  // every node) to the free DOFs via the constraint transform (MPC masters accumulate
+  // slave terms).
   std::vector<Real> r(static_cast<std::size_t>(n), 0.0);
   const fem::ConstraintTransform& tf = basis.stiffness.transform;
+  const std::size_t n_nodes =
+      basis.stiffness.dof_eq.size() / static_cast<std::size_t>(kDofsPerNode);
   for (std::size_t ni = 0; ni < n_nodes; ++ni) {
     const std::size_t g = ni * kDofsPerNode + static_cast<std::size_t>(dir);
     if (g >= tf.expansion.size()) continue;
     for (const fem::DofTerm& t : tf.expansion[g].terms)
-      r[static_cast<std::size_t>(t.eq)] += t.coeff;  // d[g] = 1 on this direction
+      r[static_cast<std::size_t>(t.eq)] += t.coeff;
   }
-  const std::vector<Real> Mr = [&] {
-    std::vector<Real> y(static_cast<std::size_t>(n), 0.0);
-    for (std::int64_t i = 0; i < n; ++i) {
-      double s = 0.0;
-      for (std::int64_t j = 0; j < n; ++j)
-        s += Md.item<double>({i, j}) * r[static_cast<std::size_t>(j)];
-      y[static_cast<std::size_t>(i)] = s;
-    }
-    return y;
-  }();
+  const std::vector<Real> Mr = sparse_matvec(M, r);  // M r (sparse)
 
   out.factor.reserve(basis.modes.size());
   out.effective_mass.reserve(basis.modes.size());

@@ -2022,11 +2022,11 @@ def _beam8f_solve():
     return _beam8f_cache["res"], _beam8f_cache["ref_path"]
 
 
-@pytest.mark.slow
 def test_frequency_beam8f_matches_calculix():
     """(2.1) The stock *FREQUENCY cantilever beam8f (C3D8) reproduces the reference
     .dat.ref eigenvalues AND natural frequencies (cycles/time) within tolerance — the
-    dense generalized eigensolver validated against stock CalculiX."""
+    sparse shift-invert Lanczos eigensolver (SciPP eigsh) validated against stock
+    CalculiX."""
     res, ref_path = _beam8f_solve()
     assert res["procedure"] == "frequency"
     ref = _parse_ref_eigenvalues(ref_path)
@@ -2041,7 +2041,6 @@ def test_frequency_beam8f_matches_calculix():
         assert rel_f < 1e-4, f"mode {i+1} frequency rel-err {rel_f:.2e}"
 
 
-@pytest.mark.slow
 def test_frequency_participation_beam8f():
     """(1.4) beam8f modal participation factors + effective mass match the reference
     .dat.ref X-direction column, and the effective masses sum to the reported total."""
@@ -2151,7 +2150,6 @@ def test_steady_state_sdof_resonance():
         f"peak amp {a_peak} vs {u_static * Q}")
 
 
-@pytest.mark.slow
 def test_steady_state_beam8f_resonates_at_an_eigenfrequency():
     """(4.2) End-to-end on the real beam8f C3D8 cantilever mesh: a *STEADY STATE
     DYNAMICS sweep spanning the extracted mode band peaks AT one of the model's natural
