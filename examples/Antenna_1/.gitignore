@@ -1,0 +1,3 @@
+*.vtk
+__pycache__/
+antenna_mesh.png
