@@ -24,8 +24,8 @@ network-thermal coupling — Phase-3 thermomechanics already couples without it)
 | `design-optimization` | implementable now | design variables/responses, adjoint sensitivities (reuse the primal factorization), filtering, feasible-direction; robust/random-field |
 | `submodeling` | implementable now | `*SUBMODEL` — interpolate a global run's boundary results onto a submodel, drive its BCs/loads, solve |
 | `high-cycle-fatigue` | implementable now | `*HCF` life / critical-location over prior dynamic/modal results (builds on Phase 4) |
-| `crack-propagation` | **blocked** | SIF + crack advance need CyberCadKernel remeshing (a stub today) |
-| `mesh-refinement` | **blocked** | `*REFINE MESH` solve–refine–resolve needs CyberCadKernel tet remeshing (a stub today) |
+| `crack-propagation` | **blocked** | conforming crack-front remeshing — [CyberCadKernel#3](https://github.com/CyberdyneCorp/CyberCadKernel/issues/3) (needs the tet mesher [#1](https://github.com/CyberdyneCorp/CyberCadKernel/issues/1)) |
+| `mesh-refinement` | **blocked** | field-driven tet refinement — [CyberCadKernel#2](https://github.com/CyberdyneCorp/CyberCadKernel/issues/2) (needs the tet mesher [#1](https://github.com/CyberdyneCorp/CyberCadKernel/issues/1)) |
 
 With CFD/EM removed, the solver is feature-complete for its domain; the implementable
 remainder is the three self-contained structural capabilities above, and the only
