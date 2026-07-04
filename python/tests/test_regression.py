@@ -2708,3 +2708,72 @@ def test_submodel_node_outside_global_raises():
         cx.solve_submodel(deck, np.asarray(gcoords, dtype=float), gdisp, gconn,
                           ["C3D8"] * len(gconn))
     assert "host" in str(ei.value).lower()
+# --- High-cycle fatigue (*HCF) -------------------------------------------------
+
+_HCF_CUBE_DECK = """
+*NODE
+1, 0.0, 0.0, 0.0
+2, 1.0, 0.0, 0.0
+3, 1.0, 1.0, 0.0
+4, 0.0, 1.0, 0.0
+5, 0.0, 0.0, 1.0
+6, 1.0, 0.0, 1.0
+7, 1.0, 1.0, 1.0
+8, 0.0, 1.0, 1.0
+*ELEMENT, TYPE=C3D8, ELSET=EALL
+1, 1, 2, 3, 4, 5, 6, 7, 8
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000.0, 0.3
+*FATIGUE
+1000.0, -0.1
+*SOLID SECTION, ELSET=EALL, MATERIAL=STEEL
+*STEP
+*HCF, CRITERION=SIGNED-VON-MISES
+*BOUNDARY
+1, 1, 3
+4, 1, 1
+4, 3, 3
+5, 1, 1
+5, 2, 2
+8, 1, 1
+*CLOAD
+2, 1, 25.0
+3, 1, 25.0
+6, 1, 25.0
+7, 1, 25.0
+*END STEP
+"""
+
+
+def test_hcf_stress_life_matches_closed_form():
+    """A *HCF deck at a uniform uniaxial amplitude S inverts the Basquin curve
+    N = (S/a)^(1/b) to <1e-6 relative; the worst-case node is the max-amplitude node."""
+    import calculixpp as cx
+    r = cx.solve_text(_HCF_CUBE_DECK)
+    assert r["procedure"] == "high cycle fatigue"
+    assert r["criterion"] == "signed-von-mises"
+    a, b = 1000.0, -0.1
+    S = r["worst_amplitude"]
+    n_closed = (S / a) ** (1.0 / b)
+    assert abs(r["worst_life"] - n_closed) <= 1e-6 * n_closed
+    # Worst node is the max-amplitude node.
+    import numpy as np
+    amp = np.asarray(r["amplitude"])
+    assert r["worst_amplitude"] >= amp.max() - 1e-9
+    # Uniform uniaxial tension of nominal σ = F/A = 100 (A = 1, F = 100).
+    assert abs(S - 100.0) < 1e-6
+
+
+def test_hcf_missing_fatigue_curve_raises():
+    """An *HCF deck with no *FATIGUE curve raises a diagnostic error."""
+    import calculixpp as cx
+    deck = _HCF_CUBE_DECK.replace("*FATIGUE\n1000.0, -0.1\n", "")
+    with pytest.raises(RuntimeError) as ei:
+        cx.solve_text(deck)
+    assert "S-N" in str(ei.value) or "FATIGUE" in str(ei.value)
+
+
+def test_hcf_summary_reports_procedure_without_solving():
+    import calculixpp as cx
+    assert cx.summary_text(_HCF_CUBE_DECK)["procedure"] == "high cycle fatigue"

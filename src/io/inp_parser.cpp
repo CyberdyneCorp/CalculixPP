@@ -273,6 +273,10 @@ class Parser {
       begin_frequency(line);
     } else if (card_ == "*BUCKLE") {
       begin_buckle(line);
+    } else if (card_ == "*HCF") {
+      begin_hcf(line);
+    } else if (card_ == "*FATIGUE") {
+      begin_fatigue(line);
     } else if (card_ == "*DYNAMIC") {
       begin_dynamic(line);
     } else if (card_ == "*MODALDYNAMIC") {
@@ -583,6 +587,41 @@ class Parser {
         (f.empty() || f[0].empty())
             ? 1
             : std::max(1, static_cast<int>(to_double(f[0], line)));
+  }
+
+  // *HCF[, CRITERION=SIGNED-VON-MISES|VON-MISES]: stress-based high-cycle-fatigue over the
+  // preceding stress field (spec: high-cycle-fatigue — *HCF). Selects the procedure and the
+  // stress-amplitude reduction; SIGNED-VON-MISES is the default. Any other CRITERION= is
+  // rejected — a criterion we do not implement must not be silently mis-evaluated. There is
+  // no data line (the S-N curve comes from the material *FATIGUE card).
+  void begin_hcf(int line) {
+    model_.procedure = Procedure::HighCycleFatigue;
+    const std::string crit = param("CRITERION");
+    if (crit.empty() || crit == "SIGNED-VON-MISES")
+      model_.hcf_criterion = FatigueCriterion::SignedVonMises;
+    else if (crit == "VON-MISES")
+      model_.hcf_criterion = FatigueCriterion::VonMises;
+    else
+      throw ParseError(line, "*HCF: unsupported CRITERION=" + crit +
+                                 " (expected SIGNED-VON-MISES or VON-MISES)");
+  }
+
+  // *FATIGUE: Basquin S-N endurance curve on the current material (spec: high-cycle-fatigue
+  // — *FATIGUE). The data line is "a, b" (S_a = a * N^b, b < 0), filled by fatigue_data.
+  void begin_fatigue(int line) {
+    if (cur_material_.empty()) throw ParseError(line, "*FATIGUE without *MATERIAL");
+  }
+
+  // *FATIGUE data line: "a, b" — the Basquin coefficient a and exponent b of the S-N curve
+  // S_a = a * N^b. Stored on the current material's SNCurve.
+  void fatigue_data(const std::vector<std::string>& f, int line) {
+    if (cur_material_.empty()) throw ParseError(line, "*FATIGUE without *MATERIAL");
+    if (f.size() < 2 || f[0].empty() || f[1].empty())
+      throw ParseError(line, "*FATIGUE needs two values: a, b");
+    SNCurve sn;
+    sn.a = to_double(f[0], line);
+    sn.b = to_double(f[1], line);
+    model_.materials[cur_material_].sn_curve = sn;
   }
 
   // *DYNAMIC[, DIRECT][, ALPHA=][, NLGEOM]: direct time integration of the equations of
@@ -1523,6 +1562,7 @@ class Parser {
     if (card_ == "*HEATTRANSFER") return static_data(f, line);  // same inc data line
     if (card_ == "*FREQUENCY") return frequency_data(f, line);
     if (card_ == "*BUCKLE") return buckle_data(f, line);
+    if (card_ == "*FATIGUE") return fatigue_data(f, line);
     if (card_ == "*DYNAMIC") return modal_dynamic_data(f, line);  // "dt, t_end"
     if (card_ == "*MODALDYNAMIC") return modal_dynamic_data(f, line);
     if (card_ == "*STEADYSTATEDYNAMICS") return steady_state_data(f, line);
