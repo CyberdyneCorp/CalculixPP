@@ -20,6 +20,7 @@
 #include "calculixpp/fem/assembly.hpp"
 #include "calculixpp/io/inp_parser.hpp"
 #include "calculixpp/io/results_writer.hpp"
+#include "calculixpp/numerics/buckling.hpp"
 #include "calculixpp/numerics/eigensolution.hpp"
 #include "calculixpp/numerics/heat_transfer.hpp"
 #include "calculixpp/numerics/direct_dynamics.hpp"
@@ -123,8 +124,10 @@ py::dict summary_dict(const Model& m) {
       : m.procedure == Procedure::HeatTransferTransient ? "heat transfer transient"
       : m.procedure == Procedure::Coupled ? "coupled temperature-displacement"
       : m.procedure == Procedure::Frequency ? "frequency"
+      : m.procedure == Procedure::Buckling ? "buckling"
       : m.procedure == Procedure::ModalDynamic ? "modal dynamic"
       : m.procedure == Procedure::SteadyStateDynamics ? "steady state dynamics"
+      : m.procedure == Procedure::ComplexFrequency ? "complex frequency"
       : m.procedure == Procedure::Dynamic ? "dynamic"
       : m.procedure == Procedure::Substructure ? "substructure generate"
                                                         : "static";
@@ -294,6 +297,87 @@ py::dict frequency_result_dict(const Model& m, const numerics::EigenBasis& basis
   d["participation"] = part;
   d["effective_mass"] = effmass;
   d["total_effective_mass"] = total_eff;
+  return d;
+}
+
+// A *COMPLEX FREQUENCY deck returns the damped complex modes: complex eigenvalues (split
+// into real/imag arrays), damped frequencies f_d, damping ratios ζ, undamped angular
+// frequencies ω_n, and the real+imag parts of each complex mode shape (n_modes x n_nodes
+// x 3). Option-(B) proportional damping (spec: modal-and-buckling — complex frequency).
+py::dict complex_frequency_result_dict(const Model& m,
+                                       const numerics::ComplexEigenBasis& cx) {
+  const std::size_t nm = cx.modes.size();
+  const std::size_t nn = m.mesh.num_nodes();
+  py::array_t<double> eig_re(static_cast<py::ssize_t>(nm));
+  py::array_t<double> eig_im(static_cast<py::ssize_t>(nm));
+  py::array_t<double> fd(static_cast<py::ssize_t>(nm));
+  py::array_t<double> zeta(static_cast<py::ssize_t>(nm));
+  py::array_t<double> omega_n(static_cast<py::ssize_t>(nm));
+  py::array_t<double> shape_re({static_cast<py::ssize_t>(nm),
+                                static_cast<py::ssize_t>(nn), py::ssize_t{3}});
+  py::array_t<double> shape_im({static_cast<py::ssize_t>(nm),
+                                static_cast<py::ssize_t>(nn), py::ssize_t{3}});
+  auto rer = eig_re.mutable_unchecked<1>();
+  auto rei = eig_im.mutable_unchecked<1>();
+  auto rfd = fd.mutable_unchecked<1>();
+  auto rz = zeta.mutable_unchecked<1>();
+  auto ron = omega_n.mutable_unchecked<1>();
+  auto rsr = shape_re.mutable_unchecked<3>();
+  auto rsi = shape_im.mutable_unchecked<3>();
+  for (std::size_t k = 0; k < nm; ++k) {
+    const numerics::ComplexMode& md = cx.modes[k];
+    const auto kk = static_cast<py::ssize_t>(k);
+    rer(kk) = md.eigenvalue.real();
+    rei(kk) = md.eigenvalue.imag();
+    rfd(kk) = md.frequency;
+    rz(kk) = md.zeta;
+    ron(kk) = md.omega_n;
+    for (std::size_t i = 0; i < nn; ++i)
+      for (py::ssize_t j = 0; j < 3; ++j) {
+        rsr(kk, static_cast<py::ssize_t>(i), j) = md.shape_real[i][static_cast<std::size_t>(j)];
+        rsi(kk, static_cast<py::ssize_t>(i), j) = md.shape_imag[i][static_cast<std::size_t>(j)];
+      }
+  }
+  py::dict d;
+  d["procedure"] = "complex frequency";
+  d["num_modes"] = nm;
+  d["num_nodes"] = nn;
+  d["num_elements"] = m.mesh.num_elements();
+  d["eigenvalues_real"] = eig_re;
+  d["eigenvalues_imag"] = eig_im;
+  d["damped_frequencies"] = fd;
+  d["damping_ratios"] = zeta;
+  d["omega_n"] = omega_n;
+  d["mode_shapes_real"] = shape_re;
+  d["mode_shapes_imag"] = shape_im;
+  return d;
+}
+
+// A *BUCKLE result as NumPy arrays: the buckling load factors λ (ascending positive)
+// and the buckling mode shapes (n_modes x n_nodes x 3). The critical load is
+// factors[0] * f_ref. (spec: modal-and-buckling — *BUCKLE.)
+py::dict buckling_result_dict(const Model& m, const numerics::BucklingReport& rep) {
+  const std::size_t nm = rep.basis.modes.size();
+  const std::size_t nn = m.mesh.num_nodes();
+  py::array_t<double> factors(static_cast<py::ssize_t>(nm));
+  py::array_t<double> shapes({static_cast<py::ssize_t>(nm),
+                              static_cast<py::ssize_t>(nn), py::ssize_t{3}});
+  auto rfac = factors.mutable_unchecked<1>();
+  auto rs = shapes.mutable_unchecked<3>();
+  for (std::size_t k = 0; k < nm; ++k) {
+    rfac(static_cast<py::ssize_t>(k)) = rep.basis.modes[k].eigenvalue;
+    for (std::size_t i = 0; i < nn; ++i)
+      for (py::ssize_t j = 0; j < 3; ++j)
+        rs(static_cast<py::ssize_t>(k), static_cast<py::ssize_t>(i), j) =
+            rep.basis.modes[k].shape[i][static_cast<std::size_t>(j)];
+  }
+  py::dict d;
+  d["procedure"] = "buckling";
+  d["num_modes"] = nm;
+  d["num_nodes"] = nn;
+  d["num_elements"] = m.mesh.num_elements();
+  d["factors"] = factors;
+  d["mode_shape"] = shapes;
   return d;
 }
 
@@ -544,6 +628,17 @@ py::dict solve_model(const Model& m, const std::string& solver,
     d["backend"] = used;
     return d;
   }
+  // A *BUCKLE deck runs the two-step prestress driver and returns the buckling factors
+  // (ascending positive) + mode shapes. (spec: modal-and-buckling — *BUCKLE.)
+  if (m.procedure == Procedure::Buckling) {
+    const std::size_t nreq = m.num_buckling_modes > 0
+                                 ? static_cast<std::size_t>(m.num_buckling_modes)
+                                 : 1;
+    const numerics::BucklingReport rep = numerics::solve_buckling(m, nreq);
+    py::dict d = buckling_result_dict(m, rep);
+    d["backend"] = used;
+    return d;
+  }
   // A *MODAL DYNAMIC deck integrates the decoupled modal SDOFs over the *FREQUENCY basis
   // and returns the transient displacement history. (spec: dynamic-analysis.)
   if (m.procedure == Procedure::ModalDynamic) {
@@ -555,6 +650,26 @@ py::dict solve_model(const Model& m, const std::string& solver,
   // frequency band by modal superposition. (spec: dynamic-analysis.)
   if (m.procedure == Procedure::SteadyStateDynamics) {
     py::dict d = steady_state_result_dict(m);
+    d["backend"] = used;
+    return d;
+  }
+  // A *COMPLEX FREQUENCY deck reduces the proportional damping onto the *FREQUENCY basis
+  // and returns damped complex modes (eigenvalues, damped frequencies, damping ratios,
+  // complex mode shapes). (spec: modal-and-buckling — complex frequency; option B.)
+  if (m.procedure == Procedure::ComplexFrequency) {
+    const std::size_t nreq = m.num_complex_modes > 0
+                                 ? static_cast<std::size_t>(m.num_complex_modes)
+                                 : 1;
+    const fem::LinearSystem K = fem::assemble_linear_static(m);
+    const fem::LinearSystem M = fem::assemble_mass(m, /*lumped=*/false);
+    const numerics::EigenBasis basis = numerics::extract_modes(K, M, nreq);
+    numerics::Damping damp;
+    damp.alpha = m.rayleigh.alpha;
+    damp.beta = m.rayleigh.beta;
+    damp.modal_ratios = m.modal_damping;
+    const numerics::ComplexEigenBasis cx =
+        numerics::extract_complex_modes(basis, damp, nreq);
+    py::dict d = complex_frequency_result_dict(m, cx);
     d["backend"] = used;
     return d;
   }

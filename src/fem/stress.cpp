@@ -144,6 +144,48 @@ std::vector<Real> internal_force(const Model& model, const std::vector<Vec3>& u)
   return f_int;
 }
 
+std::vector<std::vector<Voigt6>> recover_gauss_stress(const Model& model,
+                                                      const std::vector<Vec3>& u) {
+  const Mesh& mesh = model.mesh;
+  std::vector<std::vector<Voigt6>> out(mesh.num_elements());
+  const std::vector<ElasticIso> elastic = model.element_elastic();
+  const std::vector<std::optional<Expansion>> expansion = model.element_expansion();
+  const std::vector<bool> active = model.element_active_mask();
+  std::array<std::array<Real, 3>, kMaxNodes> g{};
+  std::vector<Vec3> coords, ue;
+  std::vector<Index> nidx;
+
+  for (std::size_t e = 0; e < mesh.num_elements(); ++e) {
+    if (!active[e]) continue;  // *MODEL CHANGE, REMOVE: no stress contribution
+    const Element& elem = mesh.elements()[e];
+    const int n = nodes_per_element(elem.type);
+    gather_element(mesh, elem, u, coords, nidx, ue);
+    const D6 D = elastic_iso_D(elastic[e]);
+
+    // Thermal correction (all-zero on the pure-mechanical buckling path): the same
+    // per-node temperature change + alpha used by recover_fields.
+    const std::vector<Real> te = element_temp_change(model, elem, expansion[e]);
+    const Real alpha = te.empty() ? 0.0 : element_alpha(model, elem, *expansion[e]);
+
+    const auto rule = gauss_rule(elem.type);
+    std::vector<Voigt6> gp_stress(rule.size());
+    Voigt6 strain_scratch{};
+    for (std::size_t q = 0; q < rule.size(); ++q) {
+      const Shape s = shape(elem.type, rule[q].xi, rule[q].et, rule[q].ze);
+      physical_gradients(s, coords, g);
+      Real dT = 0.0;
+      for (int k = 0; k < n; ++k)
+        dT += s.N[static_cast<std::size_t>(k)] *
+              (te.empty() ? 0.0 : te[static_cast<std::size_t>(k)]);
+      const Real eth = alpha * dT;
+      const Voigt6 eps_th{eth, eth, eth, 0.0, 0.0, 0.0};
+      strain_stress_at(g, n, ue, D, eps_th, strain_scratch, gp_stress[q]);
+    }
+    out[e] = std::move(gp_stress);
+  }
+  return out;
+}
+
 void recover_fields(const Model& model, StaticFields& fields) {
   const Mesh& mesh = model.mesh;
   const std::size_t n_nodes = mesh.num_nodes();

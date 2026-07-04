@@ -9,6 +9,7 @@
 
 #include "calculixpp/io/inp_parser.hpp"
 #include "calculixpp/io/results_writer.hpp"
+#include "calculixpp/numerics/buckling.hpp"
 #include "calculixpp/numerics/direct_dynamics.hpp"
 #include "calculixpp/numerics/eigensolution.hpp"
 #include "calculixpp/numerics/heat_transfer.hpp"
@@ -141,6 +142,25 @@ int main(int argc, char** argv) {
       return 0;
     }
 
+    // A *BUCKLE deck runs the two-step prestress driver: a linear static solve for the
+    // reference load, then the buckling pencil (K + λ K_geo) φ = 0. The CLI prints the
+    // BUCKLING FACTOR OUTPUT table (spec: modal-and-buckling — *BUCKLE).
+    if (model.procedure == Procedure::Buckling) {
+      const std::size_t nreq = model.num_buckling_modes > 0
+                                   ? static_cast<std::size_t>(model.num_buckling_modes)
+                                   : 1;
+      const numerics::BucklingReport rep = numerics::solve_buckling(model, nreq);
+      std::printf("CalculiX++  %s  (buckling: %zu factors)\n", input.c_str(),
+                  rep.factors.size());
+      std::printf("  nodes=%zu  elements=%zu\n", model.mesh.num_nodes(),
+                  model.mesh.num_elements());
+      std::printf("  BUCKLING FACTOR OUTPUT\n");
+      std::printf("  MODE NO   BUCKLING FACTOR\n");
+      for (std::size_t i = 0; i < rep.factors.size(); ++i)
+        std::printf("  %6zu    %.7e\n", i + 1, rep.factors[i]);
+      return 0;
+    }
+
     // A *MODAL DYNAMIC / *STEADY STATE DYNAMICS deck runs modal superposition over the
     // *FREQUENCY basis extracted from the same model (spec: dynamic-analysis). The CLI
     // prints a summary of the transient peak / resonance; the Python bindings expose the
@@ -195,6 +215,39 @@ int main(int argc, char** argv) {
       }
       std::printf("  nodes=%zu  elements=%zu\n", model.mesh.num_nodes(),
                   model.mesh.num_elements());
+      return 0;
+    }
+
+    // A *COMPLEX FREQUENCY deck extracts damped complex modes by reducing the proportional
+    // (Rayleigh / modal) damping onto the *FREQUENCY basis and solving the small companion
+    // pencil (spec: modal-and-buckling — complex frequency; option-(B) proportional
+    // damping, NOT CalculiX CORIOLIS). Prints per-mode damped frequency, damping ratio,
+    // decay rate, and stability.
+    if (model.procedure == Procedure::ComplexFrequency) {
+      const std::size_t nreq =
+          model.num_complex_modes > 0
+              ? static_cast<std::size_t>(model.num_complex_modes)
+              : 1;
+      const fem::LinearSystem K = fem::assemble_linear_static(model);
+      const fem::LinearSystem M = fem::assemble_mass(model, /*lumped=*/false);
+      const numerics::EigenBasis basis = numerics::extract_modes(K, M, nreq);
+      numerics::Damping damp;
+      damp.alpha = model.rayleigh.alpha;
+      damp.beta = model.rayleigh.beta;
+      damp.modal_ratios = model.modal_damping;
+      const numerics::ComplexEigenBasis cx =
+          numerics::extract_complex_modes(basis, damp, nreq);
+      std::printf("CalculiX++  %s  (complex frequency: %zu modes)\n", input.c_str(),
+                  cx.modes.size());
+      std::printf("  nodes=%zu  elements=%zu\n", model.mesh.num_nodes(),
+                  model.mesh.num_elements());
+      std::printf(
+          "  MODE   DAMPED FREQ f_d   DAMPING RATIO z   DECAY RATE Re(l)   STABILITY\n");
+      for (std::size_t i = 0; i < cx.modes.size(); ++i) {
+        const numerics::ComplexMode& md = cx.modes[i];
+        std::printf("  %4zu   %.7e   %+.7e   %+.7e   %s\n", i + 1, md.frequency, md.zeta,
+                    md.decay_rate, md.zeta > 0.0 ? "stable" : "unstable");
+      }
       return 0;
     }
 

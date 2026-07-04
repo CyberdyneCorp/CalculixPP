@@ -156,6 +156,11 @@ enum class Procedure {
   // *FREQUENCY: natural-frequency / mode-shape extraction — the generalized symmetric
   // eigenproblem K x = λ M x for the lowest N modes (spec: modal-and-buckling-analysis).
   Frequency,
+  // *BUCKLE: linear-buckling load-factor extraction — the pencil (K + λ K_geo) φ = 0
+  // where K_geo is the geometric (initial-stress) stiffness about a reference-load
+  // prestress state. Returns the lowest positive load factors + buckling mode shapes
+  // (spec: modal-and-buckling-analysis — *BUCKLE; geometric-stiffness).
+  Buckling,
   // *MODAL DYNAMIC: transient response by modal superposition over a preceding
   // *FREQUENCY basis — each decoupled modal SDOF integrated, recombined to the physical
   // response (spec: dynamic-analysis — modal dynamic).
@@ -163,6 +168,13 @@ enum class Procedure {
   // *STEADY STATE DYNAMICS: harmonic response amplitude/phase over a frequency sweep by
   // modal superposition with damping (spec: dynamic-analysis — steady-state dynamics).
   SteadyStateDynamics,
+  // *COMPLEX FREQUENCY: damped complex modes by proportional (Rayleigh / modal) damping,
+  // reduced onto the preceding *FREQUENCY basis — the reduced quadratic eigenproblem
+  // (λ²M + λC + K)x = 0 projected onto Φ and solved as a small 2·nev companion pencil
+  // (spec: modal-and-buckling-analysis — complex frequency). This is the option-(B)
+  // proportional-damping path and is deliberately NOT the CalculiX CORIOLIS gyroscopic
+  // problem; CORIOLIS/FLUTTER decks are parsed then rejected. (numerics/eigensolution.)
+  ComplexFrequency,
   // *DYNAMIC: direct time integration of M a + C v + K u = f(t) by the implicit HHT-α
   // scheme in physical coordinates (spec: dynamic-analysis — direct-integration
   // dynamics). Carries inertia + nonlinear material/contact tangents together; the
@@ -387,6 +399,25 @@ class Model {
   // Inert unless procedure == Frequency. The eigensolution engine extracts the lowest
   // `num_eigenvalues` modes of K x = λ M x. (spec: modal-and-buckling — *FREQUENCY.)
   int num_eigenvalues{0};
+
+  // Which complex-frequency eigenproblem a *COMPLEX FREQUENCY step requests. Only
+  // Proportional is solved (the option-(B) proportional-damping reduction); Coriolis
+  // (gyroscopic skew operator + rotor-speed body load) and Flutter (complex applied
+  // force) are parsed then rejected — a faithful port needs input this deck does not
+  // carry. (spec: modal-and-buckling-analysis — complex frequency.)
+  enum class ComplexFrequencyType { Proportional, Coriolis, Flutter };
+
+  // Number of complex modes requested by a *COMPLEX FREQUENCY step (data-line field).
+  // Inert unless procedure == ComplexFrequency. The complex eigensolution engine reduces
+  // onto the preceding *FREQUENCY basis and returns this many damped complex modes.
+  int num_complex_modes{0};
+  ComplexFrequencyType complex_freq_type{ComplexFrequencyType::Proportional};
+
+  // Number of buckling modes requested by a *BUCKLE step (first data-line field).
+  // Inert unless procedure == Buckling. The two-step prestress driver extracts the
+  // lowest `num_buckling_modes` positive load factors of (K + λ K_geo) φ = 0. (spec:
+  // input-deck-parsing — *BUCKLE; modal-and-buckling — *BUCKLE.)
+  int num_buckling_modes{0};
 
   // Dynamics-step controls (spec: dynamic-analysis). Inert unless procedure is
   // ModalDynamic or SteadyStateDynamics. These carry the modal-superposition step

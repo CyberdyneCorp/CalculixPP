@@ -375,8 +375,6 @@ void test_blocked_phase4_cards_reject_clearly() {
     std::string needle;
   };
   const Case cases[] = {
-      {"*STEP\n*BUCKLE\n5\n*END STEP\n", "linear buckling"},
-      {"*STEP\n*COMPLEX FREQUENCY\n5\n*END STEP\n", "complex"},
       {"*CYCLIC SYMMETRY MODEL, N=8\n1,2\n", "cyclic-symmetry"},
       {"*SELECT CYCLIC SYMMETRY MODES\n0,4\n", "nodal-diameter"},
       {"*STEP\n*GREEN\n*END STEP\n", "Green-function"},
@@ -386,6 +384,18 @@ void test_blocked_phase4_cards_reject_clearly() {
     CX_CHECK(throws_with(deck, c.needle));
     CX_CHECK(throws_with(deck, "deferred"));
   }
+}
+
+// (6.3) *BUCKLE is now implemented: the parser records Procedure::Buckling and the
+// requested mode count from the first data field, and the trailing ARPACK-style
+// tolerance field is accepted and ignored without error. (add-geometric-nonlinearity.)
+void test_buckle_card_parses() {
+  const char* sect = "*SOLID SECTION, ELSET=EALL, MATERIAL=M\n";
+  const std::string deck =
+      std::string(kMatHeader) + sect + "*STEP\n*BUCKLE\n10, 1.e-2\n*END STEP\n";
+  const Model m = io::parse_inp(deck);
+  CX_CHECK(m.procedure == Procedure::Buckling);
+  CX_CHECK(m.num_buckling_modes == 10);
 }
 
 // (6.1) The full Phase-2 IMPLEMENTED card set parses without crashing: connectors,
@@ -513,6 +523,50 @@ void test_preceding_frequency_required() {
   CX_CHECK(ok);
 }
 
+// *COMPLEX FREQUENCY (option-B proportional damping): the keyword-less card sets the
+// procedure + mode count; CORIOLIS and FLUTTER are rejected with an explicit "not yet
+// implemented"; and a *COMPLEX FREQUENCY step with no preceding *FREQUENCY throws.
+void test_complex_frequency_parses() {
+  const char* deck = R"(
+*NODE
+1, 0., 0., 0.
+*COMPLEX FREQUENCY
+6
+*END STEP
+)";
+  const Model m = io::parse_inp(deck);
+  CX_CHECK(m.procedure == Procedure::ComplexFrequency);
+  CX_CHECK(m.num_complex_modes == 6);
+  CX_CHECK(m.complex_freq_type == Model::ComplexFrequencyType::Proportional);
+
+  // CORIOLIS / FLUTTER are a different (gyroscopic / complex-force) eigenproblem that
+  // needs input this deck does not carry — rejected, not silently mis-solved.
+  CX_CHECK(throws_with("*COMPLEX FREQUENCY, CORIOLIS\n5\n", "not yet implemented"));
+  CX_CHECK(throws_with("*COMPLEX FREQUENCY, CORIOLIS\n5\n", "CORIOLIS"));
+  CX_CHECK(throws_with("*COMPLEX FREQUENCY, FLUTTER\n5\n", "not yet implemented"));
+  CX_CHECK(throws_with("*COMPLEX FREQUENCY, FLUTTER\n5\n", "FLUTTER"));
+
+  // A *COMPLEX FREQUENCY step requires a preceding *FREQUENCY basis.
+  Model cx;
+  cx.procedure = Procedure::ComplexFrequency;
+  bool threw = false;
+  try {
+    io::validate_preceding_frequency({cx});
+  } catch (const std::exception&) {
+    threw = true;
+  }
+  CX_CHECK(threw);
+  Model freq;
+  freq.procedure = Procedure::Frequency;
+  bool ok = true;
+  try {
+    io::validate_preceding_frequency({freq, cx});
+  } catch (const std::exception&) {
+    ok = false;
+  }
+  CX_CHECK(ok);
+}
+
 }  // namespace
 
 int main() {
@@ -525,9 +579,11 @@ int main() {
   test_constraint_cards();
   test_deferred_cards_reject_clearly();
   test_blocked_phase4_cards_reject_clearly();
+  test_buckle_card_parses();
   test_phase2_card_sweep_parses();
   test_substructure_cards();
   test_preceding_frequency_required();
+  test_complex_frequency_parses();
   if (cxtest::g_failures == 0) std::printf("test_parser: OK\n");
   CX_MAIN_RETURN();
 }

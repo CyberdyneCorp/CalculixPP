@@ -474,6 +474,39 @@ void accumulate_fint(const std::array<std::array<Real, 3>, kMaxNodes>& g, int nd
   }
 }
 
+// Accumulate one Gauss point's geometric (initial-stress) term into the upper
+// triangle of Ke (block-diagonal in the direction index). For nodes a,b the scalar
+//   senergy = g_a · σ · g_b
+// is placed on the three matching translational DOF pairs (3a+i, 3b+i). Mirrors
+// accumulate_ktangent's upper-triangle-only fill so mirror_upper completes it.
+void accumulate_kgeo(const std::array<std::array<Real, 3>, kMaxNodes>& g, int n,
+                     const Voigt6& s, Real scale, std::vector<Real>& Ke) {
+  const int ndof = n * kDofsPerNode;
+  for (int a = 0; a < n; ++a) {
+    const Real* ga = g[static_cast<std::size_t>(a)].data();
+    for (int b = a; b < n; ++b) {
+      const Real* gb = g[static_cast<std::size_t>(b)].data();
+      // senergy = σxx gax gbx + σyy gay gby + σzz gaz gbz
+      //         + σxy(gax gby + gay gbx) + σxz(gax gbz + gaz gbx)
+      //         + σyz(gay gbz + gaz gby).
+      const Real senergy =
+          s[0] * ga[0] * gb[0] + s[1] * ga[1] * gb[1] + s[2] * ga[2] * gb[2] +
+          s[3] * (ga[0] * gb[1] + ga[1] * gb[0]) +
+          s[4] * (ga[0] * gb[2] + ga[2] * gb[0]) +
+          s[5] * (ga[1] * gb[2] + ga[2] * gb[1]);
+      const Real v = scale * senergy;
+      for (int d = 0; d < kDofsPerNode; ++d) {
+        const int ia = a * kDofsPerNode + d, ib = b * kDofsPerNode + d;
+        // Only the upper triangle (ib >= ia holds for b > a; for a == b the three
+        // diagonal pairs are all upper-or-diagonal).
+        if (ib >= ia)
+          Ke[static_cast<std::size_t>(ia) * static_cast<std::size_t>(ndof) +
+             static_cast<std::size_t>(ib)] += v;
+      }
+    }
+  }
+}
+
 // Mirror the upper triangle of an ndof x ndof row-major matrix to the lower.
 void mirror_upper(int ndof, std::vector<Real>& Ke) {
   for (int a = 0; a < ndof; ++a)
@@ -795,6 +828,29 @@ std::vector<Real> element_mass_lumped(ElementType type, std::span<const Vec3> co
        static_cast<std::size_t>(i)] = row;
   }
   return Ml;
+}
+
+std::vector<Real> element_geometric_stiffness(ElementType type,
+                                              std::span<const Vec3> coords,
+                                              const std::vector<Voigt6>& gp_stress) {
+  const int n = nodes_per_element(type);
+  const int ndof = n * kDofsPerNode;
+  std::vector<Real> Ke(
+      static_cast<std::size_t>(ndof) * static_cast<std::size_t>(ndof), 0.0);
+  std::array<std::array<Real, 3>, kMaxNodes> g{};
+
+  const auto rule = gauss_rule(type);
+  for (std::size_t q = 0; q < rule.size(); ++q) {
+    const GaussPoint& gp = rule[q];
+    const Shape s = shape(type, gp.xi, gp.et, gp.ze);
+    const Real det = physical_gradients(s, coords, g);
+    // A missing / zero stress entry contributes nothing, so a zero field -> zero Ke.
+    const Voigt6& sigma =
+        q < gp_stress.size() ? gp_stress[q] : Voigt6{};
+    accumulate_kgeo(g, n, sigma, det * gp.w, Ke);
+  }
+  mirror_upper(ndof, Ke);
+  return Ke;
 }
 
 ElasticIsoMaterial::ElasticIsoMaterial(const ElasticIso& props)

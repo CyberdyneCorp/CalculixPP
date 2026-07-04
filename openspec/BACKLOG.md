@@ -23,7 +23,11 @@ them, under `openspec/changes/archive/`.
 their own work when picked up:
 - **Geometric nonlinearity (NLGEOM):** finite-strain kinematics + geometric
   stiffness `K_geo`. Unblocks 1.6 and 4.3, and is a prerequisite for Phase-4
-  linear buckling.
+  linear buckling. **Partial (2026-07):** the LINEAR geometric (initial-stress)
+  `K_geo` slice shipped with `add-geometric-nonlinearity` (resolving Phase-4 row
+  2.2 `*BUCKLE`); finite-strain kinematics (`F`, Green-Lagrange, PK2, push-forward)
+  for 1.6 (`*STATIC, PERTURBATION`) and 4.3 (large-strain hyperelasticity) is still
+  the outstanding follow-on.
 - **Multi-step analysis:** ✅ RESOLVED (2026-07). `io::parse_inp_steps` splits a
   deck into one `Model` per `*STEP...*END STEP` block (state/loads/BCs/procedure/
   active-mask carried forward; OP=NEW resets per step; `*CHANGE SOLID SECTION`/
@@ -172,8 +176,8 @@ parallel-plate energy balance. See task 3.4 (`fem::build_cavity` /
 | Item | What's missing | Enabler needed | Baseline spec |
 |---|---|---|---|
 | **1.3 Sturm-sequence count check** | Missed/starved-mode verification via the inertia (Sturm sequence) of the shifted factorization — relevant now that the sparse Lanczos path (1.1) has landed and only extracts the lowest k modes. | An inertia/negative-eigenvalue count exposed from SciPP's sparse factorization (the eigsh robustness work in [SciPP#15](https://github.com/CyberdyneCorp/SciPP/issues/15) landed thick-restart + relative breakdown but not an inertia count — this needs a separate upstream ask). | `eigensolution` |
-| **1.6 / 2.3 Complex / damped modes** | The complex eigenproblem for `*COMPLEX FREQUENCY` (damping / friction-induced instability). | Complex eigensolve + damping/friction operator assembly. | `eigensolution`, `modal-and-buckling-analysis` |
-| **2.2 `*BUCKLE`** | Two-step prestress + geometric-stiffness eigenproblem `(K + λ K_geo) x = 0`. The eigensolution engine it consumes is in place. | Geometric stiffness `K_geo` (see the NLGEOM cross-cutting enabler). | `modal-and-buckling-analysis` |
+| **1.6 / 2.3 Complex / damped modes** (partial ✅) | PROPORTIONAL-damping `*COMPLEX FREQUENCY` is **shipped** (see the resolved note below): the quadratic eigenproblem `(λ²M + λC + K)x = 0` reduced onto the `*FREQUENCY` basis and solved as a small `2·nev` companion via `numpp::linalg::eig`. STILL MISSING: the gyroscopic **`*COMPLEX FREQUENCY, CORIOLIS`** (skew rotor-whirl operator `G_r`, `i·ω·G_r` coupling, rotor-speed/axis body load) and **`FLUTTER`** (complex applied force) — a different eigenproblem, rejected at parse time — and friction-induced instability. | Coriolis (skew, gyroscopic) operator + a rotor rotation body-load parser path; the complex applied-force (flutter) path. | `eigensolution`, `modal-and-buckling-analysis` |
+| **2.2 `*BUCKLE`** ✅ | RESOLVED (2026-07) by `add-geometric-nonlinearity` — the LINEAR geometric (initial-stress) stiffness `K_geo` (`element_geometric_stiffness` / `assemble_geometric_stiffness`, the `buckling=1` branch of `e_c3d.f`) + the two-step prestress driver (`numerics::solve_buckling`: linear static prestress → `recover_gauss_stress` → assemble `K`/`K_geo` → `extract_buckling_modes` on the pencil `(−K_geo, K)`, `λ = 1/θ`, positive ascending). The parser accepts `*BUCKLE`, and the CLI + Python bindings return the factors + mode shapes. Validated on stock `beamb`/`beamb2` (C3D20R Euler column, λ₁ = 48.15, λ₂ = 106.3 — all 10 factors match `beamb.dat.ref` to 6 digits). The SPARSE eigsh buckling path is gated on **SciPP#18** (target-selection for the smallest positive λ = 1/θ; dense path only until it lands); finite-strain NLGEOM (`F`/Green-Lagrange/PK2) + `*STATIC, PERTURBATION` (1.6) + large-strain (4.3) remain follow-on rows. | Geometric stiffness `K_geo` ✅ (linear slice) | `modal-and-buckling-analysis` |
 | **3.x `*DYNAMIC, EXPLICIT` + `*GREEN`** | Explicit central-difference direct dynamics (element wave-speed critical time step) and the `*GREEN` Green-function step. (IMPLICIT direct HHT-α dynamics — 3.1 / 3.2 / 3.3 — are shipped, see the resolved note below.) | Element critical-time-step estimate (explicit); unit-excitation response basis (`*GREEN`). | `dynamic-analysis` |
 | **4.3 Base-motion time histories / 4.4 `*GREEN`** | Full `*BASE MOTION` support-excitation TIME HISTORIES driving the transient (the effective-load builder `base_motion_load` and its `p_k = -Γ_k` projection are shipped; wiring a prescribed base-acceleration amplitude into the modal-dynamic march lands with a follow-up) and the `*GREEN` step. | — (builds on the shipped modal engine). | `dynamic-analysis` |
 | **6.x Cyclic symmetry** | Cyclic-symmetry sector complex eigenproblem (`*CYCLIC SYMMETRY MODEL`) + nodal-diameter mode selection (`*SELECT CYCLIC SYMMETRY MODES`). | Complex cyclic-symmetry constraints (a deferred `constraints` capability) + the complex eigensolve (1.6 / 2.3). | `constraints`, `modal-and-buckling-analysis` |
@@ -207,7 +211,27 @@ rescaling workaround was **removed**. The dense `O(n_free³)` M-Cholesky reducti
 to O(n³) by **NumPP#138** / v1.6.0) is retained as a small-problem fallback for the one
 case shift-invert cannot factor: a singular (K−σM) at σ=0 with rigid-body modes. The
 beam8f eigen-validation tests are no longer `slow` — they run in the default gate.
-Remaining eigen follow-ups: 1.3 (Sturm count) and 1.6/2.3 (complex modes).
+Remaining eigen follow-ups: 1.3 (Sturm count) and the gyroscopic slice of 1.6/2.3
+(`*COMPLEX FREQUENCY, CORIOLIS`/`FLUTTER`; the proportional-damping complex-modes slice
+is resolved below).
+
+Resolved (2026-07): **Damped complex modes — `*COMPLEX FREQUENCY` (proportional
+damping, option B).** `numerics::extract_complex_modes` reduces the quadratic
+eigenproblem `(λ²M + λC + K)x = 0` onto the mass-normalized `*FREQUENCY` basis Φ
+(`ΦᵀMΦ = I`, `ΦᵀKΦ = Λ`), forms the reduced `(λ²I + λC_r + Λ)q = 0` with the DIAGONAL
+proportional `C_r,kk = 2 ζ_k ω_k` (reusing `Damping::ratio`), linearizes to the real
+`2·nev` companion `A = [[0,I],[-Λ,-C_r]]`, and solves it with `numpp::linalg::eig`. Each
+mode reports the complex eigenvalue, damped/undamped angular frequency, damping ratio,
+decay rate, and complex mode shape. `*COMPLEX FREQUENCY` parses (mode count; requires a
+preceding `*FREQUENCY`), auto-dispatches from the CLI and Python. Validated ANALYTICALLY
+against the exact damped-SDOF closed form `λ = -ζω ± iω√(1-ζ²)`, `ζ = (α/ω + β·ω)/2` (~1e-8
+rel), the undamped `α=β=0` limit (reproduces the real `ω` with `ζ=0`), and a dense full
+`2n` state-space oracle `[[0,I],[-M⁻¹K,-M⁻¹C]]` cross-check. This is deliberately NOT a
+CalculiX-fidelity check: CalculiX `*COMPLEX FREQUENCY` solves the GYROSCOPIC (skew
+Coriolis) problem, a different eigenproblem; `CORIOLIS`/`FLUTTER` decks are **rejected** at
+parse time. The reduced-operator interface carries an (empty) skew/imaginary block so the
+future gyroscopic `G_r` plugs into the same linearization. See tasks
+`add-complex-modal-eigensolver`.
 
 Resolved (2026-07): **Phase-4 modal superposition dynamics — `*MODAL DYNAMIC` +
 `*STEADY STATE DYNAMICS` + damping (tasks 1.5 / 4.1 / 4.2 / 4.3).**

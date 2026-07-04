@@ -296,6 +296,40 @@ LinearSystem assemble_mass(const Model& model, bool lumped) {
   return sys;
 }
 
+LinearSystem assemble_geometric_stiffness(
+    const Model& model, const std::vector<std::vector<Voigt6>>& gp_stress) {
+  const Mesh& mesh = model.mesh;
+  LinearSystem sys;
+  build_dof_map(model, sys);
+  const Index n_free = sys.n_free;
+
+  const std::vector<bool> active = model.element_active_mask();
+  std::unordered_map<std::int64_t, Real> kmap;
+  std::vector<Index> nidx;
+  std::vector<Vec3> coords, ue;
+  std::vector<Real> dummy_rhs(static_cast<std::size_t>(n_free), 0.0);
+  const std::vector<Voigt6> empty_stress;
+
+  for (std::size_t e = 0; e < mesh.num_elements(); ++e) {
+    if (!active[e]) continue;  // *MODEL CHANGE, REMOVE: element carries no K_geo
+    const Element& elem = mesh.elements()[e];
+    const int n = nodes_per_element(elem.type);
+    gather(mesh, elem, n, nullptr, nidx, coords, ue);
+    // A zero (or missing) stress field yields a zero element matrix, so the buckling
+    // path is inert on a deck with no prestress.
+    const std::vector<Voigt6>& es =
+        e < gp_stress.size() ? gp_stress[e] : empty_stress;
+    const std::vector<Real> Kg =
+        element_geometric_stiffness(elem.type, coords, es);
+    // Scatter through the same congruence transform as the stiffness; the RHS side
+    // effect (eliminated-constant columns) is discarded — K_geo never drives a load.
+    scatter_tangent(Kg, n * kDofsPerNode, nidx, sys, n_free, kmap, dummy_rhs);
+  }
+
+  flush_coo(kmap, n_free, sys);
+  return sys;
+}
+
 // Build the MaterialModel for element `e` from the resolved per-element material data,
 // dispatching by constitutive kind (user material > plastic > hyperelastic > elastic).
 // `ndepvar` is set to the *DEPVAR count so the caller can size the state vectors.
