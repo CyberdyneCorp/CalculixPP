@@ -1,4 +1,5 @@
 #pragma once
+#include <complex>
 #include <cstddef>
 #include <optional>
 #include <vector>
@@ -16,6 +17,11 @@
 // generalized path is used for correctness+validation; a sparse shift-invert Lanczos
 // on SciPP's factorization is the scalable target (see the .cpp note).
 namespace cxpp::numerics {
+
+// The proportional-damping model (Rayleigh α/β + explicit modal ζ_k) that the complex
+// modal reduction projects onto the real basis. Defined in modal_dynamics.hpp; forward
+// declared here to avoid a circular include (that header includes this one).
+struct Damping;
 
 // One extracted mode: its eigenvalue λ (= ω² for a *FREQUENCY problem), the derived
 // natural angular frequency ω = sqrt(λ) (rad/time) and cyclic frequency f = ω/(2π)
@@ -75,5 +81,59 @@ struct Participation {
 // the same M passed to extract_modes.)
 Participation participation(const EigenBasis& basis, const fem::LinearSystem& M,
                             int dir);
+
+// ---------------------------------------------------------------------------
+// Damped complex modes (*COMPLEX FREQUENCY, proportional damping — option B).
+// ---------------------------------------------------------------------------
+
+// One damped complex mode of (λ²M + λC + K)x = 0. For proportional (Rayleigh / modal)
+// damping the reduced problem is diagonal, so each mode has the exact SDOF closed form
+// λ = -ζω_n ± i ω_n √(1-ζ²). We keep the representative with Im(λ) ≥ 0 of each
+// conjugate pair. `omega_d` = |Im(λ)| (damped angular frequency), `omega_n` = |λ|
+// (undamped angular frequency), `zeta` = -Re(λ)/|λ| (>0 stable/decaying, <0 growing),
+// `frequency` = ω_d/(2π), `decay_rate` = Re(λ). The physical complex mode shape is
+// φ_c = Φ q (upper reduced block back to physical), split into real/imag full nodal
+// fields.
+struct ComplexMode {
+  std::complex<Real> eigenvalue{0.0, 0.0};  // λ
+  Real omega_d{0.0};                        // |Im(λ)| — damped angular frequency
+  Real omega_n{0.0};                        // |λ|     — undamped angular frequency
+  Real zeta{0.0};                           // -Re(λ)/|λ| — damping ratio
+  Real frequency{0.0};                      // ω_d / (2π) — damped cyclic frequency
+  Real decay_rate{0.0};                     // Re(λ)   — real part (decay if <0)
+  std::vector<Vec3> shape_real;             // Re(φ_c) full nodal field
+  std::vector<Vec3> shape_imag;             // Im(φ_c) full nodal field
+};
+
+// Result of the damped complex-mode reduction: the complex modes (ascending |λ|) and
+// the free-DOF count of the underlying system.
+struct ComplexEigenBasis {
+  std::vector<ComplexMode> modes;
+  Index n_free{0};
+};
+
+// Reduce the proportional damping operator onto the real mass-normalized eigenbasis
+// `real_basis` (Φᵀ M Φ = I, Φᵀ K Φ = Λ = diag(ω_k²)) and extract the lowest
+// `num_modes` damped complex modes. Forms the reduced quadratic (λ²I + λC_r + Λ)q = 0
+// with C_r = Φᵀ C Φ (diagonal α + β·ω_k² for Rayleigh, overridden by 2·ζ_k·ω_k where
+// modal ratios are set), linearizes to the real 2·nev companion A = [[0,I],[-Λ,-C_r]],
+// and solves it with numpp::linalg::eig. This is the proportional-damping option-(B)
+// path: it is EXACT for proportional damping (diagonal C_r) and is explicitly NOT the
+// CalculiX CORIOLIS gyroscopic problem (a skew G_r with an i·ω coupling — a different
+// eigenproblem). The reduced-operator assembly carries an (empty here) skew/imaginary
+// block so a future gyroscopic G_r plugs into the same linearization without redesign.
+ComplexEigenBasis extract_complex_modes(const EigenBasis& real_basis,
+                                        const Damping& damping, std::size_t num_modes);
+
+// Guarded small-problem dense oracle for cross-validation only: solve the full physical
+// 2n state-space companion [[0,I],[-M⁻¹K,-M⁻¹C]] with numpp::linalg::eig, where
+// C = αM + βK is the Rayleigh damping of `damping` (modal ratios are ignored — this
+// oracle validates the Rayleigh reduction). Throws if n_free exceeds kDenseComplexMaxDof
+// or if the modal-ratio path is requested. Returns the same post-processed complex modes
+// (ascending |λ|, Im(λ) ≥ 0) so the modal-reduced result can be compared entry-for-entry.
+ComplexEigenBasis extract_complex_modes_dense(const fem::LinearSystem& K,
+                                              const fem::LinearSystem& M,
+                                              const Damping& damping,
+                                              std::size_t num_modes);
 
 }  // namespace cxpp::numerics

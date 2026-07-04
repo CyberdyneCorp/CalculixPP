@@ -273,6 +273,8 @@ class Parser {
       begin_modal_dynamic(line);
     } else if (card_ == "*STEADYSTATEDYNAMICS") {
       begin_steady_state_dynamics(line);
+    } else if (card_ == "*COMPLEXFREQUENCY") {
+      begin_complex_frequency(line);
     } else if (card_ == "*DAMPING") {
       begin_damping(line);
     } else if (card_ == "*MODALDAMPING") {
@@ -451,9 +453,6 @@ class Parser {
          "linear buckling — deferred; needs the geometric stiffness K_geo "
          "(geometric nonlinearity / NLGEOM). The eigensolution engine it consumes "
          "is in place (Phase-4 tasks 2.2)"},
-        {"*COMPLEXFREQUENCY",
-         "complex / damped modes — deferred; needs a complex eigensolve plus the "
-         "damping/friction operator assembly (Phase-4 tasks 1.6 / 2.3)"},
         {"*CYCLICSYMMETRYMODEL",
          "cyclic-symmetry sector eigenproblem — deferred; needs complex "
          "cyclic-symmetry constraints and the complex eigensolve (Phase-4 tasks 6.1)"},
@@ -604,6 +603,44 @@ class Parser {
     if (f.size() > 2 && !f[2].empty())
       model_.steady_num_points = static_cast<int>(to_double(f[2], line));
     if (model_.steady_num_points <= 0) model_.steady_num_points = 20;
+  }
+
+  // *COMPLEX FREQUENCY: damped complex modes over a preceding *FREQUENCY basis (spec:
+  // modal-and-buckling-analysis — complex frequency). This slice ships the option-(B)
+  // proportional-damping reduction only. CORIOLIS (the gyroscopic skew operator + rotor
+  // rotation body load) and FLUTTER (a complex applied force) are a DIFFERENT eigenproblem
+  // that needs input this deck does not carry — rather than silently mis-solve them with
+  // the wrong physics, they are rejected here with an explicit "not yet implemented"
+  // (grounded: CalculiX complexfrequencys.f:86-92 errors unless CORIOLIS or FLUTTER is
+  // present, and CORIOLIS consumes a rotation body load via xbody). The keyword-less
+  // (or PROPORTIONAL) card drives the shipped path. The data line = number of complex
+  // modes. `line` uniform.
+  void begin_complex_frequency(int line) {
+    model_.procedure = Procedure::ComplexFrequency;
+    if (params_.count("CORIOLIS") != 0) {
+      model_.complex_freq_type = Model::ComplexFrequencyType::Coriolis;
+      throw ParseError(line,
+                       "*COMPLEX FREQUENCY, CORIOLIS is not yet implemented: the "
+                       "gyroscopic (skew) Coriolis operator and its rotor rotation body "
+                       "load are not available; only proportional-damping complex modes "
+                       "are supported");
+    }
+    if (params_.count("FLUTTER") != 0) {
+      model_.complex_freq_type = Model::ComplexFrequencyType::Flutter;
+      throw ParseError(line,
+                       "*COMPLEX FREQUENCY, FLUTTER is not yet implemented: the complex "
+                       "applied-force (flutter) path is not available; only "
+                       "proportional-damping complex modes are supported");
+    }
+    model_.complex_freq_type = Model::ComplexFrequencyType::Proportional;
+  }
+  // *COMPLEX FREQUENCY data line: "N[, ...]" — number of complex modes requested.
+  // Defaults to 1 when blank (defensive; CalculiX requires N).
+  void complex_frequency_data(const std::vector<std::string>& f, int line) {
+    const int n = (f.empty() || f[0].empty())
+                      ? 1
+                      : std::max(1, static_cast<int>(to_double(f[0], line)));
+    model_.num_complex_modes = n;
   }
 
   // *DAMPING, ALPHA=, BETA=: Rayleigh (proportional) damping C = alpha M + beta K
@@ -1398,8 +1435,8 @@ class Parser {
         "*DFLUX", "*TEMPERATURE", "*FILM", "*RADIATE", "*INITIALCONDITIONS",
         "*FREQUENCY",
         // Dynamics (Phase 4) data cards with a data line.
-        "*DYNAMIC", "*MODALDYNAMIC", "*STEADYSTATEDYNAMICS", "*MODALDAMPING",
-        "*BASEMOTION", "*RETAINEDNODALDOFS",
+        "*DYNAMIC", "*MODALDYNAMIC", "*STEADYSTATEDYNAMICS", "*COMPLEXFREQUENCY",
+        "*MODALDAMPING", "*BASEMOTION", "*RETAINEDNODALDOFS",
         "*COUPLEDTEMPERATURE-DISPLACEMENT", "*COUPLEDTEMPERATUREDISPLACEMENT"};
     return std::find(data_cards.begin(), data_cards.end(), card_) != data_cards.end();
   }
@@ -1433,6 +1470,7 @@ class Parser {
     if (card_ == "*DYNAMIC") return modal_dynamic_data(f, line);  // "dt, t_end"
     if (card_ == "*MODALDYNAMIC") return modal_dynamic_data(f, line);
     if (card_ == "*STEADYSTATEDYNAMICS") return steady_state_data(f, line);
+    if (card_ == "*COMPLEXFREQUENCY") return complex_frequency_data(f, line);
     if (card_ == "*MODALDAMPING") return modal_damping_data(f, line);
     if (card_ == "*BASEMOTION") return base_motion_data(f, line);
     if (card_ == "*RETAINEDNODALDOFS") return retained_nodal_dofs_data(f, line);
@@ -2026,12 +2064,14 @@ void validate_preceding_frequency(const std::vector<Model>& steps) {
   for (std::size_t i = 0; i < steps.size(); ++i) {
     const Procedure p = steps[i].procedure;
     const bool needs_basis = p == Procedure::ModalDynamic ||
-                             p == Procedure::SteadyStateDynamics;
+                             p == Procedure::SteadyStateDynamics ||
+                             p == Procedure::ComplexFrequency;
     if (needs_basis && !saw_frequency)
       throw std::runtime_error(
           "step " + std::to_string(i + 1) +
-          " (*MODAL DYNAMIC / *STEADY STATE DYNAMICS) requires a preceding *FREQUENCY "
-          "step in the same job that produced the eigenmodes (none found)");
+          " (*MODAL DYNAMIC / *STEADY STATE DYNAMICS / *COMPLEX FREQUENCY) requires a "
+          "preceding *FREQUENCY step in the same job that produced the eigenmodes (none "
+          "found)");
     if (p == Procedure::Frequency) saw_frequency = true;
   }
 }

@@ -2470,17 +2470,46 @@ def test_api_parity_phase4():
     for key in ("frequency", "amplitude", "phase"):
         assert key in ss, f"steady-state result missing '{key}'"
 
+    # *COMPLEX FREQUENCY (proportional damping): damped complex modes -> eigenvalues,
+    # damped frequencies, damping ratios, complex mode shapes. The single reduced mode of
+    # this SDOF equals the exact closed form λ = -ζω ± iω√(1-ζ²), ζ = (α/ω + β·ω)/2.
+    alpha, beta = 0.5, 0.002
+    cxf = cx.solve_text(
+        _sdof_deck(k, mass, "*COMPLEX FREQUENCY\n1",
+                   damping=f"*DAMPING,ALPHA={alpha},BETA={beta}\n"))
+    assert cxf["procedure"] == "complex frequency"
+    for key in ("eigenvalues_real", "eigenvalues_imag", "damped_frequencies",
+                "damping_ratios", "omega_n", "mode_shapes_real", "mode_shapes_imag"):
+        assert key in cxf, f"complex-frequency result missing '{key}'"
+    zeta = 0.5 * (alpha / omega + beta * omega)
+    assert abs(cxf["damping_ratios"][0] - zeta) < 1e-8
+    assert abs(cxf["omega_n"][0] - omega) < 1e-7 * omega
+    assert abs(cxf["eigenvalues_real"][0] - (-zeta * omega)) < 1e-7 * omega
+    assert abs(cxf["eigenvalues_imag"][0]
+               - omega * math.sqrt(1.0 - zeta * zeta)) < 1e-7 * omega
+
+    # *COMPLEX FREQUENCY, CORIOLIS / FLUTTER are a DIFFERENT (gyroscopic / complex-force)
+    # eigenproblem needing input this deck lacks — rejected, never silently mis-solved.
+    for kw in ("CORIOLIS", "FLUTTER"):
+        with pytest.raises(RuntimeError) as ei:
+            cx.solve_text(_sdof_deck(k, mass, f"*COMPLEX FREQUENCY,{kw}\n1"))
+        msg = str(ei.value)
+        assert kw in msg and "not yet implemented" in msg, \
+            f"*COMPLEX FREQUENCY,{kw} -> unclear error: {ei.value}"
+
     # summary()/summary_text() report each dynamics procedure WITHOUT solving.
     assert cx.summary_text(_sdof_deck(k, mass, "*FREQUENCY\n1"))["procedure"] == \
         "frequency"
     assert cx.summary_text(
         _sdof_deck(k, mass, f"*DYNAMIC\n{period/50},{period}"))["procedure"] == \
         "dynamic"
+    assert cx.summary_text(
+        _sdof_deck(k, mass, "*COMPLEX FREQUENCY\n1"))["procedure"] == \
+        "complex frequency"
 
     # Every BLOCKED Phase-4 card raises an actionable error naming its deferral.
     blocked = [
         ("*BUCKLE\n5", "buckling"),
-        ("*COMPLEX FREQUENCY\n5", "complex"),
         ("*GREEN", "green-function"),
     ]
     for step_card, needle in blocked:

@@ -198,6 +198,39 @@ int main(int argc, char** argv) {
       return 0;
     }
 
+    // A *COMPLEX FREQUENCY deck extracts damped complex modes by reducing the proportional
+    // (Rayleigh / modal) damping onto the *FREQUENCY basis and solving the small companion
+    // pencil (spec: modal-and-buckling — complex frequency; option-(B) proportional
+    // damping, NOT CalculiX CORIOLIS). Prints per-mode damped frequency, damping ratio,
+    // decay rate, and stability.
+    if (model.procedure == Procedure::ComplexFrequency) {
+      const std::size_t nreq =
+          model.num_complex_modes > 0
+              ? static_cast<std::size_t>(model.num_complex_modes)
+              : 1;
+      const fem::LinearSystem K = fem::assemble_linear_static(model);
+      const fem::LinearSystem M = fem::assemble_mass(model, /*lumped=*/false);
+      const numerics::EigenBasis basis = numerics::extract_modes(K, M, nreq);
+      numerics::Damping damp;
+      damp.alpha = model.rayleigh.alpha;
+      damp.beta = model.rayleigh.beta;
+      damp.modal_ratios = model.modal_damping;
+      const numerics::ComplexEigenBasis cx =
+          numerics::extract_complex_modes(basis, damp, nreq);
+      std::printf("CalculiX++  %s  (complex frequency: %zu modes)\n", input.c_str(),
+                  cx.modes.size());
+      std::printf("  nodes=%zu  elements=%zu\n", model.mesh.num_nodes(),
+                  model.mesh.num_elements());
+      std::printf(
+          "  MODE   DAMPED FREQ f_d   DAMPING RATIO z   DECAY RATE Re(l)   STABILITY\n");
+      for (std::size_t i = 0; i < cx.modes.size(); ++i) {
+        const numerics::ComplexMode& md = cx.modes[i];
+        std::printf("  %4zu   %.7e   %+.7e   %+.7e   %s\n", i + 1, md.frequency, md.zeta,
+                    md.decay_rate, md.zeta > 0.0 ? "stable" : "unstable");
+      }
+      return 0;
+    }
+
     // A *DYNAMIC deck runs direct HHT-α time integration of M a + C v + K u = f(t) in
     // physical coordinates (spec: dynamic-analysis — direct dynamics). The CLI prints the
     // transient peak displacement and the energy drift over the run; the Python bindings

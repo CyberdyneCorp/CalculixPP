@@ -2,11 +2,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <complex>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
+#include "calculixpp/numerics/modal_dynamics.hpp"
 #include "numpp/core/creation.hpp"
 #include "numpp/core/dtype.hpp"
 #include "numpp/core/ndarray.hpp"
@@ -225,6 +227,88 @@ EigenBasis extract_modes(const Model& model, std::size_t num_modes, Real shift) 
   return extract_modes(K, M, num_modes, shift);
 }
 
+namespace {
+
+// Above this free-DOF count the dense 2n complex oracle (O((2n)³) eig) is too costly;
+// it is a validation cross-check only, never a production path.
+constexpr std::int64_t kDenseComplexMaxDof = 400;
+
+// Reduced quadratic-eigenproblem operator in modal (mass-normalized) coordinates:
+// (λ²I + λ C_r + Λ) q = 0, plus an OPTIONAL skew block with an imaginary ω-coupling so a
+// future gyroscopic G_r (skew, i·ω·G_r) plugs into the same linearization without
+// redesign. `lambda` is Λ = diag(ω_k²); `c_r` is the symmetric reduced damping (row-major
+// nev×nev, diagonal for proportional damping); `skew_imag` is the skew imaginary block
+// (empty for the option-(B) proportional path). Sizes are nev (= number of real modes).
+struct ReducedQuadratic {
+  std::size_t nev{0};
+  std::vector<Real> lambda;      // Λ diagonal (size nev)
+  std::vector<Real> c_r;         // symmetric damping block (nev*nev), row-major
+  std::vector<Real> skew_imag;   // skew imaginary block (empty for option B)
+
+  bool has_skew() const { return !skew_imag.empty(); }
+};
+
+// A post-processed complex mode without a shape: the eigenvalue and its derived damped
+// frequency / damping ratio, plus the reduced eigenvector's upper block q (size nev) so
+// the caller can recombine the physical shape. Kept representative has Im(λ) ≥ 0.
+struct RawComplexMode {
+  std::complex<Real> eigenvalue;
+  std::vector<std::complex<Real>> q;  // upper nev block of the companion eigenvector
+};
+
+// Fill a ComplexMode's derived scalars from λ (shape is filled by the caller). Overdamped
+// real roots (Im(λ)=0) are reported with ω_d = 0 (ζ ≥ 1), not dropped.
+void fill_derived(ComplexMode& mode, std::complex<Real> lam) {
+  mode.eigenvalue = lam;
+  mode.omega_d = std::abs(lam.imag());
+  mode.omega_n = std::abs(lam);
+  mode.decay_rate = lam.real();
+  mode.zeta = mode.omega_n > 0.0 ? -lam.real() / mode.omega_n : 0.0;
+  mode.frequency = mode.omega_d / (2.0 * M_PI);
+}
+
+// Solve the real 2·nev companion A = [[0, I], [-Λ, -C_r]] with numpp::linalg::eig, keep
+// one representative (Im(λ) ≥ 0) per conjugate pair, sort ascending by |λ|, and return the
+// lowest `num_modes` with their upper-block reduced eigenvectors q. The skew imaginary
+// block, when present, would make A complex (A += i·[[0,0],[-G,0]]) — not populated on the
+// option-(B) path, but the assembly point is here for the future gyroscopic operator.
+std::vector<RawComplexMode> solve_companion(const ReducedQuadratic& op,
+                                            std::size_t num_modes) {
+  const std::int64_t nev = static_cast<std::int64_t>(op.nev);
+  const std::int64_t n2 = 2 * nev;
+  numpp::ndarray A = numpp::zeros({n2, n2}, numpp::kFloat64);
+  for (std::int64_t i = 0; i < nev; ++i) {
+    A.set_item<double>({i, nev + i}, 1.0);                       // upper-right I
+    A.set_item<double>({nev + i, i}, -op.lambda[static_cast<std::size_t>(i)]);  // -Λ
+    for (std::int64_t j = 0; j < nev; ++j)
+      A.set_item<double>({nev + i, nev + j},
+                         -op.c_r[static_cast<std::size_t>(i * nev + j)]);  // -C_r
+  }
+
+  const numpp::linalg::EigResult eig = numpp::linalg::eig(A);
+  // Collect one representative per conjugate pair (Im ≥ 0), each with its upper block q.
+  std::vector<RawComplexMode> raw;
+  raw.reserve(static_cast<std::size_t>(n2));
+  for (std::int64_t c = 0; c < n2; ++c) {
+    const std::complex<double> lam = eig.eigenvalues.item<std::complex<double>>({c});
+    if (lam.imag() < 0.0) continue;  // keep the Im ≥ 0 representative of each pair
+    RawComplexMode m;
+    m.eigenvalue = lam;
+    m.q.resize(op.nev);
+    for (std::int64_t r = 0; r < nev; ++r)
+      m.q[static_cast<std::size_t>(r)] =
+          eig.eigenvectors.item<std::complex<double>>({r, c});  // upper nev block
+    raw.push_back(std::move(m));
+  }
+  std::sort(raw.begin(), raw.end(), [](const RawComplexMode& a, const RawComplexMode& b) {
+    return std::abs(a.eigenvalue) < std::abs(b.eigenvalue);
+  });
+  if (raw.size() > num_modes) raw.resize(num_modes);
+  return raw;
+}
+
+}  // namespace
+
 Participation participation(const EigenBasis& basis, const fem::LinearSystem& M,
                             int dir) {
   Participation out;
@@ -254,6 +338,124 @@ Participation participation(const EigenBasis& basis, const fem::LinearSystem& M,
     out.factor.push_back(g);
     out.effective_mass.push_back(g * g);  // mass-normalized -> m_eff = Γ²
     out.total_effective_mass += g * g;
+  }
+  return out;
+}
+
+ComplexEigenBasis extract_complex_modes(const EigenBasis& real_basis,
+                                        const Damping& damping, std::size_t num_modes) {
+  const std::size_t nev = real_basis.modes.size();
+  if (nev == 0) throw std::runtime_error("extract_complex_modes: empty real basis");
+  if (num_modes == 0 || num_modes > nev) num_modes = nev;
+
+  // Reduced quadratic operator on the mass-normalized basis: Λ = diag(ω_k²), and the
+  // DIAGONAL proportional C_r,kk = 2 ζ_k ω_k with ζ_k from the shared Damping::ratio (so
+  // this path is consistent with modal dynamics). The skew imaginary block stays empty
+  // (option B); a future gyroscopic G_r would populate it.
+  ReducedQuadratic op;
+  op.nev = nev;
+  op.lambda.resize(nev);
+  op.c_r.assign(nev * nev, 0.0);
+  for (std::size_t k = 0; k < nev; ++k) {
+    const Real omega = real_basis.modes[k].omega;
+    op.lambda[k] = omega * omega;
+    op.c_r[k * nev + k] = 2.0 * damping.ratio(k, omega) * omega;  // 2 ζ_k ω_k
+  }
+
+  const std::vector<RawComplexMode> raw = solve_companion(op, num_modes);
+
+  // Recombine the physical complex mode φ_c = Φ q (real and imaginary parts separately)
+  // and expand each part through the constraint transform, mirroring the real *FREQUENCY
+  // shape expansion.
+  const fem::LinearSystem& K = real_basis.stiffness;
+  const std::int64_t nfree = static_cast<std::int64_t>(real_basis.n_free);
+  const std::size_t n_nodes =
+      K.dof_eq.size() / static_cast<std::size_t>(kDofsPerNode);
+
+  ComplexEigenBasis out;
+  out.n_free = real_basis.n_free;
+  out.modes.reserve(raw.size());
+  for (const RawComplexMode& rm : raw) {
+    std::vector<Real> phi_re(static_cast<std::size_t>(nfree), 0.0);
+    std::vector<Real> phi_im(static_cast<std::size_t>(nfree), 0.0);
+    for (std::size_t k = 0; k < nev; ++k) {
+      const std::vector<Real>& col = real_basis.mode_free[k];  // Φ column k (free DOFs)
+      const Real qr = rm.q[k].real(), qi = rm.q[k].imag();
+      for (std::size_t i = 0; i < col.size(); ++i) {
+        phi_re[i] += col[i] * qr;
+        phi_im[i] += col[i] * qi;
+      }
+    }
+    ComplexMode mode;
+    fill_derived(mode, rm.eigenvalue);
+    mode.shape_real = expand_shape(K, phi_re, n_nodes);
+    mode.shape_imag = expand_shape(K, phi_im, n_nodes);
+    out.modes.push_back(std::move(mode));
+  }
+  return out;
+}
+
+ComplexEigenBasis extract_complex_modes_dense(const fem::LinearSystem& K,
+                                              const fem::LinearSystem& M,
+                                              const Damping& damping,
+                                              std::size_t num_modes) {
+  if (!damping.modal_ratios.empty())
+    throw std::runtime_error(
+        "extract_complex_modes_dense: the dense oracle validates Rayleigh damping only "
+        "(modal ratios have no physical C = αM + βK form)");
+  const std::int64_t n = static_cast<std::int64_t>(K.n_free);
+  if (n > kDenseComplexMaxDof)
+    throw std::runtime_error(
+        "extract_complex_modes_dense: n_free=" + std::to_string(n) +
+        " exceeds the dense-oracle cap (" + std::to_string(kDenseComplexMaxDof) +
+        "); it is a small-problem cross-check only");
+  if (num_modes == 0 || static_cast<std::int64_t>(num_modes) > n)
+    num_modes = static_cast<std::size_t>(n);
+
+  // Dense physical operators, C = αM + βK (Rayleigh). Full 2n state-space companion
+  // [[0, I], [-M⁻¹K, -M⁻¹C]] fed to numpp::linalg::eig — the same eigenproblem the modal
+  // reduction approximates, at full physical scale (small n only).
+  const numpp::ndarray Kd = dense_from_system(K);
+  const numpp::ndarray Md = dense_from_system(M);
+  numpp::ndarray Cd = numpp::zeros({n, n}, numpp::kFloat64);
+  for (std::int64_t i = 0; i < n; ++i)
+    for (std::int64_t j = 0; j < n; ++j)
+      Cd.set_item<double>({i, j}, damping.alpha * Md.item<double>({i, j}) +
+                                      damping.beta * Kd.item<double>({i, j}));
+  const numpp::ndarray Minv = numpp::linalg::inv(Md);
+  const numpp::ndarray MiK = numpp::dot(Minv, Kd);  // M⁻¹K
+  const numpp::ndarray MiC = numpp::dot(Minv, Cd);  // M⁻¹C
+
+  const std::int64_t n2 = 2 * n;
+  numpp::ndarray A = numpp::zeros({n2, n2}, numpp::kFloat64);
+  for (std::int64_t i = 0; i < n; ++i) {
+    A.set_item<double>({i, n + i}, 1.0);  // upper-right I
+    for (std::int64_t j = 0; j < n; ++j) {
+      A.set_item<double>({n + i, j}, -MiK.item<double>({i, j}));      // -M⁻¹K
+      A.set_item<double>({n + i, n + j}, -MiC.item<double>({i, j}));  // -M⁻¹C
+    }
+  }
+
+  const numpp::linalg::EigResult eig = numpp::linalg::eig(A);
+  std::vector<std::complex<Real>> lams;
+  lams.reserve(static_cast<std::size_t>(n2));
+  for (std::int64_t c = 0; c < n2; ++c) {
+    const std::complex<double> lam = eig.eigenvalues.item<std::complex<double>>({c});
+    if (lam.imag() >= 0.0) lams.push_back(lam);  // one per conjugate pair
+  }
+  std::sort(lams.begin(), lams.end(),
+            [](std::complex<Real> a, std::complex<Real> b) {
+              return std::abs(a) < std::abs(b);
+            });
+  if (lams.size() > num_modes) lams.resize(num_modes);
+
+  ComplexEigenBasis out;
+  out.n_free = K.n_free;
+  out.modes.reserve(lams.size());
+  for (std::complex<Real> lam : lams) {
+    ComplexMode mode;
+    fill_derived(mode, lam);  // shape omitted — the oracle validates eigenvalues only
+    out.modes.push_back(std::move(mode));
   }
   return out;
 }
