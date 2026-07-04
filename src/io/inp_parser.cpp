@@ -267,6 +267,8 @@ class Parser {
       begin_heat_transfer(line);
     } else if (card_ == "*FREQUENCY") {
       begin_frequency(line);
+    } else if (card_ == "*BUCKLE") {
+      begin_buckle(line);
     } else if (card_ == "*DYNAMIC") {
       begin_dynamic(line);
     } else if (card_ == "*MODALDYNAMIC") {
@@ -449,10 +451,6 @@ class Parser {
         // Phase-4 procedure cards blocked on a missing enabler (documented in
         // openspec/BACKLOG.md Phase-4). The eigensolution/dynamics engines they
         // would consume are in place; each names the enabler it waits on.
-        {"*BUCKLE",
-         "linear buckling — deferred; needs the geometric stiffness K_geo "
-         "(geometric nonlinearity / NLGEOM). The eigensolution engine it consumes "
-         "is in place (Phase-4 tasks 2.2)"},
         {"*CYCLICSYMMETRYMODEL",
          "cyclic-symmetry sector eigenproblem — deferred; needs complex "
          "cyclic-symmetry constraints and the complex eigensolve (Phase-4 tasks 6.1)"},
@@ -562,6 +560,23 @@ class Parser {
       model_.substructure_modes = n;
     else
       model_.num_eigenvalues = n;
+  }
+
+  // *BUCKLE: linear-buckling analysis (spec: input-deck-parsing — *BUCKLE). Selects the
+  // buckling procedure; the data line gives the number of buckling factors requested
+  // (first field), as *FREQUENCY records num_eigenvalues. The trailing ARPACK-style
+  // accuracy / subspace / iteration fields (e.g. the `1.e-2` in `10, 1.e-2`) are
+  // recognized but do not affect the model. `line` keeps the handler signature uniform.
+  void begin_buckle(int /*line*/) { model_.procedure = Procedure::Buckling; }
+
+  // *BUCKLE data line: "N[, accuracy, ncv, maxiter]" — number of buckling modes (first
+  // field). Defaults to 1 when blank. The trailing ARPACK-style fields are accepted and
+  // ignored (the dense engine returns the lowest N positive factors regardless).
+  void buckle_data(const std::vector<std::string>& f, int line) {
+    model_.num_buckling_modes =
+        (f.empty() || f[0].empty())
+            ? 1
+            : std::max(1, static_cast<int>(to_double(f[0], line)));
   }
 
   // *DYNAMIC[, DIRECT][, ALPHA=][, NLGEOM]: direct time integration of the equations of
@@ -1467,6 +1482,7 @@ class Parser {
     if (card_ == "*STATIC") return static_data(f, line);
     if (card_ == "*HEATTRANSFER") return static_data(f, line);  // same inc data line
     if (card_ == "*FREQUENCY") return frequency_data(f, line);
+    if (card_ == "*BUCKLE") return buckle_data(f, line);
     if (card_ == "*DYNAMIC") return modal_dynamic_data(f, line);  // "dt, t_end"
     if (card_ == "*MODALDYNAMIC") return modal_dynamic_data(f, line);
     if (card_ == "*STEADYSTATEDYNAMICS") return steady_state_data(f, line);

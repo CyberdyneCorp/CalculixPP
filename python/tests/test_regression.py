@@ -2066,6 +2066,53 @@ def test_frequency_participation_beam8f():
         )
 
 
+def _parse_ref_buckling_factors(path):
+    """Parse a CalculiX .dat BUCKLING FACTOR OUTPUT block into a list of factors."""
+    factors = []
+    in_block = False
+    with open(path) as fh:
+        for line in fh:
+            if "BUCKLING" in line.upper():
+                in_block = True
+                continue
+            if not in_block:
+                continue
+            parts = line.split()
+            # A data row is "<mode> <factor>"; the header line "FACTOR" has one token.
+            if len(parts) == 2:
+                try:
+                    factors.append((int(parts[0]), float(parts[1])))
+                except ValueError:
+                    continue
+    return factors
+
+
+def test_buckling_beamb_matches_calculix():
+    """(9.3) The stock *BUCKLE cantilever beamb (C3D20R Euler column) reproduces the
+    reference .dat.ref buckling factors (lambda1 = 48.15, lambda2 = 106.3, ...) through
+    the Python bindings — the two-step prestress driver + dense generalized buckling
+    extractor validated against stock CalculiX. (add-geometric-nonlinearity.)"""
+    inp = os.path.join(CCX_TEST, "beamb.inp")
+    ref_path = os.path.join(CCX_TEST, "beamb.dat.ref")
+    if not (os.path.exists(inp) and os.path.exists(ref_path)):
+        pytest.skip("beamb reference deck not available")
+    import calculixpp
+    cx = calculixpp
+    res = cx.solve(inp)
+    assert res["procedure"] == "buckling"
+    ref = _parse_ref_buckling_factors(ref_path)
+    assert len(ref) == 10, f"expected 10 reference factors, got {len(ref)}"
+    fac = res["factors"]
+    assert len(fac) == 10
+    # Ascending positive.
+    for i in range(1, len(fac)):
+        assert float(fac[i]) > float(fac[i - 1]) > 0.0
+    # Documented relative tolerance ~1e-3 (matches beam8f frequency validation).
+    for i, (_mode, ref_fac) in enumerate(ref):
+        rel = abs(float(fac[i]) - ref_fac) / abs(ref_fac)
+        assert rel < 1e-3, f"factor {i+1} rel-err {rel:.2e} (got {fac[i]}, ref {ref_fac})"
+
+
 # --- Phase-4 modal superposition dynamics (tasks 1.5, 4.1, 4.2, 4.3) ----------
 # Validated ANALYTICALLY against the closed-form single-DOF oscillator: a grounded
 # SPRING1 (stiffness k on dof 1) plus a MASS m gives one mode ω = sqrt(k/m). This
@@ -2506,10 +2553,11 @@ def test_api_parity_phase4():
     assert cx.summary_text(
         _sdof_deck(k, mass, "*COMPLEX FREQUENCY\n1"))["procedure"] == \
         "complex frequency"
+    assert cx.summary_text(_sdof_deck(k, mass, "*BUCKLE\n5"))["procedure"] == \
+        "buckling"
 
     # Every BLOCKED Phase-4 card raises an actionable error naming its deferral.
     blocked = [
-        ("*BUCKLE\n5", "buckling"),
         ("*GREEN", "green-function"),
     ]
     for step_card, needle in blocked:

@@ -375,7 +375,6 @@ void test_blocked_phase4_cards_reject_clearly() {
     std::string needle;
   };
   const Case cases[] = {
-      {"*STEP\n*BUCKLE\n5\n*END STEP\n", "linear buckling"},
       {"*CYCLIC SYMMETRY MODEL, N=8\n1,2\n", "cyclic-symmetry"},
       {"*SELECT CYCLIC SYMMETRY MODES\n0,4\n", "nodal-diameter"},
       {"*STEP\n*GREEN\n*END STEP\n", "Green-function"},
@@ -385,6 +384,18 @@ void test_blocked_phase4_cards_reject_clearly() {
     CX_CHECK(throws_with(deck, c.needle));
     CX_CHECK(throws_with(deck, "deferred"));
   }
+}
+
+// (6.3) *BUCKLE is now implemented: the parser records Procedure::Buckling and the
+// requested mode count from the first data field, and the trailing ARPACK-style
+// tolerance field is accepted and ignored without error. (add-geometric-nonlinearity.)
+void test_buckle_card_parses() {
+  const char* sect = "*SOLID SECTION, ELSET=EALL, MATERIAL=M\n";
+  const std::string deck =
+      std::string(kMatHeader) + sect + "*STEP\n*BUCKLE\n10, 1.e-2\n*END STEP\n";
+  const Model m = io::parse_inp(deck);
+  CX_CHECK(m.procedure == Procedure::Buckling);
+  CX_CHECK(m.num_buckling_modes == 10);
 }
 
 // (6.1) The full Phase-2 IMPLEMENTED card set parses without crashing: connectors,
@@ -568,6 +579,7 @@ int main() {
   test_constraint_cards();
   test_deferred_cards_reject_clearly();
   test_blocked_phase4_cards_reject_clearly();
+  test_buckle_card_parses();
   test_phase2_card_sweep_parses();
   test_substructure_cards();
   test_preceding_frequency_required();

@@ -62,6 +62,25 @@ EigenBasis extract_modes(const fem::LinearSystem& K, const fem::LinearSystem& M,
 // *FREQUENCY.)
 EigenBasis extract_modes(const Model& model, std::size_t num_modes, Real shift = 0.0);
 
+// Extract the lowest `num_modes` linear-buckling factors of the pencil
+// (K + λ K_geo) φ = 0 (spec: modal-and-buckling-analysis — *BUCKLE). This is a
+// DEDICATED extractor, NOT extract_modes: the buckling eigenvalue is a load factor λ,
+// not ω², so there is no ≥0 clamp and no omega/frequency mapping — the returned Mode's
+// `eigenvalue` field holds λ (ascending POSITIVE), `omega`/`frequency` are left 0, and
+// `shape` is the buckling mode.
+//
+// The pencil is solved as (A = −K_geo, B = K) with B = K the SPD UNLOADED stiffness
+// (the classical linear-buckling anchor): Cholesky K = L Lᵀ, reduce to the standard
+// symmetric Â = L⁻¹(−K_geo)L⁻ᵀ, eigh(Â) → θ, back-transform φ = L⁻ᵀ z, map λ = 1/θ
+// (since (K + λ K_geo)φ = 0 ⟺ (−K_geo)φ = (1/λ) K φ, so θ = 1/λ). θ ≤ 0 (rigid-body /
+// near-null K_geo directions / load reversal) maps to λ ≤ 0 or λ → +∞ and is rejected;
+// only positive λ survive, sorted ascending. `K` and `Kgeo` must share the free-DOF
+// numbering (assemble both from one model). The DENSE generalized path is used; the
+// scalable sparse path is gated on upstream SciPP target-selection (SciPP#18).
+EigenBasis extract_buckling_modes(const fem::LinearSystem& K,
+                                  const fem::LinearSystem& Kgeo,
+                                  std::size_t num_modes);
+
 // Per-mode modal participation factors and modal effective mass for a rigid-body
 // excitation direction (spec: eigensolution — participation and effective mass). For
 // the mass-normalized mode φ_k and the unit rigid-body direction vector d (a nodal

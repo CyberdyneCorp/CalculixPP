@@ -9,6 +9,7 @@
 
 #include "calculixpp/io/inp_parser.hpp"
 #include "calculixpp/io/results_writer.hpp"
+#include "calculixpp/numerics/buckling.hpp"
 #include "calculixpp/numerics/direct_dynamics.hpp"
 #include "calculixpp/numerics/eigensolution.hpp"
 #include "calculixpp/numerics/heat_transfer.hpp"
@@ -138,6 +139,25 @@ int main(int argc, char** argv) {
       for (std::size_t i = 0; i < basis.modes.size(); ++i)
         std::printf("  %4zu   %.7e   %.7e\n", i + 1, basis.modes[i].eigenvalue,
                     basis.modes[i].frequency);
+      return 0;
+    }
+
+    // A *BUCKLE deck runs the two-step prestress driver: a linear static solve for the
+    // reference load, then the buckling pencil (K + λ K_geo) φ = 0. The CLI prints the
+    // BUCKLING FACTOR OUTPUT table (spec: modal-and-buckling — *BUCKLE).
+    if (model.procedure == Procedure::Buckling) {
+      const std::size_t nreq = model.num_buckling_modes > 0
+                                   ? static_cast<std::size_t>(model.num_buckling_modes)
+                                   : 1;
+      const numerics::BucklingReport rep = numerics::solve_buckling(model, nreq);
+      std::printf("CalculiX++  %s  (buckling: %zu factors)\n", input.c_str(),
+                  rep.factors.size());
+      std::printf("  nodes=%zu  elements=%zu\n", model.mesh.num_nodes(),
+                  model.mesh.num_elements());
+      std::printf("  BUCKLING FACTOR OUTPUT\n");
+      std::printf("  MODE NO   BUCKLING FACTOR\n");
+      for (std::size_t i = 0; i < rep.factors.size(); ++i)
+        std::printf("  %6zu    %.7e\n", i + 1, rep.factors[i]);
       return 0;
     }
 

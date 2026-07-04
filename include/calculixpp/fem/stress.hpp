@@ -23,6 +23,17 @@ std::vector<Real> internal_force(const Model& model, const std::vector<Vec3>& u)
 // resultsmech.f / extrapolate.f, not copied.)
 void recover_fields(const Model& model, StaticFields& fields);
 
+// Per-element per-integration-point reference stress (Voigt6 {xx,yy,zz,xy,xz,yz})
+// for a supplied full nodal displacement `u` (spec: geometric-stiffness — two-step
+// prestress driver). `out[e][q]` is the Gauss-point Cauchy stress of element e used
+// to feed assemble_geometric_stiffness. It shares the exact integration-point math as
+// recover_fields (same Gauss rule, same thermal-corrected σ = D (eps_mech - eps_th)),
+// factored out so the buckling prestress recovery reuses the shipped path; recover_fields
+// itself is left byte-identical. Deactivated elements (*MODEL CHANGE, REMOVE) get an
+// empty per-element vector. (ref: resultsini.f / resultsmech.f.)
+std::vector<std::vector<Voigt6>> recover_gauss_stress(const Model& model,
+                                                      const std::vector<Vec3>& u);
+
 // Plasticity-aware field recovery. Identical to recover_fields for elastic elements,
 // but the integration-point stress/strain and the internal force come from the
 // committed material-point state (radial-return stress, not linear D*strain), so a

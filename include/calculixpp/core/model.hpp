@@ -156,6 +156,11 @@ enum class Procedure {
   // *FREQUENCY: natural-frequency / mode-shape extraction — the generalized symmetric
   // eigenproblem K x = λ M x for the lowest N modes (spec: modal-and-buckling-analysis).
   Frequency,
+  // *BUCKLE: linear-buckling load-factor extraction — the pencil (K + λ K_geo) φ = 0
+  // where K_geo is the geometric (initial-stress) stiffness about a reference-load
+  // prestress state. Returns the lowest positive load factors + buckling mode shapes
+  // (spec: modal-and-buckling-analysis — *BUCKLE; geometric-stiffness).
+  Buckling,
   // *MODAL DYNAMIC: transient response by modal superposition over a preceding
   // *FREQUENCY basis — each decoupled modal SDOF integrated, recombined to the physical
   // response (spec: dynamic-analysis — modal dynamic).
@@ -407,6 +412,12 @@ class Model {
   // onto the preceding *FREQUENCY basis and returns this many damped complex modes.
   int num_complex_modes{0};
   ComplexFrequencyType complex_freq_type{ComplexFrequencyType::Proportional};
+
+  // Number of buckling modes requested by a *BUCKLE step (first data-line field).
+  // Inert unless procedure == Buckling. The two-step prestress driver extracts the
+  // lowest `num_buckling_modes` positive load factors of (K + λ K_geo) φ = 0. (spec:
+  // input-deck-parsing — *BUCKLE; modal-and-buckling — *BUCKLE.)
+  int num_buckling_modes{0};
 
   // Dynamics-step controls (spec: dynamic-analysis). Inert unless procedure is
   // ModalDynamic or SteadyStateDynamics. These carry the modal-superposition step

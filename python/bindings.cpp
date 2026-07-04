@@ -20,6 +20,7 @@
 #include "calculixpp/fem/assembly.hpp"
 #include "calculixpp/io/inp_parser.hpp"
 #include "calculixpp/io/results_writer.hpp"
+#include "calculixpp/numerics/buckling.hpp"
 #include "calculixpp/numerics/eigensolution.hpp"
 #include "calculixpp/numerics/heat_transfer.hpp"
 #include "calculixpp/numerics/direct_dynamics.hpp"
@@ -123,6 +124,7 @@ py::dict summary_dict(const Model& m) {
       : m.procedure == Procedure::HeatTransferTransient ? "heat transfer transient"
       : m.procedure == Procedure::Coupled ? "coupled temperature-displacement"
       : m.procedure == Procedure::Frequency ? "frequency"
+      : m.procedure == Procedure::Buckling ? "buckling"
       : m.procedure == Procedure::ModalDynamic ? "modal dynamic"
       : m.procedure == Procedure::SteadyStateDynamics ? "steady state dynamics"
       : m.procedure == Procedure::ComplexFrequency ? "complex frequency"
@@ -348,6 +350,34 @@ py::dict complex_frequency_result_dict(const Model& m,
   d["omega_n"] = omega_n;
   d["mode_shapes_real"] = shape_re;
   d["mode_shapes_imag"] = shape_im;
+  return d;
+}
+
+// A *BUCKLE result as NumPy arrays: the buckling load factors λ (ascending positive)
+// and the buckling mode shapes (n_modes x n_nodes x 3). The critical load is
+// factors[0] * f_ref. (spec: modal-and-buckling — *BUCKLE.)
+py::dict buckling_result_dict(const Model& m, const numerics::BucklingReport& rep) {
+  const std::size_t nm = rep.basis.modes.size();
+  const std::size_t nn = m.mesh.num_nodes();
+  py::array_t<double> factors(static_cast<py::ssize_t>(nm));
+  py::array_t<double> shapes({static_cast<py::ssize_t>(nm),
+                              static_cast<py::ssize_t>(nn), py::ssize_t{3}});
+  auto rfac = factors.mutable_unchecked<1>();
+  auto rs = shapes.mutable_unchecked<3>();
+  for (std::size_t k = 0; k < nm; ++k) {
+    rfac(static_cast<py::ssize_t>(k)) = rep.basis.modes[k].eigenvalue;
+    for (std::size_t i = 0; i < nn; ++i)
+      for (py::ssize_t j = 0; j < 3; ++j)
+        rs(static_cast<py::ssize_t>(k), static_cast<py::ssize_t>(i), j) =
+            rep.basis.modes[k].shape[i][static_cast<std::size_t>(j)];
+  }
+  py::dict d;
+  d["procedure"] = "buckling";
+  d["num_modes"] = nm;
+  d["num_nodes"] = nn;
+  d["num_elements"] = m.mesh.num_elements();
+  d["factors"] = factors;
+  d["mode_shape"] = shapes;
   return d;
 }
 
@@ -595,6 +625,17 @@ py::dict solve_model(const Model& m, const std::string& solver,
     const fem::LinearSystem M = fem::assemble_mass(m, /*lumped=*/false);
     const numerics::EigenBasis basis = numerics::extract_modes(K, M, nreq);
     py::dict d = frequency_result_dict(m, basis, M);
+    d["backend"] = used;
+    return d;
+  }
+  // A *BUCKLE deck runs the two-step prestress driver and returns the buckling factors
+  // (ascending positive) + mode shapes. (spec: modal-and-buckling — *BUCKLE.)
+  if (m.procedure == Procedure::Buckling) {
+    const std::size_t nreq = m.num_buckling_modes > 0
+                                 ? static_cast<std::size_t>(m.num_buckling_modes)
+                                 : 1;
+    const numerics::BucklingReport rep = numerics::solve_buckling(m, nreq);
+    py::dict d = buckling_result_dict(m, rep);
     d["backend"] = used;
     return d;
   }
