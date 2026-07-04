@@ -30,8 +30,8 @@ The model SHALL define elements via `*ELEMENT, TYPE=...`, each with an integer e
 number and an ordered connectivity list of node numbers. The Phase-1 library SHALL
 support the tetrahedral continuum types C3D4 and C3D10; later phases SHALL extend it to
 the full reference library (C3D8/C3D20/C3D6/C3D15 and reduced-integration variants,
-shell, membrane, beam, truss, plane, axisymmetric, gap, spring, dashpot, mass, and
-fluid network elements). (ref: src/elements.f, src/calinput.f)
+shell, membrane, beam, truss, plane, axisymmetric, gap, spring, dashpot, and mass
+elements). (ref: src/elements.f, src/calinput.f)
 
 #### Scenario: Element with wrong node count
 - GIVEN an element card whose connectivity list has the wrong number of nodes for its type

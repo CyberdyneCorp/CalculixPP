@@ -6,6 +6,31 @@ is outstanding — so they are tracked here rather than as a delta-less OpenSpec
 change. Full context (with reasons) lives in the archived change that deferred
 them, under `openspec/changes/archive/`.
 
+## Scope: structural / mechanical / civil FE (2026-07)
+
+CalculiX++ is deliberately scoped to **structural, mechanical, and civil-engineering
+FE** (statics, thermal, contact, dynamics/eigenproblems, buckling, fatigue,
+optimization). **CFD, 1-D fluid networks, and electromagnetics are OUT OF SCOPE** — the
+`cfd-and-network-analysis`, `electromagnetic-analysis`, and (never-baselined)
+`field-coupling` capabilities were removed. 3-D/network CFD is delegated to the separate
+**[Cyberfluids](https://github.com/CyberdyneCorp/Cyberfluids)** library; the multi-physics
+field-coupling engine went with them (its only consumers were CFD / EM-Joule /
+network-thermal coupling — Phase-3 thermomechanics already couples without it).
+
+**Remaining scope (the "Phase 5" structural completion), each a focused change when built:**
+
+| Capability | Status | Notes |
+|---|---|---|
+| `design-optimization` | implementable now | design variables/responses, adjoint sensitivities (reuse the primal factorization), filtering, feasible-direction; robust/random-field |
+| `submodeling` | implementable now | `*SUBMODEL` — interpolate a global run's boundary results onto a submodel, drive its BCs/loads, solve |
+| `high-cycle-fatigue` | implementable now | `*HCF` life / critical-location over prior dynamic/modal results (builds on Phase 4) |
+| `crack-propagation` | **blocked** | SIF + crack advance need CyberCadKernel remeshing (a stub today) |
+| `mesh-refinement` | **blocked** | `*REFINE MESH` solve–refine–resolve needs CyberCadKernel tet remeshing (a stub today) |
+
+With CFD/EM removed, the solver is feature-complete for its domain; the implementable
+remainder is the three self-contained structural capabilities above, and the only
+non-physics blocker is the geometry kernel for crack/AMR.
+
 ## From Phase 2 (`2026-07-03-phase-2-nonlinear-statics-and-materials`)
 
 | Item | What's missing | Enabler needed | Baseline spec |
