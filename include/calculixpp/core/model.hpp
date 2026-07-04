@@ -187,6 +187,33 @@ enum class Procedure {
   // reduced matrices are exported by *SUBSTRUCTURE MATRIX OUTPUT / *MATRIX ASSEMBLE.
   // (spec: substructure-generation.) (numerics/substructure.)
   Substructure,
+  // *SENSITIVITY: design-sensitivity analysis — the gradient dObjective/dx of a design
+  // response with respect to coordinate design variables, by the adjoint method
+  // reusing the primal linear-static factorization (spec: design-optimization —
+  // sensitivity core). (numerics/sensitivity.)
+  Sensitivity,
+};
+
+// A design response for a *SENSITIVITY step (spec: design-optimization). Only linear
+// responses with a closed-form adjoint are implemented this slice:
+//   Compliance / StrainEnergy — the self-adjoint scalar g = fᵀu (external work);
+//   Displacement — a single nodal DOF g = u(node,comp), the general linear case.
+// `name` is the *DESIGN RESPONSE NAME=. For Displacement, `node_id`/`comp` (1..3)
+// select the DOF; unused for the energy responses.
+struct DesignResponse {
+  enum class Kind { Compliance, Displacement };
+  std::string name;
+  Kind kind{Kind::Compliance};
+  Index node_id{};  // Displacement: target node
+  int comp{1};      // Displacement: target component 1..3
+};
+
+// One scalar coordinate design variable: the (node, component 1..3) whose coordinate is
+// perturbed. A `*DESIGN VARIABLES, TYPE=COORDINATE` node set expands to three of these
+// per node (x, y, z). (spec: design-optimization — coordinate design variables.)
+struct DesignVariable {
+  Index node_id{};
+  int comp{};  // 1..3 (x,y,z coordinate)
 };
 
 // Solution scheme for a *COUPLED TEMPERATURE-DISPLACEMENT step (spec: heat-transfer
@@ -462,6 +489,13 @@ class Model {
   bool substructure_stiffness{true};   // *SUBSTRUCTURE MATRIX OUTPUT, STIFFNESS=YES
   bool substructure_mass{false};       // *SUBSTRUCTURE MATRIX OUTPUT, MASS=YES
   int substructure_modes{0};           // fixed-interface modes (Craig-Bampton); 0 = Guyan
+
+  // Design-sensitivity data (spec: design-optimization). Inert unless procedure ==
+  // Sensitivity. `design_variables` is the ordered list of coordinate design variables
+  // (three per *DESIGN VARIABLES node — x, y, z); `design_responses` are the parsed
+  // *DESIGN RESPONSE / *OBJECTIVE entries whose gradients the *SENSITIVITY step reports.
+  std::vector<DesignVariable> design_variables;
+  std::vector<DesignResponse> design_responses;
 
   // Nonlinear-solution controls, parsed from *CONTROLS / *STATIC / *TIME POINTS.
   // Unused by the default linear path; consumed by solve_nonlinear_static.

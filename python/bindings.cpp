@@ -28,6 +28,7 @@
 #include "calculixpp/numerics/linear_static.hpp"
 #include "calculixpp/numerics/multistep.hpp"
 #include "calculixpp/numerics/nonlinear_static.hpp"
+#include "calculixpp/numerics/sensitivity.hpp"
 #include "calculixpp/numerics/substructure.hpp"
 
 namespace py = pybind11;
@@ -381,6 +382,51 @@ py::dict buckling_result_dict(const Model& m, const numerics::BucklingReport& re
   return d;
 }
 
+// A *SENSITIVITY deck reports dObjective/dx for each design response over the
+// coordinate design variables (spec: design-optimization). The dict exposes the
+// design-variable node/component vectors and, per response, its name, objective value,
+// and the per-variable gradient array — so the adjoint gradient is reachable from
+// Python (the finite-difference gate lives in the C++ test).
+py::dict sensitivity_result_dict(const Model& m,
+                                 const numerics::SensitivityReport& rep) {
+  const std::size_t nv = m.design_variables.size();
+  py::array_t<long long> var_node(static_cast<py::ssize_t>(nv));
+  py::array_t<int> var_comp(static_cast<py::ssize_t>(nv));
+  auto rn = var_node.mutable_unchecked<1>();
+  auto rc = var_comp.mutable_unchecked<1>();
+  for (std::size_t v = 0; v < nv; ++v) {
+    rn(static_cast<py::ssize_t>(v)) =
+        static_cast<long long>(m.design_variables[v].node_id);
+    rc(static_cast<py::ssize_t>(v)) = m.design_variables[v].comp;
+  }
+  py::list responses;
+  for (const numerics::SensitivityResult& r : rep.responses) {
+    py::array_t<double> grad(static_cast<py::ssize_t>(nv));
+    auto rg = grad.mutable_unchecked<1>();
+    for (std::size_t v = 0; v < nv; ++v)
+      rg(static_cast<py::ssize_t>(v)) = r.dgdx[v];
+    py::dict rd;
+    rd["name"] = r.response_name;
+    rd["objective"] = r.objective;
+    rd["gradient"] = grad;
+    responses.append(rd);
+  }
+  py::dict d;
+  d["procedure"] = "sensitivity";
+  d["num_design_vars"] = nv;
+  d["num_nodes"] = m.mesh.num_nodes();
+  d["num_elements"] = m.mesh.num_elements();
+  d["design_var_node"] = var_node;
+  d["design_var_comp"] = var_comp;
+  d["responses"] = responses;
+  // Convenience: the first response's gradient/name at the top level.
+  if (!rep.responses.empty()) {
+    d["response_name"] = rep.responses.front().response_name;
+    d["gradient"] = responses[0].cast<py::dict>()["gradient"];
+  }
+  return d;
+}
+
 // A *SUBSTRUCTURE GENERATE deck condenses onto the retained DOFs (Craig-Bampton /
 // Guyan) and returns the reduced operators + their labels. `k_reduced`/`m_reduced` are
 // dim×dim arrays (dim = retained DOFs + fixed-interface modes); `retained_node` /
@@ -685,6 +731,13 @@ py::dict solve_model(const Model& m, const std::string& solver,
   // the reduced stiffness (+ mass, Craig-Bampton). (spec: substructure-generation.)
   if (m.procedure == Procedure::Substructure) {
     py::dict d = substructure_result_dict(m);
+    d["backend"] = used;
+    return d;
+  }
+  // A *SENSITIVITY deck computes dObjective/dx for each design response over the
+  // coordinate design variables by the adjoint method. (spec: design-optimization.)
+  if (m.procedure == Procedure::Sensitivity) {
+    py::dict d = sensitivity_result_dict(m, numerics::solve_sensitivity(m));
     d["backend"] = used;
     return d;
   }
