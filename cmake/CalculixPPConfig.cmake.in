@@ -1,0 +1,11 @@
+@PACKAGE_INIT@
+
+# CalculiX++ exports its dependency-free core (CalculiX++::core) — the domain
+# model, FE element kernels, assembly, and .inp/.frd I/O. It links no external
+# libraries, so no transitive find_dependency is required here. The SciPP/NumPP
+# sparse-solve layer (calculixpp_numerics) is consumed at source level via the
+# project's own add_subdirectory and is intentionally not part of this package.
+
+include("${CMAKE_CURRENT_LIST_DIR}/CalculixPPTargets.cmake")
+
+check_required_components(CalculixPP)

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(CalculixPP VERSION 0.1.0 LANGUAGES CXX)
+project(CalculixPP VERSION 0.2.0 LANGUAGES CXX)
 
 # ---------------------------------------------------------------------------
 # CalculiX++ — modern C++20 port of the CalculiX finite element solver.
@@ -59,6 +59,55 @@ endif()
 
 if(CALCULIXPP_BUILD_TESTS)
   add_subdirectory(tests)
+endif()
+
+# ---------------------------------------------------------------------------
+# Install + export (find_package(CalculixPP))
+#
+# Produces an installable package with a CalculixPPConfig.cmake so downstream
+# projects can `find_package(CalculixPP)` and link `CalculiXPP::core` — the
+# dependency-free solver core (domain model + FE element math + assembly +
+# .inp/.frd I/O). The SciPP/NumPP-backed numerics layer is not exported: SciPP
+# ships no install rules and is consumed at source level via add_subdirectory,
+# so it cannot be packaged for find_package. Core is the redistributable unit.
+# ---------------------------------------------------------------------------
+option(CALCULIXPP_INSTALL "Generate install + find_package(CalculixPP) rules" ON)
+
+if(CALCULIXPP_INSTALL)
+  include(GNUInstallDirs)
+  include(CMakePackageConfigHelpers)
+
+  # Public headers (the whole tree is the API surface today).
+  install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+  # Export the core under the clean name CalculiXPP::core (not ::calculixpp_core).
+  set_target_properties(calculixpp_core PROPERTIES EXPORT_NAME core)
+
+  # calculixpp_warnings is a PRIVATE INTERFACE dependency of the static core, so
+  # the export set must carry it too (it installs no files, only usage rules).
+  install(TARGETS calculixpp_core calculixpp_warnings
+    EXPORT CalculixPPTargets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+  install(EXPORT CalculixPPTargets
+    FILE CalculixPPTargets.cmake
+    NAMESPACE CalculiXPP::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/CalculixPP)
+
+  configure_package_config_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/CalculixPPConfig.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/CalculixPPConfig.cmake
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/CalculixPP)
+  write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/CalculixPPConfigVersion.cmake
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion)
+  install(FILES
+    ${CMAKE_CURRENT_BINARY_DIR}/CalculixPPConfig.cmake
+    ${CMAKE_CURRENT_BINARY_DIR}/CalculixPPConfigVersion.cmake
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/CalculixPP)
 endif()
 
 message(STATUS "CalculiX++ ${PROJECT_VERSION}  tests=${CALCULIXPP_BUILD_TESTS}  solver=${CALCULIXPP_WITH_SOLVER}")
