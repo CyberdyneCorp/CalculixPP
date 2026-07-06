@@ -73,15 +73,43 @@ flowchart TD
 
 ## Build
 
+Requires a C++20 compiler and CMake ≥ 3.24 (Ninja recommended). The numerics layer needs **NumPP** and **SciPP** (≥ v1.5.0, for the sparse `eigsh` / `eigsh_buckling` eigensolvers); `scripts/bootstrap_deps.sh` builds/installs NumPP into `.deps/install` and points the build at a SciPP source checkout (SciPP has no install rules — it is consumed via `add_subdirectory`). Python bindings additionally need `pip install pybind11 pytest numpy`. **No GPU toolkit is ever required** — the solver runs on the portable CPU reference backend.
+
+### With `just` (recommended)
+
+A [`justfile`](justfile) wraps the common workflows — run `just` (or `just --list`) to see every recipe. It assumes sibling `../NumPP` and `../SciPP` checkouts by default (override on the `bootstrap` call):
+
 ```bash
+just bootstrap                # build + install NumPP into .deps/install, point at a SciPP checkout
+                              #   override paths: just bootstrap ../NumPP ../SciPP
+just build                    # configure (solver, CPU) + compile into build/
+just test                     # build + run the full CTest suite (CPU backend, no GPU toolkit)
+just python                   # build the pybind11 module + run the Python regression suite
+just core                     # build + test the dependency-free core alone (no NumPP/SciPP) — the mobile path
+just debug                    # configure + build + test with debug symbols and assertions (build-debug/)
+just gpu-detect               # report which GPU backends the host has (informational; CPU is always used)
+just spec                     # openspec validate --all --strict
+just ci                       # full local CI: CPU tests + spec validation
+just clean                    # remove build/, build-core/, build-debug/, and .deps/
+```
+
+Lower-level recipes `just configure *FLAGS` and `just compile` are available when you want to pass
+extra CMake flags (e.g. `just configure -DCALCULIXPP_BUILD_PYTHON=ON`).
+
+### Manual (CMake)
+
+Without `just`, run the equivalent steps directly:
+
+```bash
+scripts/bootstrap_deps.sh --numpp ../NumPP --scipp ../SciPP   # build/install NumPP, locate SciPP
+
 # Core + solver + CLI + Python module
 cmake -S . -B build -G Ninja \
-  -DCALCULIXPP_WITH_SOLVER=ON -DCALCULIXPP_BUILD_PYTHON=ON
+  -DCMAKE_BUILD_TYPE=Release -DCALCULIXPP_WITH_SOLVER=ON -DCALCULIXPP_BUILD_PYTHON=ON \
+  -DCMAKE_PREFIX_PATH="$PWD/.deps/install" -DCALCULIXPP_SCIPP_DIR=../SciPP
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
-
-Requires a C++20 compiler and CMake ≥ 3.24. The numerics layer needs **NumPP** and **SciPP** (≥ v1.5.0, for the sparse `eigsh` / `eigsh_buckling` eigensolvers); `scripts/bootstrap_deps.sh` builds/installs NumPP and points the build at a SciPP checkout. Python bindings additionally need `pip install pybind11 pytest numpy`. **No GPU toolkit is required.**
 
 ## Quick start
 
