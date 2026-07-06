@@ -24,7 +24,9 @@ add_library(calculixpp_core
   geometry/cad_mesher.cpp)
 
 target_include_directories(calculixpp_core
-  PUBLIC ${CMAKE_SOURCE_DIR}/include)
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>)
 target_compile_features(calculixpp_core PUBLIC cxx_std_20)
 target_link_libraries(calculixpp_core PRIVATE calculixpp_warnings)
 

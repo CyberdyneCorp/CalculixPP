@@ -465,6 +465,22 @@ find_package(NumPP CONFIG REQUIRED)         # + add_subdirectory(SciPP) — see 
 target_link_libraries(my_app PRIVATE calculixpp::numerics)
 ```
 
+The **dependency-free core** (domain model, element kernels, assembly, and `.inp`/`.frd` I/O)
+also installs as a standalone `find_package` package — no NumPP/SciPP required to consume it:
+
+```bash
+cmake -S . -B build -DCALCULIXPP_WITH_SOLVER=OFF && cmake --build build
+cmake --install build --prefix /your/prefix
+```
+
+```cmake
+find_package(CalculixPP CONFIG REQUIRED)    # from /your/prefix
+target_link_libraries(my_app PRIVATE CalculiXPP::core)   # parse decks, build models, element math
+```
+
+The SciPP/NumPP-backed **numerics** layer (the sparse solve) is consumed at source level via the
+project's own `add_subdirectory` and is intentionally not part of the installed package.
+
 ## Solver selection
 
 The `SOLVER=` keyword (or the `--solver` / `solver=` argument) chooses the path; when unspecified, **Auto** picks by problem size:
@@ -534,6 +550,29 @@ openspec validate --all --strict
 | [CyberCadKernel](https://github.com/CyberdyneCorp/CyberCadKernel) | CAD import & meshing | later phases |
 | CUDA / OpenCL / Metal | Optional GPU acceleration | never required |
 
+## Versioning & API stability
+
+CalculiX++ follows [Semantic Versioning](https://semver.org). The project is **pre-1.0**
+(`0.x`): while the physics is validated against stock CalculiX, the public C++ / Python API and
+the `.inp` card coverage are still stabilizing, so **minor releases (`0.y`) may carry breaking
+changes**. Pin an exact version if you depend on the current surface.
+
+- The `find_package(CalculixPP)` package ships a `CalculixPPConfigVersion.cmake` with
+  `SameMajorVersion` compatibility, so a consumer can require a version and CMake enforces it.
+- Notable changes are recorded in [CHANGELOG.md](CHANGELOG.md) (Keep a Changelog format).
+- Once the API settles the project will tag `1.0.0`, after which breaking changes will require a
+  major bump.
+
+The library builds as a static core today; when a shared library ships it will carry a
+semver-tracked `SOVERSION` so consumers can pin ABI compatibility.
+
+## Contributing
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the build/test workflow and
+what a mergeable PR looks like, [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md), and
+[SECURITY.md](SECURITY.md) for private vulnerability reporting. The `justfile` wraps the common
+tasks (`just build`, `just test`, `just python`, `just gpu-detect`); run `just --list` to see them.
+
 ## License
 
-See [LICENSE](LICENSE). CalculiX++ is an independent C++20 reimplementation; CalculiX itself (Prof. G. Dhondt / Prof. K. Wittig) is the behavioral reference.
+See [LICENSE](LICENSE) (MIT). CalculiX++ is an independent C++20 reimplementation; CalculiX itself (Prof. G. Dhondt / Prof. K. Wittig) is the behavioral reference.
